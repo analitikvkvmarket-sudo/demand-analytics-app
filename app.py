@@ -1811,6 +1811,14 @@ def fill_forecast_into_matrix(
     history_from: date,
     target_date: date,
 ) -> bytes:
+    # В расчётах средние остаются дробными, но в выгружаемом плане
+    # показываем их целыми числами. Для положительных продаж используем
+    # привычное округление 0.5 вверх.
+    def export_whole_number(value: object) -> int | None:
+        if value is None or pd.isna(value):
+            return None
+        return int(math.floor(float(value) + 0.5))
+
     workbook = load_workbook(io.BytesIO(file_bytes))
     for (sheet_name, header_row), group in forecast.groupby(["Лист", "Строка заголовков"]):
         if sheet_name not in workbook.sheetnames:
@@ -1849,7 +1857,7 @@ def fill_forecast_into_matrix(
                 target_cell.comment = Comment(
                     (
                         f"Среднее SKU за день продажи: "
-                        f"{float(record['Среднее SKU за день продажи']):.2f}\n"
+                        f"{export_whole_number(record['Среднее SKU за день продажи'])}\n"
                         f"Дней с продажами за 2 месяца: {sale_days}\n"
                         f"Основание среднего: {record['Статус прогноза']}\n"
                         f"Идеальный цикл поставки: {int(record['Дней покрытия поставкой'])} дн.\n"
@@ -1942,11 +1950,12 @@ def fill_forecast_into_matrix(
                     continue
                 average_value = point_row["Среднее SKU за день продажи"]
                 if pd.notna(average_value):
-                    sheet.cell(average_row, point_column).value = round(float(average_value), 2)
-                    average_total += float(average_value)
+                    whole_average = export_whole_number(average_value)
+                    sheet.cell(average_row, point_column).value = whole_average
+                    average_total += int(whole_average or 0)
             plan_column = headers.get("ПЛАН")
             if plan_column is not None:
-                sheet.cell(average_row, plan_column).value = round(average_total, 2)
+                sheet.cell(average_row, plan_column).value = int(average_total)
 
     calculation_name = "Расчёт по меню"
     if calculation_name in workbook.sheetnames:
@@ -1963,7 +1972,9 @@ def fill_forecast_into_matrix(
         total_plan = 0
         for _, point_row in group.sort_values("Номер точки").iterrows():
             point = str(point_row["Точка"])
-            output_row[f"Среднее {point}"] = point_row["Среднее SKU за день продажи"]
+            output_row[f"Среднее {point}"] = export_whole_number(
+                point_row["Среднее SKU за день продажи"]
+            )
             output_row[f"Дней продаж {point}"] = point_row["Дней с продажами"]
             output_row[f"Идеальный цикл {point}"] = point_row["Дней покрытия поставкой"]
             output_row[f"План {point}"] = point_row["Рекомендованный план"]
@@ -2070,7 +2081,12 @@ def fill_forecast_into_matrix(
         column for column in preferred_export_columns if column in forecast.columns
     ))
     detail_sheet.append(export_columns)
-    for row in forecast[export_columns].itertuples(index=False, name=None):
+    detail_export = forecast[export_columns].copy()
+    if "Среднее SKU за день продажи" in detail_export.columns:
+        detail_export["Среднее SKU за день продажи"] = detail_export[
+            "Среднее SKU за день продажи"
+        ].map(export_whole_number)
+    for row in detail_export.itertuples(index=False, name=None):
         detail_sheet.append([
             None if value is pd.NA or (not isinstance(value, str) and pd.isna(value)) else value
             for value in row
