@@ -16,12 +16,14 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 import psycopg
 import streamlit as st
 from dotenv import load_dotenv
 from openpyxl import load_workbook
 from openpyxl.comments import Comment
-from openpyxl.styles import Font, PatternFill
+from openpyxl.chart import BarChart, LineChart, Reference
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
@@ -3904,8 +3906,434 @@ def export_excel(
     return buffer.getvalue()
 
 
+REPORT_WEEKDAYS_RU = {
+    0: "Пн",
+    1: "Вт",
+    2: "Ср",
+    3: "Чт",
+    4: "Пт",
+    5: "Сб",
+    6: "Вс",
+}
+
+
+def _report_date_span(start_date: date, end_date: date) -> list[date]:
+    if start_date > end_date:
+        return []
+    return [start_date + timedelta(days=offset) for offset in range((end_date - start_date).days + 1)]
+
+
+def build_report_comparison_dates(
+    period_1: tuple[date, date],
+    period_2: tuple[date, date],
+    match_weekdays: bool,
+) -> tuple[list[date], list[date], list[tuple[date, date]]]:
+    dates_1 = _report_date_span(*period_1)
+    dates_2 = _report_date_span(*period_2)
+
+    if not match_weekdays:
+        pair_count = min(len(dates_1), len(dates_2))
+        pairs = list(zip(dates_1[:pair_count], dates_2[:pair_count]))
+        return dates_1, dates_2, pairs
+
+    pairs: list[tuple[date, date]] = []
+    for weekday in range(7):
+        weekday_1 = [item for item in dates_1 if item.weekday() == weekday]
+        weekday_2 = [item for item in dates_2 if item.weekday() == weekday]
+        matched_count = min(len(weekday_1), len(weekday_2))
+        pairs.extend(zip(weekday_1[:matched_count], weekday_2[:matched_count]))
+
+    pairs = sorted(pairs, key=lambda item: item[0])
+    matched_1 = [item[0] for item in pairs]
+    matched_2 = [item[1] for item in pairs]
+    return matched_1, matched_2, pairs
+
+
+def prepare_report_sales_frame(
+    sales: pd.DataFrame,
+    entities: pd.DataFrame,
+    period_name: str,
+) -> pd.DataFrame:
+    if sales.empty:
+        return pd.DataFrame(
+            columns=[
+                "period", "business_date", "point", "shop_number", "sku", "product_name",
+                "category", "entity", "sales", "revenue",
+            ]
+        )
+
+    report = sales.copy()
+    report["business_date"] = pd.to_datetime(report["business_date"], errors="coerce").dt.date
+    report["shop_number"] = pd.to_numeric(report["shop_number"], errors="coerce").astype("Int64")
+    report = report[report["shop_number"].notna()].copy()
+    report["shop_number"] = report["shop_number"].astype(int)
+    report = report[(report["shop_number"] >= 1) & (report["shop_number"] <= 29)]
+    report = report[report["shop_number"] != 11].copy()
+    report["point"] = report["shop_number"].map(lambda value: f"Т{int(value)}")
+    report = report.merge(entities[["sku", "category", "entity"]], on="sku", how="left", validate="many_to_one")
+    report["category"] = report["category"].fillna("Не сопоставлено")
+    report["entity"] = report["entity"].fillna("Не сопоставлено")
+    report["sales"] = pd.to_numeric(report["sold_quantity"], errors="coerce").fillna(0.0)
+    report["revenue"] = pd.to_numeric(report["revenue"], errors="coerce").fillna(0.0)
+    report["period"] = period_name
+    return report[
+        [
+            "period", "business_date", "point", "shop_number", "sku", "product_name",
+            "category", "entity", "sales", "revenue",
+        ]
+    ]
+
+
+def _report_group_period_values(
+    frame: pd.DataFrame,
+    group_columns: list[str],
+    value_name: str,
+) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame(columns=group_columns + [value_name])
+    return (
+        frame.groupby(group_columns, dropna=False, as_index=False)
+        .agg(**{value_name: ("sales", "sum")})
+    )
+
+
+def build_report_tables(
+    frame_1: pd.DataFrame,
+    frame_2: pd.DataFrame,
+    period_1_dates: list[date],
+    period_2_dates: list[date],
+    points: list[str],
+) -> dict[str, pd.DataFrame]:
+    days_1 = max(len(period_1_dates), 1)
+    days_2 = max(len(period_2_dates), 1)
+
+    def comparison(group_columns: list[str]) -> pd.DataFrame:
+        left = _report_group_period_values(frame_1, group_columns, "Период 1, шт.")
+        right = _report_group_period_values(frame_2, group_columns, "Период 2, шт.")
+        result = left.merge(right, on=group_columns, how="outer").fillna({"Период 1, шт.": 0.0, "Период 2, шт.": 0.0})
+        result["Изменение, шт."] = result["Период 2, шт."] - result["Период 1, шт."]
+        result["Изменение, %"] = result["Изменение, шт."].div(result["Период 1, шт."].replace(0, pd.NA)) * 100
+        zero_base = result["Период 1, шт."].eq(0) & result["Период 2, шт."].gt(0)
+        result.loc[zero_base, "Изменение, %"] = pd.NA
+        result["СР/день П1"] = result["Период 1, шт."] / days_1
+        result["СР/день П2"] = result["Период 2, шт."] / days_2
+        result["Изменение СР/день"] = result["СР/день П2"] - result["СР/день П1"]
+        return result
+
+    category_summary = comparison(["category"]).rename(columns={"category": "Категория"})
+    category_entity = comparison(["category", "entity"]).rename(columns={"category": "Категория", "entity": "Сущность"})
+    by_point = comparison(["category", "entity", "point"]).rename(
+        columns={"category": "Категория", "entity": "Сущность", "point": "Точка"}
+    )
+
+    weekday_order = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    weekday_1 = frame_1.copy()
+    weekday_2 = frame_2.copy()
+    if not weekday_1.empty:
+        weekday_1["День недели"] = weekday_1["business_date"].map(lambda value: REPORT_WEEKDAYS_RU.get(value.weekday(), ""))
+    if not weekday_2.empty:
+        weekday_2["День недели"] = weekday_2["business_date"].map(lambda value: REPORT_WEEKDAYS_RU.get(value.weekday(), ""))
+    left_weekday = _report_group_period_values(weekday_1, ["День недели"], "Период 1, шт.")
+    right_weekday = _report_group_period_values(weekday_2, ["День недели"], "Период 2, шт.")
+    weekday_summary = left_weekday.merge(right_weekday, on="День недели", how="outer").fillna(0.0)
+    weekday_summary["Изменение, шт."] = weekday_summary["Период 2, шт."] - weekday_summary["Период 1, шт."]
+    weekday_summary["Изменение, %"] = weekday_summary["Изменение, шт."].div(weekday_summary["Период 1, шт."].replace(0, pd.NA)) * 100
+    weekday_summary["_order"] = weekday_summary["День недели"].map({name: idx for idx, name in enumerate(weekday_order)})
+    weekday_summary = weekday_summary.sort_values("_order", kind="stable").drop(columns="_order")
+
+    def matrix(frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            total_row = {"Категория": "ВСЕГО", "Сущность": ""}
+            total_row.update({point: 0.0 for point in points})
+            total_row["ВСЕГО"] = 0.0
+            return pd.DataFrame([total_row], columns=["Категория", "Сущность", *points, "ВСЕГО"])
+        pivot = frame.pivot_table(
+            index=["category", "entity"],
+            columns="point",
+            values="sales",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+        pivot = pivot.reindex(columns=points, fill_value=0.0)
+        pivot["ВСЕГО"] = pivot.sum(axis=1)
+        pivot = pivot.reset_index().rename(columns={"category": "Категория", "entity": "Сущность"})
+        total_row = {"Категория": "ВСЕГО", "Сущность": ""}
+        for point in points:
+            total_row[point] = float(pd.to_numeric(pivot[point], errors="coerce").sum())
+        total_row["ВСЕГО"] = float(pd.to_numeric(pivot["ВСЕГО"], errors="coerce").sum())
+        return pd.concat([pivot, pd.DataFrame([total_row])], ignore_index=True)
+
+    matrix_1 = matrix(frame_1)
+    matrix_2 = matrix(frame_2)
+    matrix_delta = matrix_2.copy()
+    if not matrix_1.empty or not matrix_2.empty:
+        key_cols = ["Категория", "Сущность"]
+        matrix_delta = matrix_1.merge(matrix_2, on=key_cols, how="outer", suffixes=("__1", "__2")).fillna(0.0)
+        result_columns = key_cols.copy()
+        for point in [*points, "ВСЕГО"]:
+            matrix_delta[point] = matrix_delta.get(f"{point}__2", 0.0) - matrix_delta.get(f"{point}__1", 0.0)
+            result_columns.append(point)
+        matrix_delta = matrix_delta[result_columns]
+        matrix_delta["_is_total"] = matrix_delta["Категория"].eq("ВСЕГО")
+        matrix_delta = matrix_delta.sort_values(["_is_total", "Категория", "Сущность"], kind="stable").drop(columns="_is_total")
+
+    return {
+        "category_summary": category_summary.sort_values("Период 2, шт.", ascending=False, kind="stable"),
+        "category_entity": category_entity.sort_values(["Категория", "Период 2, шт."], ascending=[True, False], kind="stable"),
+        "by_point": by_point.sort_values(["Точка", "Категория", "Период 2, шт."], ascending=[True, True, False], kind="stable"),
+        "weekday_summary": weekday_summary,
+        "matrix_1": matrix_1,
+        "matrix_2": matrix_2,
+        "matrix_delta": matrix_delta,
+    }
+
+
+def _append_report_total_row(frame: pd.DataFrame, label_column: str = "Категория") -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    result = frame.copy()
+    total_row: dict[str, object] = {}
+    for column in result.columns:
+        if column == label_column:
+            total_row[column] = "ВСЕГО"
+        elif column in {"Сущность", "Точка"}:
+            total_row[column] = ""
+        elif pd.api.types.is_numeric_dtype(result[column]):
+            if column == "Изменение, %":
+                p1 = pd.to_numeric(result.get("Период 1, шт."), errors="coerce").sum()
+                p2 = pd.to_numeric(result.get("Период 2, шт."), errors="coerce").sum()
+                total_row[column] = ((p2 - p1) / p1 * 100) if p1 else pd.NA
+            elif column == "СР/день П1" or column == "СР/день П2" or column == "Изменение СР/день":
+                total_row[column] = pd.NA
+            else:
+                total_row[column] = pd.to_numeric(result[column], errors="coerce").sum()
+        else:
+            total_row[column] = ""
+    return pd.concat([result, pd.DataFrame([total_row])], ignore_index=True)
+
+
+def build_report_dynamic_data(
+    frame_1: pd.DataFrame,
+    frame_2: pd.DataFrame,
+    dates_1: list[date],
+    dates_2: list[date],
+    pairs: list[tuple[date, date]],
+    match_weekdays: bool,
+    rolling_window: int,
+) -> pd.DataFrame:
+    qty_1 = frame_1.groupby("business_date")["sales"].sum().to_dict() if not frame_1.empty else {}
+    qty_2 = frame_2.groupby("business_date")["sales"].sum().to_dict() if not frame_2.empty else {}
+
+    rows: list[dict[str, object]] = []
+    if match_weekdays:
+        for index, (date_1, date_2) in enumerate(pairs, start=1):
+            rows.append(
+                {
+                    "Сравнимый день": index,
+                    "День недели": REPORT_WEEKDAYS_RU.get(date_1.weekday(), ""),
+                    "Дата П1": date_1,
+                    "Дата П2": date_2,
+                    "Период 1, шт.": float(qty_1.get(date_1, 0.0)),
+                    "Период 2, шт.": float(qty_2.get(date_2, 0.0)),
+                }
+            )
+    else:
+        max_days = max(len(dates_1), len(dates_2))
+        for index in range(max_days):
+            date_1 = dates_1[index] if index < len(dates_1) else None
+            date_2 = dates_2[index] if index < len(dates_2) else None
+            weekday_source = date_2 or date_1
+            rows.append(
+                {
+                    "Сравнимый день": index + 1,
+                    "День недели": REPORT_WEEKDAYS_RU.get(weekday_source.weekday(), "") if weekday_source else "",
+                    "Дата П1": date_1,
+                    "Дата П2": date_2,
+                    "Период 1, шт.": float(qty_1.get(date_1, 0.0)) if date_1 else pd.NA,
+                    "Период 2, шт.": float(qty_2.get(date_2, 0.0)) if date_2 else pd.NA,
+                }
+            )
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    result["СР П1"] = pd.to_numeric(result["Период 1, шт."], errors="coerce").rolling(
+        rolling_window, min_periods=1
+    ).mean()
+    result["СР П2"] = pd.to_numeric(result["Период 2, шт."], errors="coerce").rolling(
+        rolling_window, min_periods=1
+    ).mean()
+    return result
+
+
+def build_period_comparison_excel(
+    tables: dict[str, pd.DataFrame],
+    dynamic_data: pd.DataFrame,
+    period_1: tuple[date, date],
+    period_2: tuple[date, date],
+    match_weekdays: bool,
+    dates_1: list[date],
+    dates_2: list[date],
+    rolling_window: int,
+    graph_filter_label: str,
+) -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        params = pd.DataFrame(
+            [
+                ["Период 1", f"{period_1[0]:%d.%m.%Y}–{period_1[1]:%d.%m.%Y}"],
+                ["Период 2", f"{period_2[0]:%d.%m.%Y}–{period_2[1]:%d.%m.%Y}"],
+                ["Сверка одинаковых дней недели", "Да" if match_weekdays else "Нет"],
+                ["Дней в сверке П1", len(dates_1)],
+                ["Дней в сверке П2", len(dates_2)],
+                ["Окно скользящего среднего", rolling_window],
+                ["Фильтр графика", graph_filter_label],
+            ],
+            columns=["Параметр", "Значение"],
+        )
+        params.to_excel(writer, sheet_name="Параметры", index=False)
+        _append_report_total_row(tables["category_summary"]).to_excel(writer, sheet_name="Сводка категорий", index=False)
+        _append_report_total_row(tables["category_entity"]).to_excel(writer, sheet_name="Категории-сущности", index=False)
+        _append_report_total_row(tables["by_point"]).to_excel(writer, sheet_name="По точкам", index=False)
+        tables["weekday_summary"].to_excel(writer, sheet_name="Дни недели", index=False)
+        tables["matrix_1"].to_excel(writer, sheet_name="Матрица П1", index=False)
+        tables["matrix_2"].to_excel(writer, sheet_name="Матрица П2", index=False)
+        tables["matrix_delta"].to_excel(writer, sheet_name="Изменение матрицы", index=False)
+        dynamic_export = dynamic_data.copy()
+        if not dynamic_export.empty:
+            for date_column in ["Дата П1", "Дата П2"]:
+                dynamic_export[date_column] = pd.to_datetime(dynamic_export[date_column], errors="coerce").dt.date
+        dynamic_export.to_excel(writer, sheet_name="Динамика", index=False)
+
+        workbook = writer.book
+        header_fill = PatternFill("solid", fgColor="1F4E78")
+        header_font = Font(color="FFFFFF", bold=True)
+        total_fill = PatternFill("solid", fgColor="D9EAF7")
+        positive_fill = PatternFill("solid", fgColor="E2F0D9")
+        negative_fill = PatternFill("solid", fgColor="FCE4D6")
+
+        for sheet in workbook.worksheets:
+            sheet.freeze_panes = "A2"
+            sheet.sheet_view.showGridLines = False
+            for cell in sheet[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            sheet.auto_filter.ref = sheet.dimensions
+            for cells in sheet.columns:
+                values = [len(str(cell.value or "")) for cell in cells[: min(len(cells), 3000)]]
+                width = min(max(values + [8]) + 2, 34)
+                sheet.column_dimensions[cells[0].column_letter].width = width
+
+        for sheet_name in ["Сводка категорий", "Категории-сущности", "По точкам"]:
+            sheet = workbook[sheet_name]
+            if sheet.max_row > 1:
+                for cell in sheet[sheet.max_row]:
+                    cell.fill = total_fill
+                    cell.font = Font(bold=True)
+                headers = {str(cell.value): cell.column for cell in sheet[1]}
+                pct_col = headers.get("Изменение, %")
+                if pct_col:
+                    for row in range(2, sheet.max_row + 1):
+                        sheet.cell(row, pct_col).number_format = '0.0"%"'
+                for header in ["Период 1, шт.", "Период 2, шт.", "Изменение, шт.", "СР/день П1", "СР/день П2", "Изменение СР/день"]:
+                    col = headers.get(header)
+                    if col:
+                        for row in range(2, sheet.max_row + 1):
+                            sheet.cell(row, col).number_format = '#,##0.0'
+                delta_col = headers.get("Изменение, шт.")
+                if delta_col:
+                    for row in range(2, sheet.max_row):
+                        value = sheet.cell(row, delta_col).value
+                        if isinstance(value, (int, float)):
+                            sheet.cell(row, delta_col).fill = positive_fill if value >= 0 else negative_fill
+
+        charts_sheet = workbook.create_sheet("Графики")
+        charts_sheet.sheet_view.showGridLines = False
+        charts_sheet["A1"] = "Сравнение продаж по категориям"
+        charts_sheet["A1"].font = Font(bold=True, size=14)
+
+        category_sheet = workbook["Сводка категорий"]
+        category_headers = {str(cell.value): cell.column for cell in category_sheet[1]}
+        last_category_row = max(2, category_sheet.max_row - 1)
+        if last_category_row >= 2 and category_headers.get("Категория") and category_headers.get("Период 1, шт."):
+            bar = BarChart()
+            bar.type = "col"
+            bar.style = 10
+            bar.title = "Категории: Период 1 vs Период 2"
+            bar.y_axis.title = "Продано, шт."
+            bar.x_axis.title = "Категория"
+            data = Reference(
+                category_sheet,
+                min_col=category_headers["Период 1, шт."],
+                max_col=category_headers["Период 2, шт."],
+                min_row=1,
+                max_row=last_category_row,
+            )
+            cats = Reference(
+                category_sheet,
+                min_col=category_headers["Категория"],
+                min_row=2,
+                max_row=last_category_row,
+            )
+            bar.add_data(data, titles_from_data=True)
+            bar.set_categories(cats)
+            bar.height = 12
+            bar.width = 24
+            charts_sheet.add_chart(bar, "A3")
+
+        if not dynamic_data.empty:
+            dyn_sheet = workbook["Динамика"]
+            dyn_headers = {str(cell.value): cell.column for cell in dyn_sheet[1]}
+            line = LineChart()
+            line.title = f"Динамика продаж · {graph_filter_label}"
+            line.y_axis.title = "Продано, шт."
+            line.x_axis.title = "Сравнимый день"
+            dyn_last_row = dyn_sheet.max_row
+            data_cols = [
+                dyn_headers.get("Период 1, шт."),
+                dyn_headers.get("Период 2, шт."),
+                dyn_headers.get("СР П1"),
+                dyn_headers.get("СР П2"),
+            ]
+            data_cols = [col for col in data_cols if col]
+            if data_cols:
+                for col in data_cols:
+                    data = Reference(dyn_sheet, min_col=col, min_row=1, max_row=dyn_last_row)
+                    line.add_data(data, titles_from_data=True)
+                categories = Reference(
+                    dyn_sheet,
+                    min_col=dyn_headers.get("Сравнимый день", 1),
+                    min_row=2,
+                    max_row=dyn_last_row,
+                )
+                line.set_categories(categories)
+                line.height = 12
+                line.width = 24
+                charts_sheet.add_chart(line, "A28")
+
+    return buffer.getvalue()
+
+
+def build_period_comparison_html(
+    category_chart: go.Figure,
+    delta_chart: go.Figure,
+    dynamic_chart: go.Figure,
+    title: str,
+) -> bytes:
+    parts = [
+        "<!doctype html><html><head><meta charset='utf-8'><title>" + title + "</title></head><body>",
+        f"<h1>{title}</h1>",
+        pio.to_html(category_chart, full_html=False, include_plotlyjs=True),
+        pio.to_html(delta_chart, full_html=False, include_plotlyjs=False),
+        pio.to_html(dynamic_chart, full_html=False, include_plotlyjs=False),
+        "</body></html>",
+    ]
+    return "".join(parts).encode("utf-8")
+
+
 st.title("Анализ структуры спроса")
-st.caption("Версия 75.6.1 · Окно свежести: матрица через Apps Script обновляется каждые 15 минут")
+st.caption("Версия 75.7.0 · Добавлена вкладка «Отчет» со сверкой двух периодов")
 
 if not ENTITY_FILE.exists():
     st.error(f"Не найден справочник: {ENTITY_FILE.name}")
@@ -4245,12 +4673,510 @@ metric_columns[2].metric("Точек", filtered_sku["point"].nunique())
 metric_columns[3].metric("Активных SKU", filtered_sku["sku"].nunique())
 metric_columns[4].metric("Покрытие сущностями", f"{coverage:.1%}")
 
-tab_dashboard, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_forecast = st.tabs(
+tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_forecast = st.tabs(
     [
-        "Дашборд", "Топ-3 сущности", "Сущности", "Детализация", "Детализация категории", "ABC продукции",
+        "Дашборд", "Отчет", "Топ-3 сущности", "Сущности", "Детализация", "Детализация категории", "ABC продукции",
         "Анализ категории", "Окно свежести", "Списания категорий", "Прогноз плана",
     ]
 )
+
+with tab_report:
+    st.subheader("Сверка продаж по двум периодам")
+    st.caption(
+        "Отчет сравнивает количество проданной продукции по структуре Категория → Сущность → Точка. "
+        "Можно выровнять периоды по одинаковым дням недели: приложение возьмет одинаковое количество "
+        "понедельников, вторников и т.д. в обоих периодах."
+    )
+
+    report_recent_start = previous_month_start
+    report_recent_end = previous_month_end
+    report_previous_end = report_recent_start - timedelta(days=1)
+    report_previous_start = report_previous_end.replace(day=1)
+
+    period_cols = st.columns(2)
+    with period_cols[0]:
+        report_period_1_input = st.date_input(
+            "Период 1 · база сравнения",
+            value=(report_previous_start, report_previous_end),
+            max_value=today,
+            format="DD.MM.YYYY",
+            key="report_period_1_v770",
+        )
+    with period_cols[1]:
+        report_period_2_input = st.date_input(
+            "Период 2 · сравниваемый",
+            value=(report_recent_start, report_recent_end),
+            max_value=today,
+            format="DD.MM.YYYY",
+            key="report_period_2_v770",
+        )
+
+    report_match_weekdays = st.checkbox(
+        "Сверять по одинаковым дням недели",
+        value=True,
+        key="report_same_weekdays_v770",
+        help=(
+            "Например, если в первом периоде 5 понедельников, а во втором 4, "
+            "в сверку войдут по 4 понедельника. То же правило применяется к каждому дню недели."
+        ),
+    )
+
+    all_report_points = [f"Т{number}" for number in range(1, 30) if number != 11]
+    report_points = st.multiselect(
+        "Точки отчета",
+        all_report_points,
+        default=all_report_points,
+        key="report_points_v770",
+    )
+
+    report_build = st.button(
+        "Сформировать отчет",
+        type="primary",
+        use_container_width=True,
+        key="report_build_v770",
+    )
+
+    if report_build:
+        valid_report_1 = isinstance(report_period_1_input, tuple) and len(report_period_1_input) == 2
+        valid_report_2 = isinstance(report_period_2_input, tuple) and len(report_period_2_input) == 2
+        if not valid_report_1 or not valid_report_2:
+            st.error("Для обоих периодов укажите дату начала и дату окончания.")
+        elif not report_points:
+            st.error("Выберите хотя бы одну точку.")
+        else:
+            report_period_1 = tuple(report_period_1_input)
+            report_period_2 = tuple(report_period_2_input)
+            dates_1, dates_2, date_pairs = build_report_comparison_dates(
+                report_period_1,
+                report_period_2,
+                report_match_weekdays,
+            )
+            if report_match_weekdays and not date_pairs:
+                st.error("Не удалось подобрать одинаковые дни недели для выбранных периодов.")
+            else:
+                point_numbers = tuple(sorted(int(point[1:]) for point in report_points))
+                try:
+                    with st.spinner("Загружаю продажи для двух периодов…"):
+                        raw_1 = load_sales(
+                            report_period_1[0],
+                            report_period_1[1] + timedelta(days=1),
+                            point_numbers,
+                        )
+                        raw_2 = load_sales(
+                            report_period_2[0],
+                            report_period_2[1] + timedelta(days=1),
+                            point_numbers,
+                        )
+                    frame_1 = prepare_report_sales_frame(raw_1, entities, "Период 1")
+                    frame_2 = prepare_report_sales_frame(raw_2, entities, "Период 2")
+                    if report_match_weekdays:
+                        frame_1 = frame_1[frame_1["business_date"].isin(set(dates_1))].copy()
+                        frame_2 = frame_2[frame_2["business_date"].isin(set(dates_2))].copy()
+                    for stale_key in [
+                        "report_category_filter_v770",
+                        "report_entity_filter_v770",
+                        "report_point_filter_v770",
+                        "report_graph_category_v770",
+                        "report_graph_entity_v770",
+                        "report_graph_point_v770",
+                    ]:
+                        st.session_state.pop(stale_key, None)
+                    st.session_state["period_comparison_report_v770"] = {
+                        "frame_1": frame_1,
+                        "frame_2": frame_2,
+                        "period_1": report_period_1,
+                        "period_2": report_period_2,
+                        "dates_1": dates_1,
+                        "dates_2": dates_2,
+                        "pairs": date_pairs,
+                        "match_weekdays": report_match_weekdays,
+                        "points": report_points,
+                    }
+                except Exception as error:
+                    st.error(f"Не удалось сформировать отчет: {error}")
+
+    report_state = st.session_state.get("period_comparison_report_v770")
+    if report_state:
+        report_frame_1 = report_state["frame_1"].copy()
+        report_frame_2 = report_state["frame_2"].copy()
+        report_period_1 = report_state["period_1"]
+        report_period_2 = report_state["period_2"]
+        report_dates_1 = report_state["dates_1"]
+        report_dates_2 = report_state["dates_2"]
+        report_pairs = report_state["pairs"]
+        report_match_weekdays_state = bool(report_state["match_weekdays"])
+        report_point_options = list(report_state["points"])
+
+        st.success(
+            f"Период 1: {report_period_1[0]:%d.%m.%Y}–{report_period_1[1]:%d.%m.%Y} · "
+            f"Период 2: {report_period_2[0]:%d.%m.%Y}–{report_period_2[1]:%d.%m.%Y}"
+        )
+        if report_match_weekdays_state:
+            st.caption(
+                f"Сверка выровнена по дням недели: в каждом периоде используется по {len(report_dates_1)} дней."
+            )
+        else:
+            st.caption(
+                f"Без выравнивания дней недели: П1 — {len(report_dates_1)} дней, П2 — {len(report_dates_2)} дней."
+            )
+
+        available_report_categories = sorted(
+            set(report_frame_1["category"].dropna().astype(str))
+            | set(report_frame_2["category"].dropna().astype(str))
+        )
+        report_filter_cols = st.columns(3)
+        with report_filter_cols[0]:
+            selected_report_categories = st.multiselect(
+                "Категории",
+                available_report_categories,
+                default=available_report_categories,
+                key="report_category_filter_v770",
+            )
+
+        entity_pool = sorted(
+            set(
+                pd.concat(
+                    [
+                        report_frame_1[report_frame_1["category"].isin(selected_report_categories)]["entity"],
+                        report_frame_2[report_frame_2["category"].isin(selected_report_categories)]["entity"],
+                    ],
+                    ignore_index=True,
+                ).dropna().astype(str)
+            )
+        )
+        with report_filter_cols[1]:
+            selected_report_entities = st.multiselect(
+                "Сущности",
+                entity_pool,
+                default=entity_pool,
+                key="report_entity_filter_v770",
+            )
+        with report_filter_cols[2]:
+            selected_report_points = st.multiselect(
+                "Точки в результате",
+                report_point_options,
+                default=report_point_options,
+                key="report_point_filter_v770",
+            )
+
+        filtered_report_1 = report_frame_1[
+            report_frame_1["category"].isin(selected_report_categories)
+            & report_frame_1["entity"].isin(selected_report_entities)
+            & report_frame_1["point"].isin(selected_report_points)
+        ].copy()
+        filtered_report_2 = report_frame_2[
+            report_frame_2["category"].isin(selected_report_categories)
+            & report_frame_2["entity"].isin(selected_report_entities)
+            & report_frame_2["point"].isin(selected_report_points)
+        ].copy()
+
+        report_tables = build_report_tables(
+            filtered_report_1,
+            filtered_report_2,
+            report_dates_1,
+            report_dates_2,
+            selected_report_points,
+        )
+
+        total_1 = float(filtered_report_1["sales"].sum()) if not filtered_report_1.empty else 0.0
+        total_2 = float(filtered_report_2["sales"].sum()) if not filtered_report_2.empty else 0.0
+        total_delta = total_2 - total_1
+        total_delta_pct = (total_delta / total_1 * 100) if total_1 else None
+        avg_1 = total_1 / max(len(report_dates_1), 1)
+        avg_2 = total_2 / max(len(report_dates_2), 1)
+
+        report_metrics = st.columns(6)
+        report_metrics[0].metric("Период 1, шт.", f"{total_1:,.0f}".replace(",", " "))
+        report_metrics[1].metric("Период 2, шт.", f"{total_2:,.0f}".replace(",", " "))
+        report_metrics[2].metric(
+            "Изменение, шт.",
+            f"{total_delta:+,.0f}".replace(",", " "),
+        )
+        report_metrics[3].metric(
+            "Изменение, %",
+            f"{total_delta_pct:+.1f}%" if total_delta_pct is not None else "—",
+        )
+        report_metrics[4].metric("СР/день П1", f"{avg_1:,.1f}".replace(",", " "))
+        report_metrics[5].metric("СР/день П2", f"{avg_2:,.1f}".replace(",", " "))
+
+        st.markdown("#### Сверка по категориям и сущностям")
+        report_category_entity_display = _append_report_total_row(report_tables["category_entity"])
+        st.dataframe(
+            report_category_entity_display,
+            use_container_width=True,
+            hide_index=True,
+            height=min(650, 38 * len(report_category_entity_display) + 80),
+            column_config={
+                "Период 1, шт.": st.column_config.NumberColumn(format="%.0f"),
+                "Период 2, шт.": st.column_config.NumberColumn(format="%.0f"),
+                "Изменение, шт.": st.column_config.NumberColumn(format="%+.0f"),
+                "Изменение, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                "СР/день П1": st.column_config.NumberColumn(format="%.1f"),
+                "СР/день П2": st.column_config.NumberColumn(format="%.1f"),
+                "Изменение СР/день": st.column_config.NumberColumn(format="%+.1f"),
+            },
+        )
+
+        st.markdown("#### Сверка одинаковых дней недели")
+        st.dataframe(
+            report_tables["weekday_summary"],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Период 1, шт.": st.column_config.NumberColumn(format="%.0f"),
+                "Период 2, шт.": st.column_config.NumberColumn(format="%.0f"),
+                "Изменение, шт.": st.column_config.NumberColumn(format="%+.0f"),
+                "Изменение, %": st.column_config.NumberColumn(format="%+.1f%%"),
+            },
+        )
+
+        st.markdown("#### Количество продаж по точкам")
+        matrix_choice = st.radio(
+            "Что показать в матрице",
+            ["Период 1", "Период 2", "Изменение"],
+            horizontal=True,
+            key="report_matrix_choice_v770",
+        )
+        matrix_key = {
+            "Период 1": "matrix_1",
+            "Период 2": "matrix_2",
+            "Изменение": "matrix_delta",
+        }[matrix_choice]
+        report_matrix_display = report_tables[matrix_key].copy()
+        st.caption("Последний столбец «ВСЕГО» — итог по всем выбранным точкам.")
+        st.dataframe(
+            report_matrix_display,
+            use_container_width=True,
+            hide_index=True,
+            height=min(700, 38 * len(report_matrix_display) + 80),
+        )
+
+        st.markdown("#### Графически: рост и снижение по категориям")
+        category_chart_data = report_tables["category_summary"].copy()
+        category_chart = go.Figure()
+        category_chart.add_trace(
+            go.Bar(
+                x=category_chart_data["Категория"],
+                y=category_chart_data["Период 1, шт."],
+                name=f"П1 · {report_period_1[0]:%d.%m}–{report_period_1[1]:%d.%m}",
+            )
+        )
+        category_chart.add_trace(
+            go.Bar(
+                x=category_chart_data["Категория"],
+                y=category_chart_data["Период 2, шт."],
+                name=f"П2 · {report_period_2[0]:%d.%m}–{report_period_2[1]:%d.%m}",
+            )
+        )
+        category_chart.update_layout(
+            barmode="group",
+            yaxis_title="Продано, шт.",
+            xaxis_title="Категория",
+            height=480,
+            margin=dict(l=20, r=20, t=30, b=80),
+        )
+        st.plotly_chart(category_chart, use_container_width=True)
+
+        delta_chart_data = category_chart_data.sort_values("Изменение, шт.", ascending=True, kind="stable")
+        delta_colors = ["#C0504D" if value < 0 else "#70AD47" for value in delta_chart_data["Изменение, шт."]]
+        delta_chart = go.Figure(
+            go.Bar(
+                x=delta_chart_data["Изменение, шт."],
+                y=delta_chart_data["Категория"],
+                orientation="h",
+                marker_color=delta_colors,
+                text=delta_chart_data["Изменение, шт."].map(lambda value: f"{value:+,.0f}".replace(",", " ")),
+                textposition="outside",
+                hovertemplate="%{y}<br>Изменение: %{x:+,.0f} шт.<extra></extra>",
+            )
+        )
+        delta_chart.update_layout(
+            title="Изменение продаж: Период 2 минус Период 1",
+            xaxis_title="Изменение, шт.",
+            yaxis_title="",
+            height=max(360, 45 * max(len(delta_chart_data), 5)),
+            margin=dict(l=20, r=80, t=55, b=30),
+        )
+        st.plotly_chart(delta_chart, use_container_width=True)
+
+        st.markdown("#### Динамика продаж и средняя линия")
+        graph_filter_cols = st.columns(4)
+        graph_categories = selected_report_categories or available_report_categories
+        with graph_filter_cols[0]:
+            graph_category = st.selectbox(
+                "Категория на графике",
+                graph_categories,
+                key="report_graph_category_v770",
+            ) if graph_categories else None
+
+        graph_entity_options = ["Все сущности"]
+        if graph_category:
+            graph_entity_options += sorted(
+                set(
+                    pd.concat(
+                        [
+                            report_frame_1[report_frame_1["category"].eq(graph_category)]["entity"],
+                            report_frame_2[report_frame_2["category"].eq(graph_category)]["entity"],
+                        ],
+                        ignore_index=True,
+                    ).dropna().astype(str)
+                )
+            )
+        with graph_filter_cols[1]:
+            graph_entity = st.selectbox(
+                "Сущность",
+                graph_entity_options,
+                key="report_graph_entity_v770",
+            )
+        with graph_filter_cols[2]:
+            graph_point = st.selectbox(
+                "Точка",
+                ["Все точки", *selected_report_points],
+                key="report_graph_point_v770",
+            )
+        with graph_filter_cols[3]:
+            rolling_window = st.slider(
+                "Окно среднего, дней",
+                min_value=2,
+                max_value=14,
+                value=3,
+                step=1,
+                key="report_rolling_window_v770",
+            )
+
+        dynamic_frame_1 = filtered_report_1.copy()
+        dynamic_frame_2 = filtered_report_2.copy()
+        if graph_category:
+            dynamic_frame_1 = dynamic_frame_1[dynamic_frame_1["category"].eq(graph_category)]
+            dynamic_frame_2 = dynamic_frame_2[dynamic_frame_2["category"].eq(graph_category)]
+        if graph_entity != "Все сущности":
+            dynamic_frame_1 = dynamic_frame_1[dynamic_frame_1["entity"].eq(graph_entity)]
+            dynamic_frame_2 = dynamic_frame_2[dynamic_frame_2["entity"].eq(graph_entity)]
+        if graph_point != "Все точки":
+            dynamic_frame_1 = dynamic_frame_1[dynamic_frame_1["point"].eq(graph_point)]
+            dynamic_frame_2 = dynamic_frame_2[dynamic_frame_2["point"].eq(graph_point)]
+
+        dynamic_data = build_report_dynamic_data(
+            dynamic_frame_1,
+            dynamic_frame_2,
+            report_dates_1,
+            report_dates_2,
+            report_pairs,
+            report_match_weekdays_state,
+            rolling_window,
+        )
+        graph_filter_label = " · ".join(
+            [
+                graph_category or "Все категории",
+                graph_entity,
+                graph_point,
+            ]
+        )
+
+        dynamic_chart = go.Figure()
+        if not dynamic_data.empty:
+            x_labels = dynamic_data.apply(
+                lambda row: f"{int(row['Сравнимый день'])} · {row['День недели']}", axis=1
+            )
+            custom_1 = dynamic_data["Дата П1"].map(
+                lambda value: value.strftime("%d.%m.%Y") if isinstance(value, date) else "—"
+            )
+            custom_2 = dynamic_data["Дата П2"].map(
+                lambda value: value.strftime("%d.%m.%Y") if isinstance(value, date) else "—"
+            )
+            dynamic_chart.add_trace(
+                go.Bar(
+                    x=x_labels,
+                    y=dynamic_data["Период 1, шт."],
+                    name="Период 1 · факт",
+                    customdata=custom_1,
+                    hovertemplate="%{x}<br>Дата: %{customdata}<br>Продано: %{y:,.0f} шт.<extra></extra>",
+                )
+            )
+            dynamic_chart.add_trace(
+                go.Bar(
+                    x=x_labels,
+                    y=dynamic_data["Период 2, шт."],
+                    name="Период 2 · факт",
+                    customdata=custom_2,
+                    hovertemplate="%{x}<br>Дата: %{customdata}<br>Продано: %{y:,.0f} шт.<extra></extra>",
+                )
+            )
+            dynamic_chart.add_trace(
+                go.Scatter(
+                    x=x_labels,
+                    y=dynamic_data["СР П1"],
+                    mode="lines+markers",
+                    name=f"СР П1 · {rolling_window} дн.",
+                    line=dict(width=3, dash="dot"),
+                )
+            )
+            dynamic_chart.add_trace(
+                go.Scatter(
+                    x=x_labels,
+                    y=dynamic_data["СР П2"],
+                    mode="lines+markers",
+                    name=f"СР П2 · {rolling_window} дн.",
+                    line=dict(width=3),
+                )
+            )
+        dynamic_chart.update_layout(
+            barmode="group",
+            title=f"{graph_filter_label} · факт + скользящее среднее",
+            yaxis_title="Продано, шт.",
+            xaxis_title="Сравнимый день",
+            hovermode="x unified",
+            height=520,
+            margin=dict(l=20, r=20, t=60, b=80),
+        )
+        st.plotly_chart(dynamic_chart, use_container_width=True)
+        st.caption(
+            "Столбцы — фактическое количество продаж за день. Линии СР — скользящее среднее; "
+            "его окно можно менять ползунком сверху."
+        )
+
+        report_excel = build_period_comparison_excel(
+            report_tables,
+            dynamic_data,
+            report_period_1,
+            report_period_2,
+            report_match_weekdays_state,
+            report_dates_1,
+            report_dates_2,
+            rolling_window,
+            graph_filter_label,
+        )
+        report_html = build_period_comparison_html(
+            category_chart,
+            delta_chart,
+            dynamic_chart,
+            "Отчет сравнения продаж",
+        )
+        export_cols = st.columns(2)
+        with export_cols[0]:
+            st.download_button(
+                "Скачать табличный отчет Excel",
+                data=report_excel,
+                file_name=(
+                    f"report_sales_{report_period_1[0]:%Y%m%d}_{report_period_1[1]:%Y%m%d}__"
+                    f"{report_period_2[0]:%Y%m%d}_{report_period_2[1]:%Y%m%d}.xlsx"
+                ),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="report_excel_download_v770",
+            )
+        with export_cols[1]:
+            st.download_button(
+                "Скачать графический отчет HTML",
+                data=report_html,
+                file_name=(
+                    f"report_charts_{report_period_1[0]:%Y%m%d}_{report_period_2[0]:%Y%m%d}.html"
+                ),
+                mime="text/html",
+                use_container_width=True,
+                key="report_html_download_v770",
+            )
+
 
 with tab_dashboard:
     col1, col2 = st.columns(2)
