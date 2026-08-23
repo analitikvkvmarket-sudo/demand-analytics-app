@@ -3564,7 +3564,7 @@ def export_excel(
 
 
 st.title("Анализ структуры спроса")
-st.caption("Версия 75.5.5 · Windows: запоминание подключения на 30 дней · Colab/Linux: пароль только на текущую сессию · выручка по точкам")
+st.caption("Версия 75.6 · Все категории в анализе категории · вкладка Отчёты")
 
 if not ENTITY_FILE.exists():
     st.error(f"Не найден справочник: {ENTITY_FILE.name}")
@@ -3901,10 +3901,10 @@ metric_columns[2].metric("Точек", filtered_sku["point"].nunique())
 metric_columns[3].metric("Активных SKU", filtered_sku["sku"].nunique())
 metric_columns[4].metric("Покрытие сущностями", f"{coverage:.1%}")
 
-tab_dashboard, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_forecast = st.tabs(
+tab_dashboard, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_forecast, tab_reports = st.tabs(
     [
         "Дашборд", "Топ-3 сущности", "Сущности", "Детализация", "Детализация категории", "ABC продукции",
-        "Анализ категории", "Окно свежести", "Списания категорий", "Прогноз плана",
+        "Анализ категории", "Окно свежести", "Списания категорий", "Прогноз плана", "Отчёты",
     ]
 )
 
@@ -5752,10 +5752,15 @@ with tab_category_analysis:
     }
     category_analysis_controls = st.columns([1.2, 1.8, 1.0])
     with category_analysis_controls[0]:
+        category_analysis_options = ["Все категории"] + sorted(
+            set(entities["category"].dropna().astype(str).unique())
+            | set(category_profile["category"].dropna().astype(str).unique())
+        )
         selected_analysis_category = st.selectbox(
             "Категория",
-            sorted(entities["category"].dropna().astype(str).unique()),
-            key="category_analysis_category_v37",
+            category_analysis_options,
+            index=0,
+            key="category_analysis_category_v76_all",
         )
     with category_analysis_controls[1]:
         selected_weekday_names = st.multiselect(
@@ -5871,9 +5876,12 @@ with tab_category_analysis:
             category_sales_history["category"] = category_sales_history["category"].fillna(
                 "Не сопоставлено"
             )
-            category_lifecycle_history = category_sales_history[
-                category_sales_history["category"] == selected_analysis_category
-            ].copy()
+            if selected_analysis_category == "Все категории":
+                category_lifecycle_history = category_sales_history.copy()
+            else:
+                category_lifecycle_history = category_sales_history[
+                    category_sales_history["category"] == selected_analysis_category
+                ].copy()
             category_full_period_frames = []
             for period_name, range_start, range_end in category_periods:
                 period_frame = category_lifecycle_history[
@@ -6364,7 +6372,7 @@ with tab_category_analysis:
 
                 sku_daily_by_point = (
                     category_table_history.groupby(
-                        ["Период", "point", "sku", "product_name", "business_date"],
+                        ["Период", "point", "category", "sku", "product_name", "business_date"],
                         as_index=False,
                         dropna=False,
                     )["sold_quantity"].sum()
@@ -6374,7 +6382,7 @@ with tab_category_analysis:
                 ]
                 sku_by_point = (
                     sku_daily_by_point.groupby(
-                        ["Период", "point", "sku", "product_name"],
+                        ["Период", "point", "category", "sku", "product_name"],
                         as_index=False,
                         dropna=False,
                     )
@@ -6388,7 +6396,7 @@ with tab_category_analysis:
                 )
                 sku_by_point = sku_by_point.rename(
                     columns={
-                        "point": "Точка", "sku": "SKU", "product_name": "Название товара",
+                        "point": "Точка", "category": "Категория", "sku": "SKU", "product_name": "Название товара",
                         "total_sales": "Продано всего, шт.", "active_days": "Дней с продажами",
                         "average_sales": "Среднее за день продажи, шт.",
                     }
@@ -6397,7 +6405,7 @@ with tab_category_analysis:
                 if len(selected_category_points) > 1:
                     sku_daily_combined = (
                         category_table_history.groupby(
-                            ["Период", "sku", "product_name", "business_date"],
+                            ["Период", "category", "sku", "product_name", "business_date"],
                             as_index=False,
                             dropna=False,
                         )["sold_quantity"].sum()
@@ -6407,7 +6415,7 @@ with tab_category_analysis:
                     ]
                     sku_combined = (
                         sku_daily_combined.groupby(
-                            ["Период", "sku", "product_name"],
+                            ["Период", "category", "sku", "product_name"],
                             as_index=False,
                             dropna=False,
                         )
@@ -6422,7 +6430,7 @@ with tab_category_analysis:
                     sku_combined.insert(0, "Точка", "Все выбранные")
                     sku_combined = sku_combined.rename(
                         columns={
-                            "sku": "SKU", "product_name": "Название товара",
+                            "category": "Категория", "sku": "SKU", "product_name": "Название товара",
                             "total_sales": "Продано всего, шт.", "active_days": "Дней с продажами",
                             "average_sales": "Среднее за день продажи, шт.",
                         }
@@ -6474,6 +6482,7 @@ with tab_category_analysis:
                     sku_daily_display = sku_daily_by_point.rename(
                         columns={
                             "point": "Точка",
+                            "category": "Категория",
                             "sku": "SKU",
                             "product_name": "Название товара",
                             "business_date": "Дата продажи",
@@ -6487,6 +6496,7 @@ with tab_category_analysis:
                         sku_daily_combined_display = sku_daily_combined_display.rename(
                             columns={
                                 "point": "Точка",
+                                "category": "Категория",
                                 "sku": "SKU",
                                 "product_name": "Название товара",
                                 "business_date": "Дата продажи",
@@ -6512,7 +6522,7 @@ with tab_category_analysis:
                     st.dataframe(
                         sku_daily_table[
                             [
-                                "Период", "Точка", "Дата продажи", "День недели", "SKU",
+                                "Период", "Точка", "Категория", "Дата продажи", "День недели", "SKU",
                                 "Название товара", "Продано за день, шт.",
                             ]
                         ],
@@ -8098,6 +8108,539 @@ with tab_forecast:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
+with tab_reports:
+    st.subheader("Отчёты по точкам, категориям и SKU")
+    st.caption(
+        "Отчёт объединяет продажи выбранного периода с отгрузками из встроенной матрицы свежести. "
+        "SKU без покупок считаются только среди товаров, которые были отгружены в выбранные точки."
+    )
+
+    report_controls = st.columns([1.35, 1.0, 1.0])
+    with report_controls[0]:
+        report_range = st.date_input(
+            "Период отчёта",
+            value=(period[0], period[1]),
+            min_value=period[0],
+            max_value=period[1],
+            key="reports_period_v1",
+            help="Для периода шире текущей загрузки сначала измените общий период продаж вверху приложения.",
+        )
+    if isinstance(report_range, (tuple, list)) and len(report_range) == 2:
+        report_start, report_end = report_range
+    else:
+        report_start = report_end = report_range
+    if report_start > report_end:
+        report_start, report_end = report_end, report_start
+
+    report_point_options = sorted(
+        set(point_options), key=lambda value: int(str(value).replace("Т", ""))
+    )
+    default_report_points = [value for value in point_filter if value in report_point_options]
+    with report_controls[1]:
+        report_points = st.multiselect(
+            "Точки отчёта",
+            options=report_point_options,
+            default=default_report_points or report_point_options,
+            key="reports_points_v1",
+        )
+
+    all_report_categories = sorted(
+        set(category_profile["category"].dropna().astype(str).tolist())
+        | set(detail_loading_plan.get("matrix_category", pd.Series(dtype=str)).dropna().astype(str).tolist())
+    )
+    with report_controls[2]:
+        report_categories = st.multiselect(
+            "Категории отчёта",
+            options=all_report_categories,
+            default=all_report_categories,
+            key="reports_categories_v1",
+        )
+
+    report_sales = daily_detail_with_loading.copy()
+    report_sales["business_date"] = pd.to_datetime(
+        report_sales["business_date"], errors="coerce"
+    ).dt.date
+    report_sales["sales"] = pd.to_numeric(report_sales["sales"], errors="coerce").fillna(0.0)
+    report_sales["revenue"] = pd.to_numeric(report_sales["revenue"], errors="coerce").fillna(0.0)
+    report_sales["sku"] = report_sales["sku"].map(normalize_sku)
+    report_sales = report_sales[
+        report_sales["business_date"].between(report_start, report_end, inclusive="both")
+        & report_sales["point"].isin(report_points)
+        & report_sales["category"].isin(report_categories)
+    ].copy()
+
+    report_plans = detail_loading_plan.copy()
+    if not report_plans.empty:
+        report_plans["plan_date"] = pd.to_datetime(
+            report_plans["plan_date"], errors="coerce"
+        ).dt.date
+        report_plans["point_number"] = pd.to_numeric(
+            report_plans["point_number"], errors="coerce"
+        )
+        report_plans = report_plans[
+            report_plans["plan_date"].notna()
+            & report_plans["point_number"].notna()
+        ].copy()
+        report_plans["point_number"] = report_plans["point_number"].astype(int)
+        report_plans["point"] = report_plans["point_number"].map(
+            lambda value: f"Т{int(value)}"
+        )
+        report_plans["sku"] = report_plans["sku"].map(normalize_sku)
+        report_plans["analyst_plan"] = pd.to_numeric(
+            report_plans["analyst_plan"], errors="coerce"
+        ).fillna(0.0).clip(lower=0)
+        report_plans["matrix_category"] = report_plans["matrix_category"].map(
+            normalize_matrix_category
+        )
+        report_plans = report_plans[
+            report_plans["plan_date"].between(report_start, report_end, inclusive="both")
+            & report_plans["point"].isin(report_points)
+            & report_plans["matrix_category"].isin(report_categories)
+        ].copy()
+
+    sold_sku = (
+        report_sales.groupby(["point", "sku"], as_index=False, dropna=False)
+        .agg(
+            sold_qty=("sales", "sum"),
+            revenue=("revenue", "sum"),
+            sales_category=("category", "last"),
+            sales_name=("product_name", "last"),
+        )
+        if not report_sales.empty
+        else pd.DataFrame(
+            columns=["point", "sku", "sold_qty", "revenue", "sales_category", "sales_name"]
+        )
+    )
+
+    shipped_sku = (
+        report_plans.groupby(["point", "sku"], as_index=False, dropna=False)
+        .agg(
+            shipped_qty=("analyst_plan", "sum"),
+            plan_category=("matrix_category", "last"),
+            plan_name=("product_name", "last"),
+            first_loading=("plan_date", "min"),
+            last_loading=("plan_date", "max"),
+            loading_days=("plan_date", "nunique"),
+        )
+        if not report_plans.empty
+        else pd.DataFrame(
+            columns=[
+                "point", "sku", "shipped_qty", "plan_category", "plan_name",
+                "first_loading", "last_loading", "loading_days"
+            ]
+        )
+    )
+
+    item_report = sold_sku.merge(shipped_sku, on=["point", "sku"], how="outer")
+    if not item_report.empty:
+        item_report["sold_qty"] = pd.to_numeric(item_report["sold_qty"], errors="coerce").fillna(0.0)
+        item_report["revenue"] = pd.to_numeric(item_report["revenue"], errors="coerce").fillna(0.0)
+        item_report["shipped_qty"] = pd.to_numeric(item_report["shipped_qty"], errors="coerce").fillna(0.0)
+        item_report["category"] = item_report["sales_category"].fillna(item_report["plan_category"])
+        item_report["category"] = item_report["category"].fillna("Не сопоставлено").map(normalize_matrix_category)
+        item_report["product_name"] = item_report["sales_name"].fillna(item_report["plan_name"]).fillna("")
+        item_report["purchased"] = item_report["sold_qty"] > 0
+        item_report["not_purchased"] = (item_report["sold_qty"] <= 0) & (item_report["shipped_qty"] > 0)
+        item_report["green_days"] = item_report["category"].map(product_green_days)
+        item_report["lifecycle_days"] = item_report["category"].map(product_lifecycle_days)
+        item_report["sell_through_pct"] = (
+            safe_ratio(item_report["sold_qty"], item_report["shipped_qty"]) * 100
+        ).fillna(0.0).round(1)
+
+        if "freshness_stage" in report_sales.columns and not report_sales.empty:
+            stage_source = report_sales.copy()
+            stage_source["freshness_stage"] = stage_source["freshness_stage"].fillna("Нет партии")
+            stage_summary = (
+                stage_source.groupby(["point", "sku", "freshness_stage"], as_index=False)["sales"].sum()
+                .pivot_table(
+                    index=["point", "sku"],
+                    columns="freshness_stage",
+                    values="sales",
+                    aggfunc="sum",
+                    fill_value=0,
+                )
+                .reset_index()
+            )
+            item_report = item_report.merge(stage_summary, on=["point", "sku"], how="left")
+
+        for stage_column in ["Основной период", "Завершающий период", "После срока", "Нет партии"]:
+            if stage_column not in item_report.columns:
+                item_report[stage_column] = 0.0
+            item_report[stage_column] = pd.to_numeric(
+                item_report[stage_column], errors="coerce"
+            ).fillna(0.0)
+
+    if item_report.empty:
+        st.warning("По выбранным точкам и периоду нет данных для отчёта.")
+    else:
+        purchased_items = item_report[item_report["purchased"]].copy()
+        not_purchased_items = item_report[item_report["not_purchased"]].copy()
+
+        total_shipped = float(item_report["shipped_qty"].sum())
+        total_sold = float(item_report["sold_qty"].sum())
+        total_revenue_report = float(item_report["revenue"].sum())
+        total_sell_through = (total_sold / total_shipped * 100) if total_shipped > 0 else 0.0
+
+        total_metrics = st.columns(6)
+        total_metrics[0].metric("Отгружено, шт.", f"{total_shipped:,.0f}".replace(",", " "))
+        total_metrics[1].metric("Продано, шт.", f"{total_sold:,.0f}".replace(",", " "))
+        total_metrics[2].metric("Выручка, ₽", f"{total_revenue_report:,.0f}".replace(",", " "))
+        total_metrics[3].metric("Купленных SKU", int(purchased_items["sku"].nunique()))
+        total_metrics[4].metric("SKU без покупок", int(not_purchased_items["sku"].nunique()))
+        total_metrics[5].metric("Реализация отгрузки", f"{total_sell_through:.1f}%")
+
+        point_base = (
+            item_report.groupby("point", as_index=False)
+            .agg(
+                shipped_qty=("shipped_qty", "sum"),
+                sold_qty=("sold_qty", "sum"),
+                revenue=("revenue", "sum"),
+            )
+        )
+        purchased_counts = (
+            purchased_items.groupby("point")["sku"].nunique().rename("purchased_sku")
+            if not purchased_items.empty else pd.Series(dtype=float, name="purchased_sku")
+        )
+        no_sale_counts = (
+            not_purchased_items.groupby("point")["sku"].nunique().rename("not_purchased_sku")
+            if not not_purchased_items.empty else pd.Series(dtype=float, name="not_purchased_sku")
+        )
+        point_summary = point_base.merge(purchased_counts, on="point", how="left").merge(
+            no_sale_counts, on="point", how="left"
+        )
+        point_summary[["purchased_sku", "not_purchased_sku"]] = point_summary[
+            ["purchased_sku", "not_purchased_sku"]
+        ].fillna(0).astype(int)
+        point_summary["sell_through_pct"] = (
+            safe_ratio(point_summary["sold_qty"], point_summary["shipped_qty"]) * 100
+        ).fillna(0.0).round(1)
+        point_summary["point_sort"] = pd.to_numeric(
+            point_summary["point"].astype(str).str.extract(r"(\d+)", expand=False), errors="coerce"
+        )
+        point_summary = point_summary.sort_values("point_sort").drop(columns="point_sort")
+        total_row = pd.DataFrame([
+            {
+                "point": "ИТОГО",
+                "shipped_qty": total_shipped,
+                "sold_qty": total_sold,
+                "revenue": total_revenue_report,
+                "purchased_sku": int(purchased_items["sku"].nunique()),
+                "not_purchased_sku": int(not_purchased_items["sku"].nunique()),
+                "sell_through_pct": round(total_sell_through, 1),
+            }
+        ])
+        point_summary_with_total = pd.concat([point_summary, total_row], ignore_index=True)
+        point_display = point_summary_with_total.rename(columns={
+            "point": "Точка",
+            "shipped_qty": "Отгружено, шт.",
+            "sold_qty": "Продано, шт.",
+            "revenue": "Выручка, ₽",
+            "purchased_sku": "Купленных SKU",
+            "not_purchased_sku": "SKU без покупок",
+            "sell_through_pct": "Реализация отгрузки, %",
+        })
+
+        st.markdown("#### Показатели по каждой точке и общий итог")
+        st.dataframe(
+            point_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Отгружено, шт.": st.column_config.NumberColumn(format="%.0f"),
+                "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
+                "Выручка, ₽": st.column_config.NumberColumn(format="%.2f"),
+                "Реализация отгрузки, %": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+
+        point_chart = go.Figure()
+        point_chart.add_trace(go.Bar(
+            x=point_summary["point"], y=point_summary["shipped_qty"], name="Отгружено, шт."
+        ))
+        point_chart.add_trace(go.Bar(
+            x=point_summary["point"], y=point_summary["sold_qty"], name="Продано, шт."
+        ))
+        point_chart.update_layout(
+            title="Отгрузка и продажи по точкам",
+            barmode="group",
+            xaxis_title="Точка",
+            yaxis_title="Количество, шт.",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        )
+        st.plotly_chart(point_chart, use_container_width=True)
+
+        category_point_summary = (
+            item_report.groupby(["point", "category"], as_index=False)
+            .agg(
+                shipped_qty=("shipped_qty", "sum"),
+                sold_qty=("sold_qty", "sum"),
+                revenue=("revenue", "sum"),
+                sku=("sku", "nunique"),
+            )
+        )
+        category_point_summary["sell_through_pct"] = (
+            safe_ratio(category_point_summary["sold_qty"], category_point_summary["shipped_qty"]) * 100
+        ).fillna(0.0).round(1)
+
+        st.markdown("#### Категории по точкам")
+        category_point_chart = px.bar(
+            category_point_summary,
+            x="point",
+            y="sold_qty",
+            color="category",
+            barmode="stack",
+            labels={"point": "Точка", "sold_qty": "Продано, шт.", "category": "Категория"},
+            title="Структура продаж категорий по точкам",
+        )
+        st.plotly_chart(category_point_chart, use_container_width=True)
+
+        category_point_display = category_point_summary.rename(columns={
+            "point": "Точка",
+            "category": "Категория",
+            "shipped_qty": "Отгружено, шт.",
+            "sold_qty": "Продано, шт.",
+            "revenue": "Выручка, ₽",
+            "sku": "SKU",
+            "sell_through_pct": "Реализация отгрузки, %",
+        })
+        st.dataframe(
+            category_point_display.sort_values(["Точка", "Продано, шт."], ascending=[True, False]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("#### Динамика категорий")
+        granularity = st.radio(
+            "Разрез времени",
+            options=["День", "Неделя", "Месяц"],
+            index=2,
+            horizontal=True,
+            key="reports_granularity_v1",
+        )
+        if report_sales.empty:
+            st.info("Для выбранного периода нет продаж для графика динамики.")
+            dynamics = pd.DataFrame()
+        else:
+            dynamics_source = report_sales.copy()
+            date_series = pd.to_datetime(dynamics_source["business_date"], errors="coerce")
+            if granularity == "День":
+                dynamics_source["period_bucket"] = date_series.dt.normalize()
+            elif granularity == "Неделя":
+                dynamics_source["period_bucket"] = (
+                    date_series - pd.to_timedelta(date_series.dt.weekday, unit="D")
+                ).dt.normalize()
+            else:
+                dynamics_source["period_bucket"] = date_series.dt.to_period("M").dt.to_timestamp()
+            dynamics = (
+                dynamics_source.groupby(["period_bucket", "category"], as_index=False)
+                .agg(sold_qty=("sales", "sum"), revenue=("revenue", "sum"))
+            )
+            dynamics_chart = px.line(
+                dynamics,
+                x="period_bucket",
+                y="sold_qty",
+                color="category",
+                markers=True,
+                labels={
+                    "period_bucket": "Период",
+                    "sold_qty": "Продано, шт.",
+                    "category": "Категория",
+                },
+                title=f"Категории товаров · {granularity.lower()}",
+            )
+            st.plotly_chart(dynamics_chart, use_container_width=True)
+
+        st.markdown("#### Купленные и некупленные SKU · зеркальный график")
+        mirror_controls = st.columns([1.0, 1.0, 0.8])
+        with mirror_controls[0]:
+            mirror_point = st.selectbox(
+                "Точка для графика",
+                options=["Все точки"] + report_points,
+                key="reports_mirror_point_v1",
+            )
+        with mirror_controls[1]:
+            mirror_category = st.selectbox(
+                "Категория для графика",
+                options=["Все категории"] + report_categories,
+                key="reports_mirror_category_v1",
+            )
+        with mirror_controls[2]:
+            mirror_top_n = st.slider(
+                "SKU на графике", min_value=10, max_value=60, value=30, step=5,
+                key="reports_mirror_top_v1",
+            )
+
+        mirror_source = item_report.copy()
+        if mirror_point != "Все точки":
+            mirror_source = mirror_source[mirror_source["point"].eq(mirror_point)]
+        if mirror_category != "Все категории":
+            mirror_source = mirror_source[mirror_source["category"].eq(mirror_category)]
+        mirror_grouped = (
+            mirror_source.groupby(["sku", "product_name", "category"], as_index=False)
+            .agg(sold_qty=("sold_qty", "sum"), shipped_qty=("shipped_qty", "sum"))
+        )
+        mirror_grouped["positive_sales"] = mirror_grouped["sold_qty"].where(
+            mirror_grouped["sold_qty"] > 0, 0.0
+        )
+        mirror_grouped["negative_no_sales"] = mirror_grouped["shipped_qty"].where(
+            (mirror_grouped["sold_qty"] <= 0) & (mirror_grouped["shipped_qty"] > 0), 0.0
+        ) * -1
+        mirror_grouped["magnitude"] = mirror_grouped["positive_sales"].abs() + mirror_grouped["negative_no_sales"].abs()
+        mirror_grouped = mirror_grouped.sort_values("magnitude", ascending=False).head(mirror_top_n)
+        mirror_grouped["label"] = mirror_grouped.apply(
+            lambda row: f"{row['sku']} · {str(row['product_name'])[:32]}", axis=1
+        )
+
+        if mirror_grouped.empty:
+            st.info("Нет SKU для зеркального графика.")
+        else:
+            mirror_chart = go.Figure()
+            mirror_chart.add_trace(go.Bar(
+                x=mirror_grouped["label"],
+                y=mirror_grouped["positive_sales"],
+                name="Купили · количество продаж",
+                customdata=mirror_grouped[["category", "shipped_qty"]],
+                hovertemplate=(
+                    "%{x}<br>Категория: %{customdata[0]}<br>Купили: %{y:.0f} шт."
+                    "<br>Отгружено: %{customdata[1]:.0f} шт.<extra></extra>"
+                ),
+            ))
+            mirror_chart.add_trace(go.Bar(
+                x=mirror_grouped["label"],
+                y=mirror_grouped["negative_no_sales"],
+                name="Не купили · отгружено, но продаж 0",
+                customdata=mirror_grouped[["category", "shipped_qty"]],
+                hovertemplate=(
+                    "%{x}<br>Категория: %{customdata[0]}<br>Не купили"
+                    "<br>Было отгружено: %{customdata[1]:.0f} шт.<extra></extra>"
+                ),
+            ))
+            mirror_chart.update_layout(
+                title="Выше нуля — купленные SKU; ниже нуля — отгруженные SKU без покупок",
+                barmode="relative",
+                xaxis_title="SKU",
+                yaxis_title="Количество, шт.",
+                yaxis=dict(zeroline=True, zerolinewidth=2),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                margin=dict(b=170),
+            )
+            mirror_chart.update_xaxes(tickangle=-65)
+            st.plotly_chart(mirror_chart, use_container_width=True)
+
+        st.markdown("#### Точка → категория → SKU")
+        detail_controls = st.columns(2)
+        with detail_controls[0]:
+            detail_point = st.selectbox(
+                "Точка",
+                options=report_points,
+                key="reports_detail_point_v1",
+            )
+        detail_category_options = sorted(
+            item_report.loc[item_report["point"].eq(detail_point), "category"].dropna().unique().tolist()
+        )
+        with detail_controls[1]:
+            detail_category = st.selectbox(
+                "Категория",
+                options=detail_category_options,
+                key="reports_detail_category_v1",
+            ) if detail_category_options else None
+
+        detail_items = item_report[
+            item_report["point"].eq(detail_point)
+            & item_report["category"].eq(detail_category)
+        ].copy() if detail_category is not None else pd.DataFrame()
+
+        purchased_detail = detail_items[detail_items["sold_qty"] > 0].copy()
+        no_purchase_detail = detail_items[
+            (detail_items["sold_qty"] <= 0) & (detail_items["shipped_qty"] > 0)
+        ].copy()
+
+        def report_item_view(frame: pd.DataFrame) -> pd.DataFrame:
+            if frame.empty:
+                return pd.DataFrame(columns=[
+                    "Точка", "Категория", "SKU", "Название товара", "Отгружено, шт.",
+                    "Купили, шт.", "Выручка, ₽", "Основной период, дн.", "Срок, дн.",
+                    "Продано в основном периоде", "Продано в завершающем периоде",
+                    "Реализация отгрузки, %", "Первая отгрузка", "Последняя отгрузка"
+                ])
+            result = frame.copy()
+            result = result.rename(columns={
+                "point": "Точка",
+                "category": "Категория",
+                "sku": "SKU",
+                "product_name": "Название товара",
+                "shipped_qty": "Отгружено, шт.",
+                "sold_qty": "Купили, шт.",
+                "revenue": "Выручка, ₽",
+                "green_days": "Основной период, дн.",
+                "lifecycle_days": "Срок, дн.",
+                "Основной период": "Продано в основном периоде",
+                "Завершающий период": "Продано в завершающем периоде",
+                "sell_through_pct": "Реализация отгрузки, %",
+                "first_loading": "Первая отгрузка",
+                "last_loading": "Последняя отгрузка",
+            })
+            columns = [
+                "Точка", "Категория", "SKU", "Название товара", "Отгружено, шт.",
+                "Купили, шт.", "Выручка, ₽", "Основной период, дн.", "Срок, дн.",
+                "Продано в основном периоде", "Продано в завершающем периоде",
+                "Реализация отгрузки, %", "Первая отгрузка", "Последняя отгрузка"
+            ]
+            return result[columns].sort_values(["Купили, шт.", "Отгружено, шт."], ascending=[False, False])
+
+        purchased_display = report_item_view(purchased_detail)
+        no_purchase_display = report_item_view(no_purchase_detail)
+
+        st.markdown("##### Купленные SKU")
+        st.caption(
+            "В таблице видно, сколько SKU было отгружено по матрице свежести, сколько купили, "
+            "а также срок и продажи внутри основного/завершающего периода."
+        )
+        if purchased_display.empty:
+            st.info("В выбранной точке и категории покупок не было.")
+        else:
+            st.dataframe(purchased_display, use_container_width=True, hide_index=True)
+
+        st.markdown("##### SKU, которые не купили")
+        st.caption("Это отгруженные SKU, по которым за выбранный период количество продаж равно нулю.")
+        if no_purchase_display.empty:
+            st.success("Среди отгруженных SKU нет товаров с нулевыми продажами.")
+        else:
+            st.dataframe(no_purchase_display, use_container_width=True, hide_index=True)
+
+        purchased_export = report_item_view(purchased_items)
+        no_purchase_export = report_item_view(not_purchased_items)
+        all_items_export = report_item_view(item_report)
+        dynamics_export = dynamics.rename(columns={
+            "period_bucket": "Период",
+            "category": "Категория",
+            "sold_qty": "Продано, шт.",
+            "revenue": "Выручка, ₽",
+        }) if not dynamics.empty else pd.DataFrame()
+
+        report_export_buffer = io.BytesIO()
+        with pd.ExcelWriter(report_export_buffer, engine="openpyxl") as writer:
+            point_display.to_excel(writer, sheet_name="Итог по точкам", index=False)
+            category_point_display.to_excel(writer, sheet_name="Категории по точкам", index=False)
+            purchased_export.to_excel(writer, sheet_name="Купленные SKU", index=False)
+            no_purchase_export.to_excel(writer, sheet_name="Не купленные SKU", index=False)
+            all_items_export.to_excel(writer, sheet_name="Все SKU", index=False)
+            if not dynamics_export.empty:
+                dynamics_export.to_excel(writer, sheet_name="Динамика", index=False)
+            for worksheet in writer.book.worksheets:
+                worksheet.freeze_panes = "A2"
+                worksheet.auto_filter.ref = worksheet.dimensions
+                for cells in worksheet.columns:
+                    width = min(max(len(str(cell.value or "")) for cell in cells) + 2, 42)
+                    worksheet.column_dimensions[cells[0].column_letter].width = width
+
+        st.download_button(
+            "Скачать полный отчёт (Excel)",
+            data=report_export_buffer.getvalue(),
+            file_name=f"отчет_по_точкам_SKU_{report_start:%Y-%m-%d}_{report_end:%Y-%m-%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_reports_full_v1",
+        )
 excel_bytes = export_excel(filtered_sku, filtered_category, filtered_entity, filtered_detail)
 st.download_button(
     "Скачать Excel",
