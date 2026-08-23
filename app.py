@@ -1511,30 +1511,18 @@ def calculate_sku_daily_forecast(
                 if not sku_history.empty
                 else pd.DataFrame(columns=["business_date", "sold_quantity"])
             )
-            # Факт для прогноза считаем в целых штуках. Сначала округляем
-            # фактические продажи каждого дня до целого количества, затем уже
-            # считаем число дней продаж, общий факт и среднее. Само среднее
-            # также округляется до целого и именно это целое значение участвует
-            # в расчёте плана. Для положительных значений используем 0.5 вверх.
-            if not daily_sales.empty:
-                daily_sales["sold_quantity"] = daily_sales["sold_quantity"].map(
-                    lambda value: int(math.floor(float(value) + 0.5))
-                )
             daily_sales = daily_sales[daily_sales["sold_quantity"] > 0]
             sale_days = int(daily_sales["business_date"].nunique())
-            sold_total = int(daily_sales["sold_quantity"].sum()) if sale_days else 0
+            sold_total = float(daily_sales["sold_quantity"].sum()) if sale_days else 0.0
             used_default_average = sale_days == 0
             low_sales_day_count = sale_days in (1, 2)
-            raw_average_per_sale_day = sold_total / sale_days if sale_days else 1.0
-            average_per_sale_day = int(
-                math.floor(float(raw_average_per_sale_day) + 0.5)
-            )
+            average_per_sale_day = sold_total / sale_days if sale_days else 1.0
             lifecycle_days = product_lifecycle_days(item["category"])
             coverage_days = forecast_coverage_days(item["category"])
             average_rule = (
                 "продаж не было, принято базовое среднее 1 шт./день"
                 if used_default_average
-                else "среднее рассчитано по фактическим дням продаж и округлено до целых"
+                else "среднее рассчитано по фактическим дням продаж"
             )
             coverage_rule = (
                 f"{average_rule}; загрузка по категории: "
@@ -1563,10 +1551,10 @@ def calculate_sku_daily_forecast(
                     "Сущность": item["entity"],
                     "SKU": item["sku"],
                     "Название товара": item["product_name"],
-                    "Продано за 2 месяца, шт.": int(sold_total),
+                    "Продано за 2 месяца, шт.": round(sold_total, 3),
                     "Дней с продажами": sale_days,
                     "Среднее SKU за день продажи": (
-                        int(average_per_sale_day)
+                        round(float(average_per_sale_day), 2)
                         if pd.notna(average_per_sale_day)
                         else pd.NA
                     ),
@@ -1575,7 +1563,7 @@ def calculate_sku_daily_forecast(
                     "Идеальный жизненный цикл для плана, дней": coverage_days,
                     "Правило расчёта": coverage_rule,
                     "Расчётная потребность": (
-                        int(calculated_need)
+                        round(float(calculated_need), 2)
                         if pd.notna(calculated_need)
                         else pd.NA
                     ),
@@ -7923,8 +7911,6 @@ with tab_forecast:
         "Загрузите только пустое меню — приложение обработает все даты и все блоки на листе. "
         "Для каждого SKU и каждой точки приложение берёт два календарных "
         "месяца до даты плана и считает среднее только по дням, когда SKU действительно продавался. "
-        "Фактические продажи по дням и рассчитанное среднее округляются до целых штук; "
-        "в расчёте плана используется уже целое среднее. "
         "Множитель загрузки зависит только от категории: вторые блюда — 3 дня, "
         "напитки — 4 дня, остальные категории — 2 дня. "
         "Если SKU на точке не продавался, среднее принимается равным 1 шт./день. "
