@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import calendar as pycalendar
 import io
 import json
 import math
 import os
 import re
+import tempfile
 from copy import copy
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -89,6 +91,22 @@ def resolve_app_file(filename: str, *name_fragments: str) -> Path:
 ENTITY_FILE = resolve_app_file("entities.xlsx", "сущност", "entit")
 ANALYST_LOGIC_FILE = resolve_app_file("analyst_logic.xlsx", "логика", "аналит", "analyst")
 COMBO_MATRIX_FILE = resolve_app_file("combo_matrix.xlsx", "матрица", "комбо", "combo")
+MATRIX_APPS_SCRIPT_URL = os.getenv(
+    "MATRIX_APPS_SCRIPT_URL",
+    "https://script.google.com/macros/s/AKfycbxzpVJGvkHTn8YogBOLO4PtvdQqmkoMx-chNCZ2ijmMIRc_-kcd2WUQ283PNyo5hCo/exec",
+).strip()
+MATRIX_APPS_SCRIPT_KEY = os.getenv(
+    "MATRIX_APPS_SCRIPT_KEY",
+    "VK_MATRIX_2026_8f31c5a7d942",
+).strip()
+GOOGLE_MATRIX_REFRESH_SECONDS = 15 * 60
+GOOGLE_MATRIX_CACHE_FILE = Path(tempfile.gettempdir()) / "vkusnomarket_combo_matrix_cache.xlsx"
+MATRIX_PLAN_SHEETS = [
+    "План 1-я неделя",
+    "План 2-я неделя",
+    "План 3-я неделя",
+    "План 4-я неделя",
+]
 
 st.set_page_config(page_title="Структура спроса", page_icon="📊", layout="wide")
 load_dotenv(APP_DIR / ".env", override=True)
@@ -110,6 +128,171 @@ MONTH_NAMES_RU = {
     11: "Ноябрь",
     12: "Декабрь",
 }
+
+def _coerce_api_cell(value: object) -> object:
+    """Convert Apps Script display values to simple Excel-friendly Python values."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if text == "":
+        return None
+    # Keep dates and labels as text; parsers below already understand Russian date strings.
+    # Convert plain numeric cells so plan quantities remain numeric in the reconstructed XLSX.
+    numeric = text.replace("\u00a0", " ").replace(" ", "").replace(",", ".")
+    if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", numeric):
+        try:
+            number = float(numeric)
+            return int(number) if number.is_integer() else number
+        except ValueError:
+            pass
+    return text
+
+
+def _build_matrix_xlsx_from_apps_script(sheet_payloads: dict[str, list[list[object]]]) -> bytes:
+    """Rebuild a minimal XLSX with the four plan sheets returned by Apps Script."""
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    default_sheet = workbook.active
+    workbook.remove(default_sheet)
+
+    for sheet_name in MATRIX_PLAN_SHEETS:
+        values = sheet_payloads.get(sheet_name, [])
+        worksheet = workbook.create_sheet(title=sheet_name)
+        for row in values:
+            worksheet.append([_coerce_api_cell(value) for value in row])
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
+@st.cache_data(ttl=GOOGLE_MATRIX_REFRESH_SECONDS, show_spinner=False)
+def _fetch_apps_script_matrix_snapshot(
+    api_url: str,
+    api_key: str,
+) -> tuple[bytes, str, str, str]:
+    """Read the four current plan sheets from Apps Script and cache for 15 minutes."""
+    checked_at = datetime.now().isoformat(timespec="seconds")
+    if not api_url or not api_key:
+        return b"", "", checked_at, "не указан URL или ключ Apps Script"
+
+    try:
+        import requests
+
+        session = requests.Session()
+        meta_response = session.get(
+            api_url,
+            params={"key": api_key, "action": "meta"},
+            timeout=60,
+            allow_redirects=True,
+        )
+        meta_response.raise_for_status()
+        meta = meta_response.json()
+        if not meta.get("ok"):
+            raise RuntimeError(meta.get("error") or "Apps Script вернул ошибку meta")
+
+        available_sheets = set(meta.get("sheets") or [])
+        missing = [name for name in MATRIX_PLAN_SHEETS if name not in available_sheets]
+        if missing:
+            raise RuntimeError("в Apps Script не найдены листы: " + ", ".join(missing))
+
+        sheet_payloads: dict[str, list[list[object]]] = {}
+        for sheet_name in MATRIX_PLAN_SHEETS:
+            sheet_response = session.get(
+                api_url,
+                params={"key": api_key, "action": "sheet", "name": sheet_name},
+                timeout=90,
+                allow_redirects=True,
+            )
+            sheet_response.raise_for_status()
+            payload = sheet_response.json()
+            if not payload.get("ok"):
+                raise RuntimeError(
+                    f"{sheet_name}: {payload.get('error') or 'Apps Script вернул ошибку'}"
+                )
+            values = payload.get("values")
+            if not isinstance(values, list):
+                raise RuntimeError(f"{sheet_name}: Apps Script не вернул массив values")
+            sheet_payloads[sheet_name] = values
+
+        content = _build_matrix_xlsx_from_apps_script(sheet_payloads)
+        if content[:2] != b"PK":
+            raise RuntimeError("не удалось собрать XLSX из ответа Apps Script")
+
+        updated_at = str(meta.get("updatedAt") or "").replace("T", " ").replace("Z", " UTC")
+        source = "Apps Script · 2.3 Матрица КОМБО"
+        if updated_at:
+            source += f" · обновлена {updated_at}"
+        return content, source, checked_at, ""
+    except Exception as error:
+        return b"", "", checked_at, f"Apps Script: {error}"
+
+
+def get_current_combo_matrix_snapshot() -> tuple[bytes, str, str, str]:
+    """Return current Apps Script matrix; fall back to last cache or bundled workbook."""
+    google_bytes, google_source, checked_at, google_error = _fetch_apps_script_matrix_snapshot(
+        MATRIX_APPS_SCRIPT_URL,
+        MATRIX_APPS_SCRIPT_KEY,
+    )
+    if google_bytes:
+        try:
+            GOOGLE_MATRIX_CACHE_FILE.write_bytes(google_bytes)
+        except OSError:
+            pass
+        return google_bytes, google_source, checked_at, ""
+
+    if GOOGLE_MATRIX_CACHE_FILE.exists():
+        try:
+            cached_bytes = GOOGLE_MATRIX_CACHE_FILE.read_bytes()
+            if cached_bytes[:2] == b"PK":
+                return (
+                    cached_bytes,
+                    "Резерв · последняя Apps Script-копия",
+                    checked_at,
+                    google_error,
+                )
+        except OSError:
+            pass
+
+    if COMBO_MATRIX_FILE.exists():
+        try:
+            bundled_bytes = COMBO_MATRIX_FILE.read_bytes()
+            return (
+                bundled_bytes,
+                "Резерв · combo_matrix.xlsx из сборки",
+                checked_at,
+                google_error,
+            )
+        except OSError as error:
+            google_error = f"{google_error}; локальная матрица: {error}".strip("; ")
+
+    return b"", "Матрица недоступна", checked_at, google_error
+
+def _combo_matrix_signature(matrix_bytes: bytes, source: str) -> str:
+    digest = hashlib.sha256(matrix_bytes).hexdigest() if matrix_bytes else "empty"
+    return f"{digest}|{source}"
+
+
+@st.fragment(run_every="15m")
+def _matrix_auto_refresh_watcher() -> None:
+    """Refresh the Apps Script matrix in the background while the app session is open."""
+    if "analysis" not in st.session_state:
+        return
+    matrix_bytes, source, _, _ = get_current_combo_matrix_snapshot()
+    signature = _combo_matrix_signature(matrix_bytes, source)
+    state_key = "combo_matrix_signature_v761"
+    previous = st.session_state.get(state_key)
+    if previous is None:
+        st.session_state[state_key] = signature
+        return
+    if previous != signature:
+        st.session_state[state_key] = signature
+        st.rerun()
+
 
 
 def _dpapi_encrypt_text(value: str) -> str:
@@ -3722,7 +3905,7 @@ def export_excel(
 
 
 st.title("Анализ структуры спроса")
-st.caption("Версия 75.5.7 · история продаж SKU из меню в Окне свежести · период из Параметров")
+st.caption("Версия 75.6.1 · Окно свежести: матрица через Apps Script обновляется каждые 15 минут")
 
 if not ENTITY_FILE.exists():
     st.error(f"Не найден справочник: {ENTITY_FILE.name}")
@@ -3935,10 +4118,18 @@ filtered_entity = entity_profile[
     entity_profile["category"].isin(category_filter) & entity_profile["point"].isin(point_filter)
 ]
 filtered_sku = sku_point[sku_point["category"].isin(category_filter) & sku_point["point"].isin(point_filter)]
+matrix_snapshot_bytes, matrix_snapshot_source, matrix_snapshot_checked_at, matrix_snapshot_error = (
+    get_current_combo_matrix_snapshot()
+)
+st.session_state["combo_matrix_signature_v761"] = _combo_matrix_signature(
+    matrix_snapshot_bytes, matrix_snapshot_source
+)
+_matrix_auto_refresh_watcher()
+
 try:
     detail_loading_plan = (
-        parse_freshness_plan(COMBO_MATRIX_FILE.read_bytes())
-        if COMBO_MATRIX_FILE.exists() else pd.DataFrame()
+        parse_freshness_plan(matrix_snapshot_bytes)
+        if matrix_snapshot_bytes else pd.DataFrame()
     )
     daily_detail_with_loading = attach_loading_dates_to_sales(daily_detail, detail_loading_plan)
 except Exception:
@@ -6801,19 +6992,39 @@ with tab_sales_time:
         "напитки: 4 зелёных + 3 серых дня. "
         "Скидка 40% применяется только в последний день срока."
     )
-    # В окне свежести источник один: встроенная актуальная «2.3 Матрица КОМБО».
-    # Отдельный загрузчик плана больше не нужен и не может случайно подменить источник.
-    if not COMBO_MATRIX_FILE.exists():
-        st.error(
-            "Не найдена встроенная матрица 2.3. Проверьте, что combo_matrix.xlsx "
-            "лежит рядом с app.py."
-        )
+    # Основной источник — Apps Script, связанный с Google Sheet «2.3 Матрица КОМБО».
+    # Снимок обновляется автоматически каждые 15 минут; локальный XLSX — только резерв.
+    matrix_status_columns = st.columns([4.0, 1.0])
+    with matrix_status_columns[0]:
+        if matrix_snapshot_source.startswith("Apps Script"):
+            st.success(
+                f"Матрица: {matrix_snapshot_source}. Автообновление каждые 15 минут · "
+                f"проверено {matrix_snapshot_checked_at.replace('T', ' ')}."
+            )
+        else:
+            st.warning(
+                f"Матрица сейчас загружена из резерва: {matrix_snapshot_source}. "
+                "Приложение продолжит пытаться получить актуальную матрицу через Apps Script каждые 15 минут."
+            )
+            if matrix_snapshot_error:
+                st.caption(f"Причина: {matrix_snapshot_error}")
+    with matrix_status_columns[1]:
+        if st.button(
+            "Обновить матрицу сейчас",
+            use_container_width=True,
+            key="refresh_google_matrix_now_v761",
+        ):
+            _fetch_apps_script_matrix_snapshot.clear()
+            st.rerun()
+
+    if not matrix_snapshot_bytes:
+        st.error("Матрица 2.3 недоступна ни через Apps Script, ни в резервной копии.")
         sales_time_plans = pd.DataFrame()
     else:
         try:
-            sales_time_plans = parse_freshness_plan(COMBO_MATRIX_FILE.read_bytes())
+            sales_time_plans = parse_freshness_plan(matrix_snapshot_bytes)
         except Exception as error:
-            st.error(f"Не удалось прочитать встроенную матрицу 2.3: {error}")
+            st.error(f"Не удалось прочитать матрицу 2.3: {error}")
             sales_time_plans = pd.DataFrame()
 
     if sales_time_plans.empty:
