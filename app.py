@@ -2129,6 +2129,174 @@ def fill_forecast_into_matrix(
     return output.getvalue()
 
 
+
+@st.cache_data(show_spinner=False)
+def build_filled_menu_category_summary(file_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame, bytes]:
+    """Summarize only filled T1-T29 plan cells by category, point and menu date."""
+    workbook = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=False)
+    rows: list[dict[str, object]] = []
+    points_seen: set[int] = set()
+
+    for sheet_name in workbook.sheetnames:
+        sheet = workbook[sheet_name]
+        date_rows: list[tuple[int, date]] = []
+        for row_number in range(1, sheet.max_row + 1):
+            first_value = str(sheet.cell(row_number, 1).value or "").strip().casefold()
+            if not first_value.startswith("\u0434\u0430\u0442\u0430"):
+                continue
+            row_values = [
+                sheet.cell(row_number, column).value
+                for column in range(1, min(sheet.max_column, 16) + 1)
+            ]
+            target_date = next(
+                (parsed for value in row_values if (parsed := parse_excel_date(value)) is not None),
+                None,
+            )
+            if target_date is not None:
+                date_rows.append((row_number, target_date))
+
+        for block_index, (date_row, target_date) in enumerate(date_rows):
+            header_row = date_row + 1
+            end_row = (
+                date_rows[block_index + 1][0] - 1
+                if block_index + 1 < len(date_rows)
+                else sheet.max_row
+            )
+            headers = {
+                column: str(sheet.cell(header_row, column).value or "").strip()
+                for column in range(1, sheet.max_column + 1)
+            }
+            code_column = next(
+                (
+                    column
+                    for column, label in headers.items()
+                    if label.casefold() in {"\u043a\u043e\u0434", "\u043a\u043e\u0434 \u2116"}
+                ),
+                None,
+            )
+            category_column = next(
+                (
+                    column
+                    for column, label in headers.items()
+                    if "\u043a\u0430\u0442\u0435\u0433\u043e\u0440" in label.casefold()
+                ),
+                None,
+            )
+            point_columns: dict[int, int] = {}
+            for column, label in headers.items():
+                match = re.fullmatch(r"[\u0422T]\s*(\d+)", label.upper())
+                if not match:
+                    continue
+                point_number = int(match.group(1))
+                if 1 <= point_number <= 29 and point_number != 11:
+                    point_columns[point_number] = column
+                    points_seen.add(point_number)
+
+            if code_column is None or category_column is None or not point_columns:
+                continue
+
+            for row_number in range(header_row + 1, end_row + 1):
+                sku = normalize_sku(sheet.cell(row_number, code_column).value)
+                # Service rows such as "SR" / totals do not contain a valid SKU and are ignored.
+                if sku is None:
+                    continue
+                category = normalize_matrix_category(
+                    sheet.cell(row_number, category_column).value
+                ) or "\u041d\u0435 \u0443\u043a\u0430\u0437\u0430\u043d\u0430"
+                for point_number, point_column in point_columns.items():
+                    value = pd.to_numeric(
+                        sheet.cell(row_number, point_column).value,
+                        errors="coerce",
+                    )
+                    if pd.isna(value):
+                        continue
+                    rows.append(
+                        {
+                            "\u0414\u0430\u0442\u0430": target_date,
+                            "\u041b\u0438\u0441\u0442": str(sheet_name),
+                            "\u041a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f": category,
+                            "\u0422\u043e\u0447\u043a\u0430": f"\u0422{point_number}",
+                            "\u041a\u043e\u043b\u0438\u0447\u0435\u0441\u0442\u0432\u043e": max(0.0, float(value)),
+                        }
+                    )
+
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame(), b""
+
+    detail = pd.DataFrame(rows)
+    grouped = (
+        detail.groupby(
+            ["\u0414\u0430\u0442\u0430", "\u041b\u0438\u0441\u0442", "\u041a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f", "\u0422\u043e\u0447\u043a\u0430"],
+            as_index=False,
+            dropna=False,
+        )["\u041a\u043e\u043b\u0438\u0447\u0435\u0441\u0442\u0432\u043e"]
+        .sum()
+    )
+    point_labels = [f"\u0422{number}" for number in sorted(points_seen)]
+
+    overall = grouped.pivot_table(
+        index="\u041a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f",
+        columns="\u0422\u043e\u0447\u043a\u0430",
+        values="\u041a\u043e\u043b\u0438\u0447\u0435\u0441\u0442\u0432\u043e",
+        aggfunc="sum",
+        fill_value=0,
+    ).reindex(columns=point_labels, fill_value=0)
+    overall = overall.reset_index()
+    overall["\u0412\u0421\u0415\u0413\u041e \u041f\u041e \u041a\u0410\u0422\u0415\u0413\u041e\u0420\u0418\u0418"] = overall[point_labels].sum(axis=1)
+    total_row: dict[str, object] = {
+        "\u041a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f": "\u0412\u0421\u0415\u0413\u041e \u041f\u041e \u0422\u041e\u0427\u041a\u0415"
+    }
+    for point_label in point_labels:
+        total_row[point_label] = float(overall[point_label].sum())
+    total_row["\u0412\u0421\u0415\u0413\u041e \u041f\u041e \u041a\u0410\u0422\u0415\u0413\u041e\u0420\u0418\u0418"] = float(
+        overall["\u0412\u0421\u0415\u0413\u041e \u041f\u041e \u041a\u0410\u0422\u0415\u0413\u041e\u0420\u0418\u0418"].sum()
+    )
+    overall = pd.concat([overall, pd.DataFrame([total_row])], ignore_index=True)
+
+    by_date = grouped.pivot_table(
+        index=["\u0414\u0430\u0442\u0430", "\u041b\u0438\u0441\u0442", "\u041a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f"],
+        columns="\u0422\u043e\u0447\u043a\u0430",
+        values="\u041a\u043e\u043b\u0438\u0447\u0435\u0441\u0442\u0432\u043e",
+        aggfunc="sum",
+        fill_value=0,
+    ).reindex(columns=point_labels, fill_value=0)
+    by_date = by_date.reset_index()
+    by_date["\u0412\u0421\u0415\u0413\u041e \u041f\u041e \u041a\u0410\u0422\u0415\u0413\u041e\u0420\u0418\u0418"] = by_date[point_labels].sum(axis=1)
+    by_date = by_date.sort_values(["\u0414\u0430\u0442\u0430", "\u041b\u0438\u0441\u0442", "\u041a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f"], kind="stable")
+
+    # Plans are whole pieces; keep display/export clean when values are integral.
+    numeric_columns = point_labels + ["\u0412\u0421\u0415\u0413\u041e \u041f\u041e \u041a\u0410\u0422\u0415\u0413\u041e\u0420\u0418\u0418"]
+    for frame in (overall, by_date):
+        for column in numeric_columns:
+            if column in frame.columns:
+                numeric = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+                frame[column] = numeric.map(
+                    lambda value: int(round(value)) if abs(value - round(value)) < 1e-9 else round(value, 3)
+                )
+
+    export_buffer = io.BytesIO()
+    with pd.ExcelWriter(export_buffer, engine="openpyxl") as writer:
+        overall.to_excel(writer, sheet_name="\u0418\u0442\u043e\u0433 \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0439", index=False)
+        by_date.to_excel(writer, sheet_name="\u041a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438 \u043f\u043e \u0434\u0430\u0442\u0430\u043c", index=False)
+        grouped.to_excel(writer, sheet_name="\u0414\u0435\u0442\u0430\u043b\u0438\u0437\u0430\u0446\u0438\u044f", index=False)
+        for worksheet in writer.book.worksheets:
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+            for cell in worksheet[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="4472C4")
+            for cells in worksheet.columns:
+                width = min(max(len(str(cell.value or "")) for cell in cells) + 2, 28)
+                worksheet.column_dimensions[cells[0].column_letter].width = width
+        total_sheet = writer.book["\u0418\u0442\u043e\u0433 \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0439"]
+        if total_sheet.max_row >= 2:
+            for cell in total_sheet[total_sheet.max_row]:
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill("solid", fgColor="D9EAD3")
+        total_sheet.sheet_properties.tabColor = "70AD47"
+
+    return overall, by_date, export_buffer.getvalue()
+
 def build_sales_time_menu(
     plan_rows: pd.DataFrame,
     sales: pd.DataFrame,
@@ -7918,184 +8086,260 @@ with tab_forecast:
         "подсвечивается светло-красным как значение с недостаточной выборкой. "
         "Ф-столбцы не изменяются, Т11 пустая."
     )
-    matrix_file = st.file_uploader("Меню (.xlsx)", type=["xlsx"], key="forecast_matrix")
-    if matrix_file is not None:
-        try:
-            matrix_menu, matrix_capacity = parse_menu_matrix(matrix_file.getvalue())
-        except Exception as error:
-            st.error(f"Не удалось прочитать матрицу: {error}")
-            matrix_menu = pd.DataFrame()
-            matrix_capacity = pd.DataFrame()
+    forecast_plan_mode, forecast_ready_mode = st.tabs(
+        [
+            "\u0420\u0430\u0441\u0447\u0451\u0442 \u043f\u043b\u0430\u043d\u0430",
+            "\u0413\u043e\u0442\u043e\u0432\u043e\u0435 \u043c\u0435\u043d\u044e \u00b7 \u043f\u043e\u0434\u0441\u0447\u0451\u0442 \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0439",
+        ]
+    )
 
-        if matrix_menu.empty:
-            st.warning("В файле не найдено меню с датой, SKU и колонками точек.")
-        else:
-            block_options = (
-                matrix_menu[["target_date", "sheet", "day_label"]]
-                .drop_duplicates()
-                .sort_values(["target_date", "sheet"])
-            )
-            block_records = block_options.to_dict("records")
-            selected_block = st.selectbox(
-                "Предпросмотр даты и листа (расчёт выполнится по всему файлу)",
-                block_records,
-                format_func=lambda item: f"{item['target_date']:%d.%m.%Y} · {item['sheet']} · {item['day_label']}",
-            )
-            selected_menu = matrix_menu[
-                (matrix_menu["target_date"] == selected_block["target_date"])
-                & (matrix_menu["sheet"] == selected_block["sheet"])
-            ].copy()
-            preview_menu = selected_menu.merge(
-                entities[["sku", "category", "entity"]], on="sku", how="left"
-            )
-            preview_menu["category"] = preview_menu["category"].fillna(preview_menu["matrix_category"])
-            preview_menu["entity"] = preview_menu["entity"].fillna("Не сопоставлено")
-            forecast_metrics = st.columns(4)
-            forecast_metrics[0].metric("SKU в меню", preview_menu["sku"].nunique())
-            forecast_metrics[1].metric("Категорий", preview_menu["category"].nunique())
-            forecast_metrics[2].metric("Сущностей", preview_menu["entity"].nunique())
-            forecast_metrics[3].metric(
-                "Без сущности", preview_menu.loc[preview_menu["entity"] == "Не сопоставлено", "sku"].nunique()
-            )
-            with st.expander("Показать распознанное меню"):
-                st.dataframe(
-                    preview_menu[["sku", "product_name", "category", "entity", "price"]].rename(
-                        columns={
-                            "sku": "SKU",
-                            "product_name": "Название товара",
-                            "category": "Категория",
-                            "entity": "Сущность",
-                            "price": "Цена",
-                        }
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
+    with forecast_plan_mode:
+        matrix_file = st.file_uploader("Меню (.xlsx)", type=["xlsx"], key="forecast_matrix")
+        if matrix_file is not None:
+            try:
+                matrix_menu, matrix_capacity = parse_menu_matrix(matrix_file.getvalue())
+            except Exception as error:
+                st.error(f"Не удалось прочитать матрицу: {error}")
+                matrix_menu = pd.DataFrame()
+                matrix_capacity = pd.DataFrame()
+
+            if matrix_menu.empty:
+                st.warning("В файле не найдено меню с датой, SKU и колонками точек.")
+            else:
+                block_options = (
+                    matrix_menu[["target_date", "sheet", "day_label"]]
+                    .drop_duplicates()
+                    .sort_values(["target_date", "sheet"])
                 )
+                block_records = block_options.to_dict("records")
+                selected_block = st.selectbox(
+                    "Предпросмотр даты и листа (расчёт выполнится по всему файлу)",
+                    block_records,
+                    format_func=lambda item: f"{item['target_date']:%d.%m.%Y} · {item['sheet']} · {item['day_label']}",
+                )
+                selected_menu = matrix_menu[
+                    (matrix_menu["target_date"] == selected_block["target_date"])
+                    & (matrix_menu["sheet"] == selected_block["sheet"])
+                ].copy()
+                preview_menu = selected_menu.merge(
+                    entities[["sku", "category", "entity"]], on="sku", how="left"
+                )
+                preview_menu["category"] = preview_menu["category"].fillna(preview_menu["matrix_category"])
+                preview_menu["entity"] = preview_menu["entity"].fillna("Не сопоставлено")
+                forecast_metrics = st.columns(4)
+                forecast_metrics[0].metric("SKU в меню", preview_menu["sku"].nunique())
+                forecast_metrics[1].metric("Категорий", preview_menu["category"].nunique())
+                forecast_metrics[2].metric("Сущностей", preview_menu["entity"].nunique())
+                forecast_metrics[3].metric(
+                    "Без сущности", preview_menu.loc[preview_menu["entity"] == "Не сопоставлено", "sku"].nunique()
+                )
+                with st.expander("Показать распознанное меню"):
+                    st.dataframe(
+                        preview_menu[["sku", "product_name", "category", "entity", "price"]].rename(
+                            columns={
+                                "sku": "SKU",
+                                "product_name": "Название товара",
+                                "category": "Категория",
+                                "entity": "Сущность",
+                                "price": "Цена",
+                            }
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-            all_target_dates = sorted(matrix_menu["target_date"].dropna().unique().tolist())
-            first_target_date = all_target_dates[0]
-            last_target_date = all_target_dates[-1]
-            history_from = (pd.Timestamp(first_target_date) - pd.DateOffset(months=2)).date()
-            st.info(
-                f"Будут рассчитаны все {len(all_target_dates)} дат меню: "
-                f"{first_target_date:%d.%m.%Y}–{last_target_date:%d.%m.%Y}. "
-                "Для каждой даты используется своё окно предыдущих двух календарных месяцев."
-            )
-            forecast_button = st.button("Рассчитать рекомендуемый план", type="primary", key="calculate_forecast")
-            if forecast_button:
-                forecast_points = {
-                    int(number): label
-                    for number, label in st.session_state.get("point_mapping", {}).items()
-                    if str(label).startswith("Т")
-                    and 1 <= int(str(label)[1:]) <= 29
-                    and int(str(label)[1:]) != 11
-                }
-                if not forecast_points:
+                all_target_dates = sorted(matrix_menu["target_date"].dropna().unique().tolist())
+                first_target_date = all_target_dates[0]
+                last_target_date = all_target_dates[-1]
+                history_from = (pd.Timestamp(first_target_date) - pd.DateOffset(months=2)).date()
+                st.info(
+                    f"Будут рассчитаны все {len(all_target_dates)} дат меню: "
+                    f"{first_target_date:%d.%m.%Y}–{last_target_date:%d.%m.%Y}. "
+                    "Для каждой даты используется своё окно предыдущих двух календарных месяцев."
+                )
+                forecast_button = st.button("Рассчитать рекомендуемый план", type="primary", key="calculate_forecast")
+                if forecast_button:
                     forecast_points = {
-                        number: f"Т{number}" for number in range(1, 30) if number != 11
+                        int(number): label
+                        for number, label in st.session_state.get("point_mapping", {}).items()
+                        if str(label).startswith("Т")
+                        and 1 <= int(str(label)[1:]) <= 29
+                        and int(str(label)[1:]) != 11
                     }
-                try:
-                    forecast_history = load_forecast_history(
-                        history_from,
-                        last_target_date,
-                        tuple(sorted(forecast_points)),
-                    )
-                except Exception as error:
-                    st.error(f"Не удалось загрузить историю продаж: {error}")
-                    forecast_history = pd.DataFrame()
-                if forecast_history.empty:
-                    st.warning("За исторический период продажи не найдены.")
-                else:
-                    forecast_parts: list[pd.DataFrame] = []
-                    for (target_date, sheet_name), menu_block in matrix_menu.groupby(
-                        ["target_date", "sheet"], sort=True
-                    ):
-                        block_history_from = (
-                            pd.Timestamp(target_date) - pd.DateOffset(months=2)
-                        ).date()
-                        block_history = forecast_history[
-                            pd.to_datetime(
-                                forecast_history["business_date"], errors="coerce"
-                            ).dt.date.between(
-                                block_history_from,
-                                target_date - timedelta(days=1),
-                                inclusive="both",
-                            )
-                        ].copy()
-                        block_result = calculate_sku_daily_forecast(
-                            menu_block,
-                            block_history,
-                            entities,
-                            target_date,
-                            forecast_points,
+                    if not forecast_points:
+                        forecast_points = {
+                            number: f"Т{number}" for number in range(1, 30) if number != 11
+                        }
+                    try:
+                        forecast_history = load_forecast_history(
+                            history_from,
+                            last_target_date,
+                            tuple(sorted(forecast_points)),
                         )
-                        if not block_result.empty:
-                            forecast_parts.append(block_result)
-                    forecast_result = (
-                        pd.concat(forecast_parts, ignore_index=True)
-                        if forecast_parts else pd.DataFrame()
-                    )
-                    if forecast_result.empty:
-                        st.warning("Не удалось сформировать расчёт ни для одного блока меню.")
-                        st.stop()
-                    st.session_state["forecast_result"] = forecast_result
-                    st.session_state["forecast_menu"] = matrix_menu
-                    st.session_state["forecast_history_from"] = history_from
-                    st.session_state["forecast_target_date"] = last_target_date
-                    st.session_state["forecast_first_target_date"] = first_target_date
-                    st.session_state["forecast_matrix_bytes"] = matrix_file.getvalue()
+                    except Exception as error:
+                        st.error(f"Не удалось загрузить историю продаж: {error}")
+                        forecast_history = pd.DataFrame()
+                    if forecast_history.empty:
+                        st.warning("За исторический период продажи не найдены.")
+                    else:
+                        forecast_parts: list[pd.DataFrame] = []
+                        for (target_date, sheet_name), menu_block in matrix_menu.groupby(
+                            ["target_date", "sheet"], sort=True
+                        ):
+                            block_history_from = (
+                                pd.Timestamp(target_date) - pd.DateOffset(months=2)
+                            ).date()
+                            block_history = forecast_history[
+                                pd.to_datetime(
+                                    forecast_history["business_date"], errors="coerce"
+                                ).dt.date.between(
+                                    block_history_from,
+                                    target_date - timedelta(days=1),
+                                    inclusive="both",
+                                )
+                            ].copy()
+                            block_result = calculate_sku_daily_forecast(
+                                menu_block,
+                                block_history,
+                                entities,
+                                target_date,
+                                forecast_points,
+                            )
+                            if not block_result.empty:
+                                forecast_parts.append(block_result)
+                        forecast_result = (
+                            pd.concat(forecast_parts, ignore_index=True)
+                            if forecast_parts else pd.DataFrame()
+                        )
+                        if forecast_result.empty:
+                            st.warning("Не удалось сформировать расчёт ни для одного блока меню.")
+                            st.stop()
+                        st.session_state["forecast_result"] = forecast_result
+                        st.session_state["forecast_menu"] = matrix_menu
+                        st.session_state["forecast_history_from"] = history_from
+                        st.session_state["forecast_target_date"] = last_target_date
+                        st.session_state["forecast_first_target_date"] = first_target_date
+                        st.session_state["forecast_matrix_bytes"] = matrix_file.getvalue()
 
-            if "forecast_result" in st.session_state:
-                forecast_result = st.session_state["forecast_result"]
-                st.markdown("#### Рекомендованный план")
-                result_metrics = st.columns(5)
-                result_metrics[0].metric("Дат меню", forecast_result["Дата плана"].nunique())
-                result_metrics[1].metric("Точек", forecast_result["Точка"].nunique())
-                result_metrics[2].metric("SKU", forecast_result["SKU"].nunique())
-                result_metrics[3].metric(
-                    "План, шт.",
-                    f"{forecast_result['Рекомендованный план'].sum(skipna=True):,.0f}".replace(",", " "),
+                if "forecast_result" in st.session_state:
+                    forecast_result = st.session_state["forecast_result"]
+                    st.markdown("#### Рекомендованный план")
+                    result_metrics = st.columns(5)
+                    result_metrics[0].metric("Дат меню", forecast_result["Дата плана"].nunique())
+                    result_metrics[1].metric("Точек", forecast_result["Точка"].nunique())
+                    result_metrics[2].metric("SKU", forecast_result["SKU"].nunique())
+                    result_metrics[3].metric(
+                        "План, шт.",
+                        f"{forecast_result['Рекомендованный план'].sum(skipna=True):,.0f}".replace(",", " "),
+                    )
+                    result_metrics[4].metric(
+                        "Пустых ячеек без данных",
+                        int(forecast_result["Рекомендованный план"].isna().sum()),
+                    )
+                    result_point_options = sorted(
+                        forecast_result["Точка"].unique(), key=lambda value: int(str(value)[1:])
+                    )
+                    result_points = st.multiselect(
+                        "Показать точки прогноза",
+                        result_point_options,
+                        default=result_point_options[:1],
+                        key="forecast_result_points",
+                    )
+                    visible_forecast = forecast_result[forecast_result["Точка"].isin(result_points)]
+                    result_dates = st.multiselect(
+                        "Показать даты меню",
+                        sorted(forecast_result["Дата плана"].unique()),
+                        default=sorted(forecast_result["Дата плана"].unique()),
+                        format_func=lambda value: value.strftime("%d.%m.%Y"),
+                        key="forecast_result_dates_v66",
+                    )
+                    visible_forecast = visible_forecast[
+                        visible_forecast["Дата плана"].isin(result_dates)
+                    ]
+                    st.dataframe(visible_forecast, use_container_width=True, hide_index=True)
+                    filled_matrix = fill_forecast_into_matrix(
+                        st.session_state["forecast_matrix_bytes"],
+                        forecast_result,
+                        st.session_state["forecast_history_from"],
+                        st.session_state["forecast_target_date"],
+                    )
+                    st.download_button(
+                        "Скачать меню с заполненными Т1–Т29",
+                        data=filled_matrix,
+                        file_name=(
+                            f"матрица_с_прогнозом_"
+                            f"{st.session_state['forecast_first_target_date']:%Y-%m-%d}_"
+                            f"{st.session_state['forecast_target_date']:%Y-%m-%d}.xlsx"
+                        ),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+    with forecast_ready_mode:
+        st.markdown("#### \u0413\u043e\u0442\u043e\u0432\u043e\u0435 \u043c\u0435\u043d\u044e \u2014 \u043f\u043e\u0434\u0441\u0447\u0451\u0442 \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0439")
+        st.caption(
+            "\u0417\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u0435 \u0443\u0436\u0435 \u0433\u043e\u0442\u043e\u0432\u043e\u0435 \u043c\u0435\u043d\u044e, \u0433\u0434\u0435 \u0437\u0430\u043f\u043e\u043b\u043d\u0435\u043d\u044b \u04221\u2013\u042229. "
+            "\u0421\u0447\u0438\u0442\u0430\u044e\u0442\u0441\u044f \u0442\u043e\u043b\u044c\u043a\u043e \u0447\u0438\u0441\u043b\u043e\u0432\u044b\u0435 \u0437\u043d\u0430\u0447\u0435\u043d\u0438\u044f \u043f\u043e\u0434 \u043a\u043e\u043b\u043e\u043d\u043a\u0430\u043c\u0438 \u0422. "
+            "\u0421\u043b\u0443\u0436\u0435\u0431\u043d\u044b\u0435 \u0441\u0442\u0440\u043e\u043a\u0438 \u0421\u0420, \u0441\u0442\u043e\u043b\u0431\u0446\u044b \u0424, \u041f\u041b\u0410\u041d \u0438 \u0434\u0440\u0443\u0433\u0438\u0435 \u043f\u043e\u043b\u044f \u0432 \u0438\u0442\u043e\u0433 \u043d\u0435 \u0432\u0445\u043e\u0434\u044f\u0442. \u042211 \u043f\u043e \u0431\u0438\u0437\u043d\u0435\u0441-\u043f\u0440\u0430\u0432\u0438\u043b\u0443 \u043d\u0435 \u0441\u0447\u0438\u0442\u0430\u0435\u0442\u0441\u044f."
+        )
+        ready_menu_file = st.file_uploader(
+            "\u0413\u043e\u0442\u043e\u0432\u043e\u0435 \u043c\u0435\u043d\u044e (.xlsx)",
+            type=["xlsx"],
+            key="forecast_ready_category_matrix_v1",
+        )
+        if ready_menu_file is not None:
+            try:
+                category_summary, category_by_date, category_summary_bytes = (
+                    build_filled_menu_category_summary(ready_menu_file.getvalue())
                 )
-                result_metrics[4].metric(
-                    "Пустых ячеек без данных",
-                    int(forecast_result["Рекомендованный план"].isna().sum()),
+            except Exception as error:
+                st.error(f"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0441\u0447\u0438\u0442\u0430\u0442\u044c \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438: {error}")
+                category_summary = pd.DataFrame()
+                category_by_date = pd.DataFrame()
+                category_summary_bytes = b""
+
+            if category_summary.empty:
+                st.warning(
+                    "\u0412 \u0444\u0430\u0439\u043b\u0435 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u044b \u0437\u0430\u043f\u043e\u043b\u043d\u0435\u043d\u043d\u044b\u0435 \u0431\u043b\u043e\u043a\u0438 \u043c\u0435\u043d\u044e \u0441 SKU, \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f\u043c\u0438 \u0438 \u043a\u043e\u043b\u043e\u043d\u043a\u0430\u043c\u0438 \u0422."
                 )
-                result_point_options = sorted(
-                    forecast_result["Точка"].unique(), key=lambda value: int(str(value)[1:])
-                )
-                result_points = st.multiselect(
-                    "Показать точки прогноза",
-                    result_point_options,
-                    default=result_point_options[:1],
-                    key="forecast_result_points",
-                )
-                visible_forecast = forecast_result[forecast_result["Точка"].isin(result_points)]
-                result_dates = st.multiselect(
-                    "Показать даты меню",
-                    sorted(forecast_result["Дата плана"].unique()),
-                    default=sorted(forecast_result["Дата плана"].unique()),
-                    format_func=lambda value: value.strftime("%d.%m.%Y"),
-                    key="forecast_result_dates_v66",
-                )
-                visible_forecast = visible_forecast[
-                    visible_forecast["Дата плана"].isin(result_dates)
+            else:
+                point_columns = [
+                    column
+                    for column in category_summary.columns
+                    if re.fullmatch(r"\u0422\d+", str(column))
                 ]
-                st.dataframe(visible_forecast, use_container_width=True, hide_index=True)
-                filled_matrix = fill_forecast_into_matrix(
-                    st.session_state["forecast_matrix_bytes"],
-                    forecast_result,
-                    st.session_state["forecast_history_from"],
-                    st.session_state["forecast_target_date"],
+                data_rows = category_summary[
+                    category_summary["\u041a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f"] != "\u0412\u0421\u0415\u0413\u041e \u041f\u041e \u0422\u041e\u0427\u041a\u0415"
+                ]
+                grand_total = pd.to_numeric(
+                    category_summary.iloc[-1]["\u0412\u0421\u0415\u0413\u041e \u041f\u041e \u041a\u0410\u0422\u0415\u0413\u041e\u0420\u0418\u0418"],
+                    errors="coerce",
                 )
+                ready_metrics = st.columns(4)
+                ready_metrics[0].metric("\u041a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0439", data_rows["\u041a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f"].nunique())
+                ready_metrics[1].metric("\u0422\u043e\u0447\u0435\u043a", len(point_columns))
+                ready_metrics[2].metric("\u0414\u0430\u0442 \u043c\u0435\u043d\u044e", category_by_date["\u0414\u0430\u0442\u0430"].nunique())
+                ready_metrics[3].metric(
+                    "\u0412\u0441\u0435\u0433\u043e \u043f\u043e\u0434 \u0422, \u0448\u0442.",
+                    f"{float(grand_total or 0):,.0f}".replace(",", " "),
+                )
+
+                st.markdown("##### \u0418\u0442\u043e\u0433 \u043f\u043e \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f\u043c \u0438 \u0442\u043e\u0447\u043a\u0430\u043c")
+                st.caption(
+                    "\u041a\u0430\u0436\u0434\u0430\u044f \u0441\u0442\u0440\u043e\u043a\u0430 \u2014 \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u044f. \u041a\u0430\u0436\u0434\u044b\u0439 \u0441\u0442\u043e\u043b\u0431\u0435\u0446 \u0422 \u2014 \u0441\u0443\u043c\u043c\u0430 \u044d\u0442\u043e\u0439 \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438 \u043d\u0430 \u0442\u043e\u0447\u043a\u0435. "
+                    "\u0421\u043f\u0440\u0430\u0432\u0430 \u2014 \u0412\u0421\u0415\u0413\u041e \u043f\u043e \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438, \u0441\u043d\u0438\u0437\u0443 \u2014 \u0412\u0421\u0415\u0413\u041e \u043f\u043e \u043a\u0430\u0436\u0434\u043e\u0439 \u0442\u043e\u0447\u043a\u0435."
+                )
+                st.dataframe(category_summary, use_container_width=True, hide_index=True)
+
+                with st.expander("\u041f\u043e\u043a\u0430\u0437\u0430\u0442\u044c \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0438 \u043f\u043e \u043a\u0430\u0436\u0434\u043e\u0439 \u0434\u0430\u0442\u0435 \u043c\u0435\u043d\u044e"):
+                    st.dataframe(category_by_date, use_container_width=True, hide_index=True)
+
                 st.download_button(
-                    "Скачать меню с заполненными Т1–Т29",
-                    data=filled_matrix,
-                    file_name=(
-                        f"матрица_с_прогнозом_"
-                        f"{st.session_state['forecast_first_target_date']:%Y-%m-%d}_"
-                        f"{st.session_state['forecast_target_date']:%Y-%m-%d}.xlsx"
-                    ),
+                    "\u0421\u043a\u0430\u0447\u0430\u0442\u044c \u043f\u043e\u0434\u0441\u0447\u0451\u0442 \u043a\u0430\u0442\u0435\u0433\u043e\u0440\u0438\u0439 (Excel)",
+                    data=category_summary_bytes,
+                    file_name=f"{Path(ready_menu_file.name).stem}_category_totals.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_ready_menu_category_totals_v1",
+                    use_container_width=True,
                 )
 
 with tab_reports:
