@@ -8105,3 +8105,16 @@ st.download_button(
     file_name=f"структура_спроса_{period[0]:%Y-%m-%d}_{period[1]:%Y-%m-%d}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 )
+tab_dashboard, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_forecast, tab_reports = st.tabs([
+    "Дашборд",
+    "Топ-3 сущности",
+    "Сущности",
+    "Детализация",
+    "Детализация категории",
+    "ABC продукции",
+    "Анализ категории",
+    "Окно свежести",
+    "Списания категорий",
+    "Прогноз плана",
+    "Отчёты",
+])
