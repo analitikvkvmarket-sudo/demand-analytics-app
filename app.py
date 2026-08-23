@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import calendar as pycalendar
 import io
 import json
 import math
@@ -94,6 +95,21 @@ load_dotenv(APP_DIR / ".env", override=True)
 
 REMEMBERED_PG_FILE = APP_DIR / ".remembered_pg.json"
 REMEMBERED_PG_DAYS = 30
+
+MONTH_NAMES_RU = {
+    1: "Январь",
+    2: "Февраль",
+    3: "Март",
+    4: "Апрель",
+    5: "Май",
+    6: "Июнь",
+    7: "Июль",
+    8: "Август",
+    9: "Сентябрь",
+    10: "Октябрь",
+    11: "Ноябрь",
+    12: "Декабрь",
+}
 
 
 def _dpapi_encrypt_text(value: str) -> str:
@@ -7074,20 +7090,30 @@ with tab_sales_time:
                             sku_history["revenue"], errors="coerce"
                         ).fillna(0.0)
                         sold_history = sku_history[sku_history["sales"] > 0].copy()
-                        history_metrics = st.columns(4)
+                        sold_days_count = int(sold_history["business_date"].nunique())
+                        avg_sales_per_day = (
+                            float(sold_history["sales"].sum()) / sold_days_count
+                            if sold_days_count > 0
+                            else 0.0
+                        )
+                        history_metrics = st.columns(5)
                         history_metrics[0].metric(
                             "Продано, шт.",
                             f"{sku_history['sales'].sum():,.0f}".replace(",", " "),
                         )
                         history_metrics[1].metric(
+                            "СР за день, шт.",
+                            f"{avg_sales_per_day:,.1f}".replace(",", " "),
+                        )
+                        history_metrics[2].metric(
                             "Выручка, ₽",
                             f"{sku_history['revenue'].sum():,.0f}".replace(",", " "),
                         )
-                        history_metrics[2].metric(
-                            "Дней с продажами",
-                            int(sold_history["business_date"].nunique()),
-                        )
                         history_metrics[3].metric(
+                            "Дней с продажами",
+                            sold_days_count,
+                        )
+                        history_metrics[4].metric(
                             "Продаж / строк",
                             int(len(sold_history)),
                         )
@@ -7125,6 +7151,89 @@ with tab_sales_time:
                             height=390,
                         )
                         st.plotly_chart(history_chart, use_container_width=True)
+
+                        st.markdown("##### Календарь продаж за выбранный период")
+                        sales_by_date = (
+                            daily_history.groupby("Дата", as_index=False)["Продано, шт."].sum()
+                            .sort_values("Дата", kind="stable")
+                        )
+                        sales_by_date["Дата"] = pd.to_datetime(sales_by_date["Дата"], errors="coerce")
+                        sales_by_date = sales_by_date.dropna(subset=["Дата"]).copy()
+                        sales_map = {
+                            ts.date(): float(qty)
+                            for ts, qty in zip(sales_by_date["Дата"], sales_by_date["Продано, шт."])
+                        }
+
+                        calendar_months = []
+                        month_cursor = date(history_start.year, history_start.month, 1)
+                        last_month = date(history_end.year, history_end.month, 1)
+                        while month_cursor <= last_month:
+                            calendar_months.append(month_cursor)
+                            if month_cursor.month == 12:
+                                month_cursor = date(month_cursor.year + 1, 1, 1)
+                            else:
+                                month_cursor = date(month_cursor.year, month_cursor.month + 1, 1)
+
+                        month_tabs = st.tabs([month_date.strftime("%m.%Y") for month_date in calendar_months])
+                        weekday_labels = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+                        for month_tab, month_date in zip(month_tabs, calendar_months):
+                            with month_tab:
+                                month_weeks = pycalendar.Calendar(firstweekday=0).monthdatescalendar(
+                                    month_date.year, month_date.month
+                                )
+                                z_values = []
+                                text_values = []
+                                for week in month_weeks:
+                                    week_qty = []
+                                    week_text = []
+                                    for day_item in week:
+                                        if (
+                                            day_item.month != month_date.month
+                                            or day_item < history_start
+                                            or day_item > history_end
+                                        ):
+                                            week_qty.append(None)
+                                            week_text.append("")
+                                        else:
+                                            qty_value = float(sales_map.get(day_item, 0.0))
+                                            week_qty.append(qty_value)
+                                            week_text.append(f"{day_item.day}<br>{qty_value:,.0f} шт.".replace(',', ' '))
+                                    z_values.append(week_qty)
+                                    text_values.append(week_text)
+
+                                month_title = f"{MONTH_NAMES_RU.get(month_date.month, month_date.strftime('%m'))} {month_date.year}"
+                                month_calendar_fig = go.Figure(
+                                    data=go.Heatmap(
+                                        z=z_values,
+                                        x=weekday_labels,
+                                        y=[f"Неделя {idx + 1}" for idx in range(len(z_values))],
+                                        text=text_values,
+                                        texttemplate="%{text}",
+                                        textfont={"size": 12},
+                                        colorscale=[
+                                            [0.0, '#f3f6fb'],
+                                            [0.2, '#dcefe3'],
+                                            [0.5, '#a9d3b0'],
+                                            [1.0, '#4f8a61'],
+                                        ],
+                                        hovertemplate="%{x}<br>%{text}<extra></extra>",
+                                        colorbar_title="Продано, шт.",
+                                        zmin=0,
+                                        xgap=3,
+                                        ygap=3,
+                                    )
+                                )
+                                month_calendar_fig.update_layout(
+                                    title=f"Календарь продаж · {month_title}",
+                                    margin=dict(l=20, r=20, t=55, b=20),
+                                    height=max(260, 95 + len(z_values) * 70),
+                                )
+                                month_calendar_fig.update_yaxes(autorange='reversed', title='')
+                                month_calendar_fig.update_xaxes(title='')
+                                st.plotly_chart(month_calendar_fig, use_container_width=True)
+                                st.caption(
+                                    'В ячейке показаны день месяца и суммарное количество продаж SKU за этот день.'
+                                )
 
                         history_table = sku_history.copy()
                         history_table["Дата"] = pd.to_datetime(
