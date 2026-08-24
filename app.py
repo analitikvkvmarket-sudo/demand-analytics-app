@@ -739,8 +739,10 @@ def product_green_days(category: object) -> int:
 
 
 def forecast_coverage_days(category: object) -> int:
-    """Возвращает число дней загрузки, используемое только в прогнозе плана."""
+    """Возвращает множитель среднего SKU, используемый только в прогнозе плана."""
     normalized = normalize_matrix_category(category)
+    if normalized == "Япония":
+        return 1
     if normalized == "Вторые блюда":
         return 3
     if normalized == "Напитки":
@@ -3042,6 +3044,16 @@ def add_freshness_bands_to_depletion_chart(
             figure.add_vrect(
                 x0=green_end, x1=shelf_end, fillcolor="#D9D9D9", opacity=0.35,
                 line_width=0, layer="below",
+            )
+        if normalize_matrix_category(category) == "Япония":
+            # Третий календарный день после загрузки — уже день списания.
+            figure.add_vrect(
+                x0=shelf_end,
+                x1=shelf_end + pd.Timedelta(days=1),
+                fillcolor="#F4CCCC",
+                opacity=0.30,
+                line_width=0,
+                layer="below",
             )
         figure.add_vline(
             x=green_start, line_width=1, line_dash="dot", line_color="#6B8E23"
@@ -8608,19 +8620,48 @@ with tab_sales_time:
                     ).astype(object)
                 today_for_freshness = date.today()
                 for row_index, category in display_time_menu["Категория"].items():
+                    normalized_category = normalize_matrix_category(category)
                     shelf_days = product_lifecycle_days(category)
-                    display_time_menu.loc[row_index, timeline_columns[shelf_days:]] = "—"
                     shipment_date_row = pd.to_datetime(
                         display_time_menu.at[row_index, "Дата отгрузки"], errors="coerce"
                     )
-                    if pd.notna(shipment_date_row):
-                        shipment_day = shipment_date_row.date()
-                        for day_number in range(1, shelf_days + 1):
-                            if shipment_day + timedelta(days=day_number) > today_for_freshness:
-                                display_time_menu.at[row_index, f"День {day_number}"] = "—"
+
+                    # Для категории «Япония» жизненный цикл строго двухдневный:
+                    # День 1 — основной (зелёный), День 2 — завершающий (серый),
+                    # в 00:00 Дня 3 остаток уже переходит в списание (красный).
+                    if normalized_category == "Япония":
+                        display_time_menu.loc[row_index, timeline_columns[3:]] = "—"
+                        if pd.notna(shipment_date_row):
+                            shipment_day = shipment_date_row.date()
+                            writeoff_day = shipment_day + timedelta(days=3)
+                            for day_number in (1, 2):
+                                if shipment_day + timedelta(days=day_number) > today_for_freshness:
+                                    display_time_menu.at[row_index, f"День {day_number}"] = "—"
+                            if writeoff_day <= today_for_freshness:
+                                writeoff_qty = float(
+                                    pd.to_numeric(
+                                        pd.Series([display_time_menu.at[row_index, "Списания"]]),
+                                        errors="coerce",
+                                    ).fillna(0).iloc[0]
+                                )
+                                display_time_menu.at[row_index, "День 3"] = (
+                                    f"Списание {writeoff_qty:,.0f}".replace(",", " ")
+                                    if writeoff_qty > 0
+                                    else "Срок завершён"
+                                )
+                            else:
+                                display_time_menu.at[row_index, "День 3"] = "—"
+                    else:
+                        display_time_menu.loc[row_index, timeline_columns[shelf_days:]] = "—"
+                        if pd.notna(shipment_date_row):
+                            shipment_day = shipment_date_row.date()
+                            for day_number in range(1, shelf_days + 1):
+                                if shipment_day + timedelta(days=day_number) > today_for_freshness:
+                                    display_time_menu.at[row_index, f"День {day_number}"] = "—"
 
                 def style_sales_timeline(row: pd.Series) -> list[str]:
                     styles = [""] * len(row)
+                    normalized_category = normalize_matrix_category(row["Категория"])
                     green_days = product_green_days(row["Категория"])
                     shelf_days = product_lifecycle_days(row["Категория"])
                     for day_number, column_name in enumerate(timeline_columns, start=1):
@@ -8629,6 +8670,8 @@ with tab_sales_time:
                             styles[position] = "background-color: #D9EAD3; color: #274E13; font-weight: 600"
                         elif day_number <= shelf_days:
                             styles[position] = "background-color: #D9D9D9; color: #333333; font-weight: 600"
+                        elif normalized_category == "Япония" and day_number == 3:
+                            styles[position] = "background-color: #F4CCCC; color: #990000; font-weight: 700"
                         else:
                             styles[position] = "color: #B7B7B7"
                     writeoff_position = row.index.get_loc("Списания")
@@ -9425,8 +9468,8 @@ with tab_forecast:
         "Загрузите только пустое меню — приложение обработает все даты и все блоки на листе. "
         "Для каждого SKU и каждой точки приложение берёт два календарных "
         "месяца до даты плана и считает среднее только по дням, когда SKU действительно продавался. "
-        "Множитель загрузки зависит только от категории: вторые блюда — 3 дня, "
-        "напитки — 4 дня, остальные категории — 2 дня. "
+        "Множитель загрузки зависит от текущей категории SKU: Япония — ×1 от среднего, "
+        "вторые блюда — ×3, напитки — ×4, остальные категории — ×2. "
         "Если SKU на точке не продавался, среднее принимается равным 1 шт./день. "
         "Если за 2 месяца продажи были только в 1–2 дня, итоговый прогноз в Excel "
         "подсвечивается светло-красным как значение с недостаточной выборкой. "
