@@ -4402,7 +4402,7 @@ def build_period_comparison_html(
 
 
 st.title("Анализ структуры спроса")
-st.caption("Версия 75.7.4 · Отчет: изменение по точкам в шт. и %")
+st.caption("Версия 75.7.5 · Отчет: изменение по точкам в шт. и %")
 
 if not ENTITY_FILE.exists():
     st.error(f"Не найден справочник: {ENTITY_FILE.name}")
@@ -4970,27 +4970,52 @@ with tab_report:
         report_metrics[4].metric("СР/день П1", f"{avg_1:,.1f}".replace(",", " "))
         report_metrics[5].metric("СР/день П2", f"{avg_2:,.1f}".replace(",", " "))
 
-        st.markdown("#### Сравнение по категории")
-        category_compare_options = report_tables["category_summary"]["Категория"].dropna().astype(str).tolist()
-        if category_compare_options:
-            compare_category = st.selectbox(
-                "Категория для быстрой сверки",
-                category_compare_options,
-                key="report_category_compare_v7574",
+        st.markdown("#### Сравнение по категориям за выбранные периоды")
+        st.caption(
+            f"Период 1: {report_period_1[0]:%d.%m.%Y}–{report_period_1[1]:%d.%m.%Y} · "
+            f"Период 2: {report_period_2[0]:%d.%m.%Y}–{report_period_2[1]:%d.%m.%Y}. "
+            "По каждой категории показаны продажи в штуках, количественная разница и изменение в процентах."
+        )
+        category_compare_table = report_tables["category_summary"].copy()
+        if not category_compare_table.empty:
+            category_compare_table = category_compare_table.rename(
+                columns={
+                    "Изменение, шт.": "Разница, шт.",
+                    "Изменение, %": "Разница, %",
+                }
             )
-            compare_row = report_tables["category_summary"][
-                report_tables["category_summary"]["Категория"].astype(str).eq(compare_category)
-            ].iloc[0]
-            category_cards = st.columns(4)
-            cat_p1 = float(pd.to_numeric(compare_row.get("Период 1, шт."), errors="coerce") or 0.0)
-            cat_p2 = float(pd.to_numeric(compare_row.get("Период 2, шт."), errors="coerce") or 0.0)
-            cat_delta = float(pd.to_numeric(compare_row.get("Изменение, шт."), errors="coerce") or 0.0)
-            cat_pct_raw = pd.to_numeric(compare_row.get("Изменение, %"), errors="coerce")
-            cat_pct = float(cat_pct_raw) if pd.notna(cat_pct_raw) else None
-            category_cards[0].metric("Период 1, шт.", f"{cat_p1:,.0f}".replace(",", " "))
-            category_cards[1].metric("Период 2, шт.", f"{cat_p2:,.0f}".replace(",", " "))
-            category_cards[2].metric("Разница, шт.", f"{cat_delta:+,.0f}".replace(",", " "))
-            category_cards[3].metric("Разница, %", f"{cat_pct:+.1f}%" if cat_pct is not None else "—")
+            category_total_p1 = float(pd.to_numeric(category_compare_table["Период 1, шт."], errors="coerce").fillna(0).sum())
+            category_total_p2 = float(pd.to_numeric(category_compare_table["Период 2, шт."], errors="coerce").fillna(0).sum())
+            category_total_delta = category_total_p2 - category_total_p1
+            category_total_pct = (category_total_delta / category_total_p1 * 100) if category_total_p1 else None
+            total_row = {column: None for column in category_compare_table.columns}
+            total_row["Категория"] = "ВСЕГО"
+            total_row["Период 1, шт."] = category_total_p1
+            total_row["Период 2, шт."] = category_total_p2
+            total_row["Разница, шт."] = category_total_delta
+            total_row["Разница, %"] = category_total_pct
+            category_compare_table = pd.concat(
+                [category_compare_table, pd.DataFrame([total_row])],
+                ignore_index=True,
+            )
+            visible_category_columns = [
+                column for column in [
+                    "Категория", "Период 1, шт.", "Период 2, шт.", "Разница, шт.", "Разница, %"
+                ] if column in category_compare_table.columns
+            ]
+            category_compare_table = category_compare_table[visible_category_columns]
+            st.dataframe(
+                category_compare_table,
+                use_container_width=True,
+                hide_index=True,
+                height=min(620, 38 * len(category_compare_table) + 80),
+                column_config={
+                    "Период 1, шт.": st.column_config.NumberColumn(format="%.0f"),
+                    "Период 2, шт.": st.column_config.NumberColumn(format="%.0f"),
+                    "Разница, шт.": st.column_config.NumberColumn(format="%+.0f"),
+                    "Разница, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                },
+            )
         else:
             st.info("Для выбранных фильтров нет категорий для сравнения.")
 
