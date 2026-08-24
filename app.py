@@ -4520,7 +4520,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.7.5")
+    st.caption("Аналитика спроса · версия 75.8 · автоматическая загрузка")
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
         pg_host = st.text_input(
             "Сервер",
@@ -4556,8 +4556,10 @@ with st.sidebar:
         max_value=today,
         format="DD.MM.YYYY",
     )
-    find_button = st.button("1. Найти магазины в базе", use_container_width=True)
-    load_button = st.button("2. Загрузить продажи", type="primary", use_container_width=True)
+    st.caption(
+        "Точки и продажи загружаются автоматически. При смене периода или "
+        "параметров PostgreSQL данные обновятся без дополнительных кнопок."
+    )
 
 os.environ["PGHOST"] = pg_host.strip()
 os.environ["PGPORT"] = str(int(pg_port))
@@ -4566,92 +4568,59 @@ os.environ["PGUSER"] = pg_user.strip()
 os.environ["PGPASSWORD"] = pg_password
 
 valid_period = isinstance(date_range, tuple) and len(date_range) == 2
-if find_button:
-    if not valid_period:
-        st.error("Выберите дату начала и дату окончания.")
-        st.stop()
-    start_date, end_date = date_range
+if not valid_period:
+    st.info("Выберите дату начала и дату окончания — загрузка начнётся автоматически.")
+    st.stop()
+
+start_date, end_date = date_range
+refresh_bucket = int(datetime.now().timestamp() // (15 * 60))
+connection_signature = hashlib.sha256(
+    "|".join(
+        [
+            pg_host.strip(),
+            str(int(pg_port)),
+            pg_database.strip(),
+            pg_user.strip(),
+            pg_password,
+            start_date.isoformat(),
+            end_date.isoformat(),
+            str(refresh_bucket),
+        ]
+    ).encode("utf-8")
+).hexdigest()
+
+# Session state keeps the prepared analytical tables while the user switches
+# interactive sections. PostgreSQL is queried again only when the connection,
+# period or the 15-minute cache window changes.
+analysis_is_current = (
+    "analysis" in st.session_state
+    and st.session_state.get("auto_load_signature_v758") == connection_signature
+)
+
+if not analysis_is_current:
     try:
         available_shops = ensure_required_shops(
             load_available_shops(start_date, end_date + timedelta(days=1))
         )
-    except Exception as error:
-        st.error(f"Не удалось получить список магазинов: {error}")
-        st.stop()
-    if remember_connection:
-        try:
-            remembered_until = save_remembered_pg_credentials(
-                pg_host, int(pg_port), pg_database, pg_user, pg_password
-            )
-            st.toast(f"Пароль запомнен до {remembered_until:%d.%m.%Y}", icon="🔐")
-        except Exception as error:
-            st.warning(f"Подключение работает, но пароль не удалось запомнить: {error}")
-    elif REMEMBERED_PG_FILE.exists():
-        forget_remembered_pg_credentials()
-    if available_shops.empty:
-        st.warning("За выбранный период база не вернула ни одного магазина. Проверьте даты.")
-    else:
-        mapping = available_shops.copy()
-        mapping.insert(0, "Использовать", True)
-        mapping.insert(2, "Название точки", mapping["shop_number"].map(lambda value: f"Т{int(value)}"))
-        st.session_state["shop_mapping"] = mapping
 
-edited_mapping = None
-if "shop_mapping" in st.session_state:
-    required_mapping = ensure_required_shops(st.session_state["shop_mapping"])
-    for shop_number, point_name in REQUIRED_POINT_SHOPS.items():
-        required_mask = pd.to_numeric(
-            required_mapping["shop_number"], errors="coerce"
-        ).eq(shop_number)
-        required_mapping.loc[required_mask, "Использовать"] = True
-        required_mapping.loc[required_mask, "Название точки"] = point_name
-    st.session_state["shop_mapping"] = required_mapping
-    st.subheader("Соответствие магазинов и точек")
-    st.caption("Проверьте столбец «Название точки». Оставьте галочку только у точек Т; столовые, ФСПК и точки Ф отключите.")
-    edited_mapping = st.data_editor(
-        st.session_state["shop_mapping"],
-        hide_index=True,
-        use_container_width=True,
-        disabled=["shop_number", "receipts", "sold_quantity", "first_sale_date", "last_sale_date"],
-        column_config={
-            "Использовать": st.column_config.CheckboxColumn("Использовать"),
-            "shop_number": st.column_config.NumberColumn("Номер магазина", format="%d"),
-            "Название точки": st.column_config.TextColumn("Название точки"),
-            "receipts": st.column_config.NumberColumn("Количество чеков", format="%d"),
-            "sold_quantity": st.column_config.NumberColumn("Продано, шт.", format="%.0f"),
-            "first_sale_date": st.column_config.DateColumn("Первая продажа", format="DD.MM.YYYY"),
-            "last_sale_date": st.column_config.DateColumn("Последняя продажа", format="DD.MM.YYYY"),
-        },
-        key="mapping_editor",
-    )
+        shop_numbers = pd.to_numeric(
+            available_shops["shop_number"], errors="coerce"
+        ).astype("Int64")
+        selected = available_shops[
+            shop_numbers.between(1, 29) & shop_numbers.ne(11)
+        ].copy()
+        selected["shop_number"] = pd.to_numeric(
+            selected["shop_number"], errors="coerce"
+        ).astype(int)
 
-if load_button:
-    if not valid_period:
-        st.error("Выберите дату начала и дату окончания.")
-        st.stop()
-    if edited_mapping is None:
-        st.error("Сначала нажмите «1. Найти магазины в базе».")
-        st.stop()
-    selected = edited_mapping[edited_mapping["Использовать"]].copy()
-    if selected.empty:
-        st.error("Отметьте хотя бы одну точку.")
-        st.stop()
-    selected["Название точки"] = selected["Название точки"].astype(str).str.strip()
-    selected = selected[selected["Название точки"].str.match(r"^Т\d+$", na=False)]
-    if selected.empty:
-        st.error("Для выбранных строк задайте названия в формате Т1, Т2 … Т29.")
-        st.stop()
-    start_date, end_date = date_range
-    for shop_number, point_name in REQUIRED_POINT_SHOPS.items():
-        if shop_number not in selected["shop_number"].astype(int).tolist():
+        # Т25 должна присутствовать во всех фильтрах даже при нулевых продажах.
+        if 25 not in selected["shop_number"].tolist():
             selected = pd.concat(
                 [
                     selected,
                     pd.DataFrame(
                         [{
-                            "Использовать": True,
-                            "shop_number": shop_number,
-                            "Название точки": point_name,
+                            "shop_number": 25,
                             "receipts": 0,
                             "sold_quantity": 0.0,
                             "first_sale_date": pd.NaT,
@@ -4661,33 +4630,55 @@ if load_button:
                 ],
                 ignore_index=True,
             )
-    selected_shop_numbers = tuple(selected["shop_number"].astype(int).tolist())
-    point_mapping = dict(zip(selected["shop_number"].astype(int), selected["Название точки"]))
-    try:
-        sales = load_sales(start_date, end_date + timedelta(days=1), selected_shop_numbers)
-    except Exception as error:
-        st.error(f"Не удалось получить данные: {error}")
-        st.stop()
-    if sales.empty:
-        st.warning("За выбранный период продаж не найдено.")
-        st.stop()
-    st.session_state["analysis"] = prepare_analysis(sales, entities, point_mapping)
-    st.session_state["period"] = (start_date, end_date)
-    st.session_state["point_mapping"] = point_mapping
-    if remember_connection:
-        try:
-            remembered_until = save_remembered_pg_credentials(
-                pg_host, int(pg_port), pg_database, pg_user, pg_password
-            )
-            st.toast(f"Пароль запомнен до {remembered_until:%d.%m.%Y}", icon="🔐")
-        except Exception as error:
-            st.warning(f"Продажи загружены, но пароль не удалось запомнить: {error}")
-    elif REMEMBERED_PG_FILE.exists():
-        forget_remembered_pg_credentials()
 
-if "analysis" not in st.session_state:
-    st.info("Сначала найдите магазины, сопоставьте их с Т1–Т29, затем загрузите продажи.")
-    st.stop()
+        selected = selected.sort_values("shop_number", kind="stable").reset_index(drop=True)
+        selected["Название точки"] = selected["shop_number"].map(lambda value: f"Т{int(value)}")
+        selected["Использовать"] = True
+        selected_shop_numbers = tuple(selected["shop_number"].astype(int).tolist())
+        point_mapping = dict(
+            zip(selected["shop_number"].astype(int), selected["Название точки"])
+        )
+
+        sales = load_sales(
+            start_date,
+            end_date + timedelta(days=1),
+            selected_shop_numbers,
+        )
+        if sales.empty:
+            raise RuntimeError("за выбранный период продаж не найдено")
+
+        st.session_state["shop_mapping"] = selected
+        st.session_state["analysis"] = prepare_analysis(sales, entities, point_mapping)
+        st.session_state["period"] = (start_date, end_date)
+        st.session_state["point_mapping"] = point_mapping
+        st.session_state["auto_load_signature_v758"] = connection_signature
+
+        if remember_connection:
+            try:
+                remembered_until = save_remembered_pg_credentials(
+                    pg_host, int(pg_port), pg_database, pg_user, pg_password
+                )
+                st.toast(f"Пароль запомнен до {remembered_until:%d.%m.%Y}", icon="🔐")
+            except Exception as error:
+                st.warning(f"Данные загружены, но пароль не удалось запомнить: {error}")
+        elif REMEMBERED_PG_FILE.exists():
+            forget_remembered_pg_credentials()
+    except Exception as error:
+        st.error(f"Автоматическая загрузка не выполнена: {error}")
+        st.caption(
+            "Проверьте параметры PostgreSQL и выбранный период. После исправления "
+            "приложение повторит загрузку автоматически."
+        )
+        st.stop()
+
+with st.sidebar.expander("Автоматически найденные точки", expanded=False):
+    loaded_mapping = st.session_state.get("shop_mapping", pd.DataFrame())
+    if isinstance(loaded_mapping, pd.DataFrame) and not loaded_mapping.empty:
+        st.caption(
+            ", ".join(loaded_mapping["Название точки"].astype(str).tolist())
+        )
+    else:
+        st.caption("Список точек ещё не получен.")
 
 sku_point, category_profile, entity_profile, daily_detail = st.session_state["analysis"]
 period = st.session_state["period"]
