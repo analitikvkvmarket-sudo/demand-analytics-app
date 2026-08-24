@@ -45,7 +45,6 @@ def resolve_app_file(filename: str, *name_fragments: str) -> Path:
         "entities.xlsx": ("таблица сущности.xlsx",),
         "combo_matrix.xlsx": ("2.3 Матрица КОМБО.xlsx",),
         "analyst_logic.xlsx": ("логика аналитика.xlsx",),
-        "category_additions.xlsx": ("категории в разрезе.xlsx",),
     }
     exact_names = (filename, *aliases.get(filename, ()))
     for folder in search_dirs:
@@ -92,9 +91,6 @@ def resolve_app_file(filename: str, *name_fragments: str) -> Path:
 
 
 ENTITY_FILE = resolve_app_file("entities.xlsx", "сущност", "entit")
-CATEGORY_ADDITIONS_FILE = resolve_app_file(
-    "category_additions.xlsx", "категор", "разрез", "addition"
-)
 ANALYST_LOGIC_FILE = resolve_app_file("analyst_logic.xlsx", "логика", "аналит", "analyst")
 COMBO_MATRIX_FILE = resolve_app_file("combo_matrix.xlsx", "матрица", "комбо", "combo")
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -451,141 +447,6 @@ def normalize_sku(value: object) -> str | None:
     except (ValueError, TypeError):
         return None
 
-
-# Утвержденные бизнес-категории по SKU.
-# Встроены прямо в app.py, поэтому отдельный Excel для работы не требуется.
-# Для этих SKU встроенная категория имеет приоритет над entities.xlsx.
-SKU_CATEGORY_OVERRIDES: dict[str, str] = {
-    "24": "Прочее",
-    "545": "Вторые блюда",
-    "644": "Вторые блюда",
-    "869": "Вторые блюда",
-    "883": "Вторые блюда",
-    "981": "Напитки газ",
-    "1063": "Вторые блюда",
-    "1455": "Снэки",
-    "1456": "Снэки",
-    "1457": "Снэки",
-    "1459": "Снэки",
-    "1539": "Вторые блюда",
-    "1833": "Снэки",
-    "1983": "Напитки газ",
-    "1984": "Напитки газ",
-    "1985": "Напитки газ",
-    "1987": "Напитки",
-    "1988": "Напитки",
-    "1989": "Напитки",
-    "2075": "Напитки",
-    "2096": "Снэки",
-    "2103": "Снэки",
-    "2104": "Снэки",
-    "2107": "Снэки",
-    "2110": "Снэки",
-    "2112": "Снэки",
-    "2158": "Снэки",
-    "2160": "Снэки",
-    "2161": "Снэки",
-    "2171": "Снэки",
-    "2195": "Вторые блюда",
-    "2396": "Снэки",
-    "2413": "Напитки",
-    "2417": "Напитки",
-    "2444": "Напитки",
-    "2445": "Напитки газ",
-    "2459": "Снэки",
-    "2460": "Снэки",
-    "2461": "Снэки",
-    "2506": "Снэки",
-    "2525": "Снэки",
-    "2614": "Снэки",
-    "2616": "Снэки",
-    "2634": "Напитки",
-    "2635": "Завтраки",
-    "2659": "Напитки",
-    "2670": "Снэки",
-    "2690": "Соусы и добавки",
-    "2691": "Снэки",
-    "2711": "Напитки",
-    "2734": "Напитки",
-    "2752": "Напитки газ",
-    "2753": "Напитки газ",
-    "2754": "Напитки газ",
-    "2765": "Снэки",
-    "2775": "Напитки",
-    "2776": "Напитки газ",
-    "2780": "Напитки",
-    "2795": "Снэки",
-    "2819": "Напитки",
-    "2820": "Напитки газ",
-    "2907": "Напитки",
-    "2949": "Япония",
-    "2995": "Напитки",
-    "3038": "Снэки",
-    "3094": "Напитки",
-    "3095": "Напитки",
-    "3096": "Напитки",
-    "3097": "Напитки",
-    "3129": "Вторые блюда",
-    "3139": "Напитки газ",
-    "3172": "Снэки",
-    "3177": "Вторые блюда",
-    "3197": "Снэки",
-    "3204": "Напитки газ",
-    "3205": "Напитки газ",
-    "3206": "Напитки",
-    "3210": "Напитки газ",
-    "3211": "Напитки",
-    "3281": "Снэки",
-    "3282": "Снэки",
-    "3324": "Завтраки",
-    "3351": "Вторые блюда",
-    "3405": "Вторые блюда",
-    "3406": "Вторые блюда",
-    "3421": "Снэки",
-    "3429": "Вторые блюда",
-    "3440": "Вторые блюда",
-    "3443": "Вторые блюда",
-    "3488": "Снэки",
-    "3489": "Вторые блюда",
-    "3508": "Снэки",
-    "3509": "Снэки",
-    "3510": "Снэки",
-    "3516": "Вторые блюда",
-    "3522": "Снэки",
-    "3529": "Салаты",
-    "3532": "Сэндвичи",
-    "3537": "Сэндвичи",
-    "3541": "Вторые блюда",
-    "3572": "Напитки",
-    "3577": "Салаты",
-    "3593": "Салаты",
-    "3623": "Завтраки",
-    "3629": "Напитки",
-    "3660": "Салаты",
-    "3672": "Вторые блюда",
-    "3703": "Вторые блюда",
-    "3711": "Вторые блюда",
-    "3718": "Снэки",
-    "3719": "Снэки",
-    "3720": "Снэки",
-    "3721": "Снэки",
-    "3730": "Напитки",
-    "3732": "Вторые блюда",
-    "3733": "Вторые блюда",
-    "3734": "Вторые блюда",
-    "3736": "Вторые блюда",
-    "3756": "Вторые блюда",
-    "3758": "Вторые блюда",
-    "3772": "Вторые блюда",
-    "3775": "Вторые блюда",
-    "3788": "Напитки",
-    "3815": "Вторые блюда",
-    "3816": "Снэки",
-    "3817": "Снеки и орехи",
-    "3818": "Снэки",
-    "4356": "Вторые блюда",
-}
-
 def numeric_series(series: pd.Series) -> pd.Series:
     """Return a plain float64 Series even when source values are object/nullable."""
     return pd.to_numeric(series, errors="coerce").astype("float64")
@@ -650,134 +511,9 @@ def load_entities(path: str, modified_at: float) -> pd.DataFrame:
         lambda row: " • ".join(value.strip() for value in row if value.strip()) or "Не задана",
         axis=1,
     )
-
-    # Глобальные точечные исправления категорий. Если SKU отсутствует в
-    # entities.xlsx, добавляем минимальную строку: название при объединении
-    # будет взято из PostgreSQL, а категория уже будет определена правильно.
-    for override_sku, override_category in SKU_CATEGORY_OVERRIDES.items():
-        sku_mask = result["sku"].eq(override_sku)
-        if sku_mask.any():
-            result.loc[sku_mask, "category"] = override_category
-        else:
-            result = pd.concat(
-                [
-                    result,
-                    pd.DataFrame(
-                        [
-                            {
-                                "sku": override_sku,
-                                "entity_product_name": "",
-                                "category": override_category,
-                                "attribute_1": "",
-                                "attribute_2": "",
-                                "attribute_3": "",
-                                "entity": "Не задана",
-                            }
-                        ]
-                    ),
-                ],
-                ignore_index=True,
-            )
-
     return result[
         ["sku", "entity_product_name", "category", "attribute_1", "attribute_2", "attribute_3", "entity"]
     ]
-
-
-@st.cache_data(show_spinner=False)
-def load_category_additions(path: str, modified_at: float) -> pd.DataFrame:
-    """Дополнительное сопоставление SKU -> категория.
-
-    Файл не заменяет entities.xlsx: он переопределяет только категорию,
-    а сущности/атрибуты продолжают жить в основном справочнике.
-    При дублях SKU выбирается строка с наибольшим значением ВСЕГО.
-    """
-    data = pd.read_excel(path, sheet_name=0)
-    data.columns = [str(column).strip() for column in data.columns]
-    required = ["SKU", "Категория"]
-    missing = [column for column in required if column not in data.columns]
-    if missing:
-        raise ValueError(
-            f"В дополнительном справочнике категорий отсутствуют колонки: {', '.join(missing)}"
-        )
-
-    result = pd.DataFrame()
-    result["sku"] = data["SKU"].map(normalize_sku)
-    result["additional_category"] = data["Категория"].fillna("").astype(str).str.strip()
-    if "Наименование" in data.columns:
-        result["additional_product_name"] = data["Наименование"].fillna("").astype(str).str.strip()
-    else:
-        result["additional_product_name"] = ""
-    if "Источник категории" in data.columns:
-        result["additional_category_source"] = (
-            data["Источник категории"].fillna("").astype(str).str.strip()
-        )
-    else:
-        result["additional_category_source"] = "Дополнительный справочник"
-    if "ВСЕГО" in data.columns:
-        result["_priority_total"] = pd.to_numeric(data["ВСЕГО"], errors="coerce").fillna(0)
-    else:
-        result["_priority_total"] = 0
-
-    result = result[
-        result["sku"].notna()
-        & result["additional_category"].ne("")
-        & ~result["additional_category"].str.casefold().isin({"не сопоставлено", "nan", "none"})
-    ].copy()
-    result = (
-        result.sort_values(["sku", "_priority_total"], ascending=[True, False], kind="stable")
-        .drop_duplicates("sku", keep="first")
-        .drop(columns="_priority_total")
-        .reset_index(drop=True)
-    )
-    return result
-
-
-def apply_category_additions(entities: pd.DataFrame, additions: pd.DataFrame) -> pd.DataFrame:
-    """Apply the user-approved additional category mapping globally by SKU."""
-    if additions is None or additions.empty:
-        return entities.copy()
-
-    result = entities.copy()
-    additions = additions.drop_duplicates("sku", keep="first").copy()
-    category_map = additions.set_index("sku")["additional_category"]
-    name_map = additions.set_index("sku")["additional_product_name"]
-
-    # The additional file is an approved correction set, so for its SKU the
-    # category from this file has priority over the old category in entities.xlsx.
-    existing_mask = result["sku"].isin(category_map.index)
-    if existing_mask.any():
-        result.loc[existing_mask, "category"] = result.loc[existing_mask, "sku"].map(category_map)
-        empty_name_mask = existing_mask & result["entity_product_name"].fillna("").astype(str).str.strip().eq("")
-        if empty_name_mask.any():
-            result.loc[empty_name_mask, "entity_product_name"] = (
-                result.loc[empty_name_mask, "sku"].map(name_map).fillna("")
-            )
-
-    missing_skus = [sku for sku in category_map.index if sku not in set(result["sku"].astype(str))]
-    if missing_skus:
-        new_rows = []
-        for sku in missing_skus:
-            new_rows.append(
-                {
-                    "sku": sku,
-                    "entity_product_name": str(name_map.get(sku, "") or ""),
-                    "category": str(category_map.get(sku, "") or ""),
-                    "attribute_1": "",
-                    "attribute_2": "",
-                    "attribute_3": "",
-                    "entity": "Не задана",
-                }
-            )
-        result = pd.concat([result, pd.DataFrame(new_rows)], ignore_index=True)
-
-    # Keep hard business overrides as the strongest final rule.
-    for override_sku, override_category in SKU_CATEGORY_OVERRIDES.items():
-        sku_mask = result["sku"].eq(override_sku)
-        if sku_mask.any():
-            result.loc[sku_mask, "category"] = override_category
-
-    return result.drop_duplicates("sku", keep="last").reset_index(drop=True)
 
 
 def connection_settings() -> dict[str, object]:
@@ -1104,21 +840,11 @@ def parse_menu_matrix(file_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
             texts = [normalized_text(value).casefold() for value in values if pd.notna(value)]
             has_date_label = any(text.startswith("дата") for text in texts)
             has_plan_label = any("план на день кухня" in text for text in texts)
-            # В матрице после основного меню бывает служебный блок
-            # «Дата + Участок комплектации». Он может содержать те же SKU и
-            # похожий заголовок, но это НЕ второе меню. Раньше такой блок
-            # ошибочно распознавался как ещё одно меню и при выгрузке полностью
-            # дублировал выбранную дату снизу.
-            has_packaging_label = any("участок комплектации" in text for text in texts)
             parsed_date = next(
                 (parsed for value in values if (parsed := parse_excel_date(value)) is not None),
                 None,
             )
-            if (
-                parsed_date is not None
-                and (has_date_label or has_plan_label)
-                and not has_packaging_label
-            ):
+            if parsed_date is not None and (has_date_label or has_plan_label):
                 date_rows.append(row_index)
 
         for position, date_row in enumerate(date_rows):
@@ -1216,185 +942,6 @@ def parse_menu_matrix(file_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
             capacity = capacity[capacity["point_number"].notna()].copy()
             capacity["point_number"] = capacity["point_number"].astype(int)
     return menu, capacity
-
-
-def build_blank_menu_for_date(file_bytes: bytes, target_date: date) -> bytes:
-    """Build a compact blank menu for one date from the current combo matrix.
-
-    SKU/name/category/price come from the matrix. Point plan cells T1-T29 are
-    intentionally blank. The source matrix is never modified.
-    """
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill
-
-    menu, _ = parse_menu_matrix(file_bytes)
-    if menu.empty:
-        raise ValueError("В матрице не найдено меню.")
-
-    selected = menu[menu["target_date"].eq(target_date)].copy()
-    if selected.empty:
-        raise ValueError(f"В матрице нет меню на {target_date:%d.%m.%Y}.")
-
-    # If the same date is duplicated on service sheets, keep the first real block
-    # and preserve the row order from the matrix.
-    first_sheet = str(selected.iloc[0]["sheet"])
-    selected = selected[selected["sheet"].astype(str).eq(first_sheet)].copy()
-    selected = selected.sort_values("excel_row", kind="stable")
-    day_label = str(selected.iloc[0].get("day_label", "") or "").strip()
-
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "Меню"
-    sheet.sheet_view.showGridLines = False
-
-    sheet.cell(1, 1).value = "Дата:"
-    sheet.cell(1, 3).value = target_date
-    sheet.cell(1, 3).number_format = "DD.MM.YYYY"
-    sheet.cell(1, 5).value = day_label or f"План на день кухня {WEEKDAY_RU.get(target_date.weekday(), '')}"
-
-    headers = ["по плану", "Код №", "Цена", "категория", "Название блюда"]
-    headers.extend([f"Т{point}" for point in range(1, 30)])
-    headers.append("ПЛАН")
-    sheet.append(headers)
-
-    for item in selected.itertuples(index=False):
-        row = [
-            "Да",
-            item.sku,
-            None if pd.isna(item.price) else float(item.price),
-            ("" if str(item.matrix_category).strip().casefold() in {"nan", "none"} else item.matrix_category),
-            item.product_name,
-        ]
-        # All T-columns are deliberately empty. T11 remains present but blank.
-        row.extend([None] * 29)
-        row.append(None)
-        sheet.append(row)
-
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    for cell in sheet[2]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    sheet.freeze_panes = "F3"
-    sheet.auto_filter.ref = sheet.dimensions
-    sheet.column_dimensions["A"].width = 12
-    sheet.column_dimensions["B"].width = 11
-    sheet.column_dimensions["C"].width = 11
-    sheet.column_dimensions["D"].width = 18
-    sheet.column_dimensions["E"].width = 42
-    for column in range(6, 35):
-        sheet.column_dimensions[get_column_letter(column)].width = 8
-    sheet.column_dimensions[get_column_letter(35)].width = 12
-
-    for row in sheet.iter_rows(min_row=3):
-        for cell in row:
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
-
-    output = io.BytesIO()
-    workbook.save(output)
-    output.seek(0)
-    return output.getvalue()
-
-
-def build_blank_menu_for_dates(file_bytes: bytes, target_dates: list[date] | tuple[date, ...]) -> bytes:
-    """Build one blank workbook for several menu dates from the current matrix.
-
-    Each selected date gets its own worksheet. SKU/name/category/price are preserved,
-    while T1-T29 and PLAN are intentionally blank. The source matrix is untouched.
-    """
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Font, PatternFill
-
-    dates = sorted({value for value in target_dates if isinstance(value, date)})
-    if not dates:
-        raise ValueError("Не выбраны даты меню.")
-
-    menu, _ = parse_menu_matrix(file_bytes)
-    if menu.empty:
-        raise ValueError("В матрице не найдено меню.")
-
-    workbook = Workbook()
-    workbook.remove(workbook.active)
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    created = 0
-
-    for target_date in dates:
-        selected = menu[menu["target_date"].eq(target_date)].copy()
-        if selected.empty:
-            continue
-
-        first_sheet = str(selected.iloc[0]["sheet"])
-        selected = selected[selected["sheet"].astype(str).eq(first_sheet)].copy()
-        selected = selected.sort_values("excel_row", kind="stable")
-        if selected.empty:
-            continue
-
-        day_label = str(selected.iloc[0].get("day_label", "") or "").strip()
-        title_base = target_date.strftime("%d.%m.%Y")
-        title = title_base
-        suffix = 2
-        while title in workbook.sheetnames:
-            title = f"{title_base}_{suffix}"
-            suffix += 1
-        sheet = workbook.create_sheet(title=title)
-        sheet.sheet_view.showGridLines = False
-
-        sheet.cell(1, 1).value = "Дата:"
-        sheet.cell(1, 3).value = target_date
-        sheet.cell(1, 3).number_format = "DD.MM.YYYY"
-        sheet.cell(1, 5).value = day_label or f"План на день кухня {WEEKDAY_RU.get(target_date.weekday(), '')}"
-
-        headers = ["по плану", "Код №", "Цена", "категория", "Название блюда"]
-        headers.extend([f"Т{point}" for point in range(1, 30)])
-        headers.append("ПЛАН")
-        sheet.append(headers)
-
-        for item in selected.itertuples(index=False):
-            row = [
-                "Да",
-                item.sku,
-                None if pd.isna(item.price) else float(item.price),
-                (
-                    ""
-                    if str(item.matrix_category).strip().casefold() in {"nan", "none"}
-                    else item.matrix_category
-                ),
-                item.product_name,
-            ]
-            row.extend([None] * 29)
-            row.append(None)
-            sheet.append(row)
-
-        for cell in sheet[2]:
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-        sheet.freeze_panes = "F3"
-        sheet.auto_filter.ref = sheet.dimensions
-        sheet.column_dimensions["A"].width = 12
-        sheet.column_dimensions["B"].width = 11
-        sheet.column_dimensions["C"].width = 11
-        sheet.column_dimensions["D"].width = 18
-        sheet.column_dimensions["E"].width = 42
-        for column in range(6, 35):
-            sheet.column_dimensions[get_column_letter(column)].width = 8
-        sheet.column_dimensions[get_column_letter(35)].width = 12
-        for row in sheet.iter_rows(min_row=3):
-            for cell in row:
-                cell.alignment = Alignment(vertical="center", wrap_text=True)
-        created += 1
-
-    if created == 0:
-        raise ValueError("По выбранным датам в матрице не найдено меню.")
-
-    output = io.BytesIO()
-    workbook.save(output)
-    output.seek(0)
-    return output.getvalue()
 
 
 @st.cache_data(show_spinner="Читаю планы аналитика за 1–4 недели…")
@@ -4521,27 +4068,20 @@ def prepare_report_sales_frame(
 ) -> pd.DataFrame:
     """Подготавливает компактный дневной набор для отчёта.
 
-    В session_state не храним сырые строки чеков. Данные сжимаются до уровня
-    день + точка + категория + сущность + SKU. SKU и название нужны только
-    для раскрывающейся детализации категорий, при этом строки чеков/времени
-    продажи по-прежнему не сохраняются.
+    В session_state не храним сырые строки чеков: для отчёта достаточно
+    день + точка + категория + сущность. Это резко снижает расход RAM.
     """
     compact_columns = [
         "period", "business_date", "point", "shop_number",
-        "category", "entity", "sku", "product_name", "sales",
+        "category", "entity", "sales",
     ]
     if sales.empty:
         return pd.DataFrame(columns=compact_columns)
 
     report = sales[[
-        column for column in [
-            "business_date", "shop_number", "sku", "product_name", "sold_quantity"
-        ]
+        column for column in ["business_date", "shop_number", "sku", "sold_quantity"]
         if column in sales.columns
     ]].copy()
-    if "product_name" not in report.columns:
-        report["product_name"] = ""
-    report = report.rename(columns={"product_name": "source_product_name"})
     report["business_date"] = pd.to_datetime(report["business_date"], errors="coerce").dt.date
     report["shop_number"] = pd.to_numeric(report["shop_number"], errors="coerce").astype("Int64")
     report = report[report["business_date"].notna() & report["shop_number"].notna()].copy()
@@ -4550,102 +4090,23 @@ def prepare_report_sales_frame(
     report = report[report["shop_number"] != 11].copy()
     report["point"] = report["shop_number"].map(lambda value: f"Т{int(value)}")
     report["sku"] = report["sku"].map(normalize_sku)
-
-    entity_columns = [
-        column for column in ["sku", "category", "entity", "entity_product_name"]
-        if column in entities.columns
-    ]
-    entity_map = entities[entity_columns].copy()
+    entity_map = entities[["sku", "category", "entity"]].copy()
     entity_map["sku"] = entity_map["sku"].map(normalize_sku)
     entity_map = entity_map.drop_duplicates("sku")
     report = report.merge(entity_map, on="sku", how="left", validate="many_to_one")
     report["category"] = report["category"].fillna("Не сопоставлено")
     report["entity"] = report["entity"].fillna("Не сопоставлено")
-
-    canonical_name = (
-        report["entity_product_name"]
-        if "entity_product_name" in report.columns
-        else pd.Series("", index=report.index, dtype=object)
-    )
-    source_name = report["source_product_name"].fillna("").astype(str).str.strip()
-    canonical_name = canonical_name.fillna("").astype(str).str.strip()
-    report["product_name"] = canonical_name.where(canonical_name.ne(""), source_name)
-    report["product_name"] = report["product_name"].replace("", "Без названия")
-    report["sku"] = report["sku"].fillna("БЕЗ_SKU")
     report["sales"] = pd.to_numeric(report["sold_quantity"], errors="coerce").fillna(0.0)
 
     report = (
         report.groupby(
-            [
-                "business_date", "point", "shop_number", "category", "entity",
-                "sku", "product_name",
-            ],
+            ["business_date", "point", "shop_number", "category", "entity"],
             as_index=False,
             dropna=False,
         )["sales"].sum()
     )
     report["period"] = period_name
     return report[compact_columns]
-
-
-def build_report_category_sku_daily_detail(
-    frame: pd.DataFrame,
-    category: str,
-) -> pd.DataFrame:
-    """Проданные SKU выбранной категории: строки SKU, колонки дней недели."""
-    weekday_columns = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-    columns = ["SKU", "Название блюда", *weekday_columns, "ВСЕГО"]
-    if frame.empty:
-        return pd.DataFrame(columns=columns)
-
-    category_frame = frame[frame["category"].astype(str) == str(category)].copy()
-    if category_frame.empty:
-        return pd.DataFrame(columns=columns)
-
-    category_frame["sales"] = pd.to_numeric(category_frame["sales"], errors="coerce").fillna(0.0)
-    category_frame = category_frame[category_frame["sales"] != 0].copy()
-    if category_frame.empty:
-        return pd.DataFrame(columns=columns)
-
-    category_frame["День недели"] = category_frame["business_date"].map(
-        lambda value: REPORT_WEEKDAYS_RU.get(value.weekday(), "") if pd.notna(value) else ""
-    )
-    category_frame = category_frame[category_frame["День недели"].isin(weekday_columns)].copy()
-    if category_frame.empty:
-        return pd.DataFrame(columns=columns)
-
-    grouped = (
-        category_frame.groupby(
-            ["sku", "product_name", "День недели"],
-            as_index=False,
-            dropna=False,
-        )["sales"].sum()
-    )
-    detail = grouped.pivot_table(
-        index=["sku", "product_name"],
-        columns="День недели",
-        values="sales",
-        aggfunc="sum",
-        fill_value=0.0,
-    ).reset_index()
-
-    for weekday in weekday_columns:
-        if weekday not in detail.columns:
-            detail[weekday] = 0.0
-    detail["ВСЕГО"] = detail[weekday_columns].sum(axis=1)
-    detail = detail.rename(columns={"sku": "SKU", "product_name": "Название блюда"})
-    detail = detail[columns].sort_values(
-        ["ВСЕГО", "SKU"],
-        ascending=[False, True],
-        kind="stable",
-    ).reset_index(drop=True)
-
-    total_row = {column: "" for column in columns}
-    total_row["SKU"] = "ВСЕГО"
-    for weekday in weekday_columns:
-        total_row[weekday] = float(pd.to_numeric(detail[weekday], errors="coerce").fillna(0.0).sum())
-    total_row["ВСЕГО"] = float(pd.to_numeric(detail["ВСЕГО"], errors="coerce").fillna(0.0).sum())
-    return pd.concat([detail, pd.DataFrame([total_row])], ignore_index=True)
 
 
 def _report_group_period_values(
@@ -4704,102 +4165,6 @@ def build_report_tables(
     weekday_summary["Изменение, %"] = weekday_summary["Изменение, шт."].div(weekday_summary["Период 1, шт."].replace(0, pd.NA)) * 100
     weekday_summary["_order"] = weekday_summary["День недели"].map({name: idx for idx, name in enumerate(weekday_order)})
     weekday_summary = weekday_summary.sort_values("_order", kind="stable").drop(columns="_order")
-
-    # Детальная сверка по фактическим датам: одинаковые дни недели НЕ объединяем.
-    # Каждая дата остается отдельной строкой, категории становятся колонками,
-    # а «ВСЕГО» показывает сумму выбранных категорий за конкретную дату.
-    category_columns = sorted(
-        set(frame_1.get("category", pd.Series(dtype=object)).dropna().astype(str))
-        | set(frame_2.get("category", pd.Series(dtype=object)).dropna().astype(str))
-    )
-
-    def daily_category_matrix(frame: pd.DataFrame, period_dates: list[date]) -> pd.DataFrame:
-        rows: list[dict[str, object]] = []
-        if frame.empty:
-            grouped_lookup: dict[tuple[date, str], float] = {}
-        else:
-            grouped = (
-                frame.groupby(["business_date", "category"], as_index=False, dropna=False)["sales"].sum()
-            )
-            grouped_lookup = {
-                (row["business_date"], str(row["category"])): float(row["sales"])
-                for _, row in grouped.iterrows()
-            }
-
-        for current_date in period_dates:
-            row: dict[str, object] = {
-                "Дата": current_date.strftime("%d.%m.%Y"),
-                "День недели": REPORT_WEEKDAYS_RU.get(current_date.weekday(), ""),
-            }
-            date_total = 0.0
-            for category_name in category_columns:
-                value = float(grouped_lookup.get((current_date, category_name), 0.0))
-                row[category_name] = value
-                date_total += value
-            row["ВСЕГО"] = date_total
-            rows.append(row)
-
-        total_row: dict[str, object] = {"Дата": "ВСЕГО", "День недели": ""}
-        for category_name in category_columns:
-            total_row[category_name] = sum(float(item.get(category_name, 0.0)) for item in rows)
-        total_row["ВСЕГО"] = sum(float(item.get("ВСЕГО", 0.0)) for item in rows)
-        rows.append(total_row)
-        return pd.DataFrame(rows, columns=["Дата", "День недели", *category_columns, "ВСЕГО"])
-
-    daily_category_1 = daily_category_matrix(frame_1, period_1_dates)
-    daily_category_2 = daily_category_matrix(frame_2, period_2_dates)
-
-    # Сравниваем конкретные даты П1 и П2. При включенной сверке дней недели
-    # period_1_dates и period_2_dates уже выровнены попарно по Пн/Вт/... .
-    category_date_compare_rows: list[dict[str, object]] = []
-    max_pair_count = max(len(period_1_dates), len(period_2_dates))
-    qty_1 = (
-        frame_1.groupby(["business_date", "category"])["sales"].sum().to_dict()
-        if not frame_1.empty else {}
-    )
-    qty_2 = (
-        frame_2.groupby(["business_date", "category"])["sales"].sum().to_dict()
-        if not frame_2.empty else {}
-    )
-    for index in range(max_pair_count):
-        date_1 = period_1_dates[index] if index < len(period_1_dates) else None
-        date_2 = period_2_dates[index] if index < len(period_2_dates) else None
-        weekday_source = date_1 or date_2
-        pair_total_1 = 0.0
-        pair_total_2 = 0.0
-        for category_name in category_columns:
-            p1_value = float(qty_1.get((date_1, category_name), 0.0)) if date_1 else 0.0
-            p2_value = float(qty_2.get((date_2, category_name), 0.0)) if date_2 else 0.0
-            delta_value = p2_value - p1_value
-            delta_pct = (delta_value / p1_value * 100) if p1_value else pd.NA
-            pair_total_1 += p1_value
-            pair_total_2 += p2_value
-            category_date_compare_rows.append(
-                {
-                    "Дата П1": date_1.strftime("%d.%m.%Y") if date_1 else "",
-                    "День недели": REPORT_WEEKDAYS_RU.get(weekday_source.weekday(), "") if weekday_source else "",
-                    "Дата П2": date_2.strftime("%d.%m.%Y") if date_2 else "",
-                    "Категория": category_name,
-                    "Период 1, шт.": p1_value,
-                    "Период 2, шт.": p2_value,
-                    "Разница, шт.": delta_value,
-                    "Разница, %": delta_pct,
-                }
-            )
-        total_delta = pair_total_2 - pair_total_1
-        category_date_compare_rows.append(
-            {
-                "Дата П1": date_1.strftime("%d.%m.%Y") if date_1 else "",
-                "День недели": REPORT_WEEKDAYS_RU.get(weekday_source.weekday(), "") if weekday_source else "",
-                "Дата П2": date_2.strftime("%d.%m.%Y") if date_2 else "",
-                "Категория": "ВСЕГО",
-                "Период 1, шт.": pair_total_1,
-                "Период 2, шт.": pair_total_2,
-                "Разница, шт.": total_delta,
-                "Разница, %": (total_delta / pair_total_1 * 100) if pair_total_1 else pd.NA,
-            }
-        )
-    category_date_compare = pd.DataFrame(category_date_compare_rows)
 
     def matrix(frame: pd.DataFrame) -> pd.DataFrame:
         if frame.empty:
@@ -4869,9 +4234,6 @@ def build_report_tables(
         "category_entity": category_entity.sort_values(["Категория", "Период 2, шт."], ascending=[True, False], kind="stable"),
         "by_point": by_point.sort_values(["Точка", "Категория", "Период 2, шт."], ascending=[True, True, False], kind="stable"),
         "weekday_summary": weekday_summary,
-        "daily_category_1": daily_category_1,
-        "daily_category_2": daily_category_2,
-        "category_date_compare": category_date_compare,
         "matrix_1": matrix_1,
         "matrix_2": matrix_2,
         "matrix_delta": matrix_delta,
@@ -4985,10 +4347,7 @@ def build_period_comparison_excel(
         _append_report_total_row(tables["category_summary"]).to_excel(writer, sheet_name="Сводка категорий", index=False)
         _append_report_total_row(tables["category_entity"]).to_excel(writer, sheet_name="Категории-сущности", index=False)
         _append_report_total_row(tables["by_point"]).to_excel(writer, sheet_name="По точкам", index=False)
-        tables["daily_category_1"].to_excel(writer, sheet_name="Даты-категории П1", index=False)
-        tables["daily_category_2"].to_excel(writer, sheet_name="Даты-категории П2", index=False)
-        tables["category_date_compare"].to_excel(writer, sheet_name="Сравнение дат-категорий", index=False)
-        tables["weekday_summary"].to_excel(writer, sheet_name="Дни недели агрегат", index=False)
+        tables["weekday_summary"].to_excel(writer, sheet_name="Дни недели", index=False)
         tables["matrix_1"].to_excel(writer, sheet_name="Матрица П1", index=False)
         tables["matrix_2"].to_excel(writer, sheet_name="Матрица П2", index=False)
         tables["matrix_delta"].to_excel(writer, sheet_name="Изменение матрицы", index=False)
@@ -5143,7 +4502,7 @@ def build_period_comparison_html(
 
 
 st.title("Анализ структуры спроса")
-st.caption("Версия 75.8.4 · Исправлена двойная выгрузка меню")
+st.caption("Версия 75.7.5 · Отчет: изменение по точкам в шт. и %")
 
 if not ENTITY_FILE.exists():
     st.error(f"Не найден справочник: {ENTITY_FILE.name}")
@@ -5154,22 +4513,6 @@ try:
 except Exception as error:
     st.error(f"Ошибка справочника сущностей: {error}")
     st.stop()
-
-st.caption(f"Встроенные категории SKU: {len(SKU_CATEGORY_OVERRIDES):,} сопоставлений".replace(",", " "))
-
-category_additions = pd.DataFrame()
-if CATEGORY_ADDITIONS_FILE.exists():
-    try:
-        category_additions = load_category_additions(
-            str(CATEGORY_ADDITIONS_FILE), CATEGORY_ADDITIONS_FILE.stat().st_mtime
-        )
-        entities = apply_category_additions(entities, category_additions)
-        st.caption(
-            f"Дополнительные категории подключены: {len(category_additions):,} SKU · источник: {CATEGORY_ADDITIONS_FILE.name}"
-            .replace(",", " ")
-        )
-    except Exception as error:
-        st.warning(f"Дополнительный справочник категорий не применён: {error}")
 
 today = date.today()
 month_start = today.replace(day=1)
@@ -5204,8 +4547,7 @@ with st.sidebar:
         if st.button("Забыть сохранённый пароль", use_container_width=True, disabled=not REMEMBERED_PG_FILE.exists()):
             forget_remembered_pg_credentials()
             os.environ.pop("PGPASSWORD", None)
-            for state_key in ["analysis", "period", "point_mapping", "_analysis_signature_v760", "_shops_signature_v760"]:
-                st.session_state.pop(state_key, None)
+            st.session_state.pop("analysis", None)
             st.success("Сохранённый пароль удалён. При следующем подключении введите его снова.")
             st.rerun()
     date_range = st.date_input(
@@ -5214,13 +4556,8 @@ with st.sidebar:
         max_value=today,
         format="DD.MM.YYYY",
     )
-    global_refresh_button = st.button(
-        "Обновить все данные",
-        type="primary",
-        use_container_width=True,
-        help="Принудительно обновляет магазины, продажи, матрицу и остальные кэшированные данные. При обычной работе нажимать не требуется.",
-    )
-    st.caption("Точки Т1–Т29 определяются автоматически, Т11 исключена. Продажи загружаются при открытии сайта и смене периода.")
+    find_button = st.button("1. Найти магазины в базе", use_container_width=True)
+    load_button = st.button("2. Загрузить продажи", type="primary", use_container_width=True)
 
 os.environ["PGHOST"] = pg_host.strip()
 os.environ["PGPORT"] = str(int(pg_port))
@@ -5229,175 +4566,128 @@ os.environ["PGUSER"] = pg_user.strip()
 os.environ["PGPASSWORD"] = pg_password
 
 valid_period = isinstance(date_range, tuple) and len(date_range) == 2
-credentials_ready = all(
-    str(value).strip()
-    for value in (pg_host, pg_database, pg_user, pg_password)
-)
-connection_signature = (
-    pg_host.strip(),
-    int(pg_port),
-    pg_database.strip(),
-    pg_user.strip(),
-    hashlib.sha256(pg_password.encode("utf-8")).hexdigest()[:16] if pg_password else "",
-)
-
-if global_refresh_button:
-    # Одна кнопка обновляет весь кэш приложения: PostgreSQL, матрицу, прогнозы и справочники.
-    st.cache_data.clear()
-    for state_key in [
-        "analysis",
-        "period",
-        "point_mapping",
-        "_analysis_signature_v760",
-        "_shops_signature_v760",
-        "combo_matrix_signature_v761",
-        "period_comparison_report_v770",
-    ]:
-        st.session_state.pop(state_key, None)
-
-if not valid_period:
-    st.info("Выберите дату начала и дату окончания.")
-    st.stop()
-if not credentials_ready:
-    st.info("Заполните подключение к PostgreSQL. После ввода данных приложение загрузит продажи автоматически.")
-    st.stop()
-
-start_date, end_date = date_range
-shops_signature = (start_date, end_date, connection_signature)
-need_shops_refresh = (
-    "shop_mapping" not in st.session_state
-    or st.session_state.get("_shops_signature_v760") != shops_signature
-)
-
-if need_shops_refresh:
+if find_button:
+    if not valid_period:
+        st.error("Выберите дату начала и дату окончания.")
+        st.stop()
+    start_date, end_date = date_range
     try:
-        with st.spinner("Обновляю магазины и точки…"):
-            available_shops = ensure_required_shops(
-                load_available_shops(start_date, end_date + timedelta(days=1))
-            )
+        available_shops = ensure_required_shops(
+            load_available_shops(start_date, end_date + timedelta(days=1))
+        )
     except Exception as error:
         st.error(f"Не удалось получить список магазинов: {error}")
         st.stop()
-
-    if available_shops.empty:
-        st.warning("За выбранный период база не вернула ни одного магазина. Проверьте даты.")
-        st.stop()
-
-    mapping = available_shops.copy()
-    shop_numbers_numeric = pd.to_numeric(mapping["shop_number"], errors="coerce")
-    default_use = shop_numbers_numeric.between(1, 29) & shop_numbers_numeric.ne(11)
-    mapping.insert(0, "Использовать", default_use.fillna(False))
-    mapping.insert(
-        2,
-        "Название точки",
-        shop_numbers_numeric.map(lambda value: f"Т{int(value)}" if pd.notna(value) and 1 <= int(value) <= 29 else ""),
-    )
-    mapping = ensure_required_shops(mapping)
-    for shop_number, point_name in REQUIRED_POINT_SHOPS.items():
-        required_mask = pd.to_numeric(mapping["shop_number"], errors="coerce").eq(shop_number)
-        mapping.loc[required_mask, "Использовать"] = True
-        mapping.loc[required_mask, "Название точки"] = point_name
-    st.session_state["shop_mapping"] = mapping
-    st.session_state["_shops_signature_v760"] = shops_signature
-
-# Полностью автоматическое сопоставление: магазин N -> ТN.
-# Используются только Т1–Т29, Т11 исключается. Пользователь ничего не выбирает.
-automatic_mapping = ensure_required_shops(st.session_state["shop_mapping"]).copy()
-shop_numbers_numeric = pd.to_numeric(automatic_mapping["shop_number"], errors="coerce")
-automatic_mapping["Использовать"] = shop_numbers_numeric.between(1, 29) & shop_numbers_numeric.ne(11)
-automatic_mapping["Название точки"] = shop_numbers_numeric.map(
-    lambda value: f"Т{int(value)}" if pd.notna(value) and 1 <= int(value) <= 29 else ""
-)
-for shop_number, point_name in REQUIRED_POINT_SHOPS.items():
-    required_mask = shop_numbers_numeric.eq(shop_number)
-    automatic_mapping.loc[required_mask, "Использовать"] = True
-    automatic_mapping.loc[required_mask, "Название точки"] = point_name
-st.session_state["shop_mapping"] = automatic_mapping
-
-selected = automatic_mapping[automatic_mapping["Использовать"].fillna(False)].copy()
-selected["Название точки"] = selected["Название точки"].astype(str).str.strip()
-selected = selected[selected["Название точки"].str.match(r"^Т\d+$", na=False)].copy()
-selected["_point_number"] = pd.to_numeric(
-    selected["Название точки"].str.extract(r"(\d+)", expand=False), errors="coerce"
-)
-selected = selected[
-    selected["_point_number"].between(1, 29)
-    & selected["_point_number"].ne(11)
-].copy()
-
-for shop_number, point_name in REQUIRED_POINT_SHOPS.items():
-    if shop_number not in pd.to_numeric(selected["shop_number"], errors="coerce").dropna().astype(int).tolist():
-        selected = pd.concat(
-            [
-                selected,
-                pd.DataFrame(
-                    [{
-                        "Использовать": True,
-                        "shop_number": shop_number,
-                        "Название точки": point_name,
-                        "receipts": 0,
-                        "sold_quantity": 0.0,
-                        "first_sale_date": pd.NaT,
-                        "last_sale_date": pd.NaT,
-                        "_point_number": int(point_name[1:]),
-                    }]
-                ),
-            ],
-            ignore_index=True,
-        )
-
-if selected.empty:
-    st.error("Не удалось автоматически определить точки Т1–Т29 для анализа.")
-    st.stop()
-
-selected["shop_number"] = pd.to_numeric(selected["shop_number"], errors="coerce").astype(int)
-selected_shop_numbers = tuple(sorted(selected["shop_number"].unique().tolist()))
-point_mapping = dict(
-    zip(selected["shop_number"].astype(int), selected["Название точки"].astype(str))
-)
-mapping_signature = tuple(sorted((int(shop), str(point)) for shop, point in point_mapping.items()))
-analysis_signature = (start_date, end_date, connection_signature, mapping_signature)
-need_analysis_refresh = (
-    "analysis" not in st.session_state
-    or st.session_state.get("_analysis_signature_v760") != analysis_signature
-)
-
-if need_analysis_refresh:
-    try:
-        with st.spinner("Обновляю продажи и весь анализ…"):
-            sales = load_sales(start_date, end_date + timedelta(days=1), selected_shop_numbers)
-    except Exception as error:
-        st.error(f"Не удалось получить продажи: {error}")
-        st.stop()
-    if sales.empty:
-        st.warning("За выбранный период продаж не найдено.")
-        st.stop()
-
-    st.session_state["analysis"] = prepare_analysis(sales, entities, point_mapping)
-    st.session_state["period"] = (start_date, end_date)
-    st.session_state["point_mapping"] = point_mapping
-    st.session_state["_analysis_signature_v760"] = analysis_signature
-    st.session_state["_analysis_updated_at_v760"] = datetime.now()
-
     if remember_connection:
         try:
             remembered_until = save_remembered_pg_credentials(
                 pg_host, int(pg_port), pg_database, pg_user, pg_password
             )
-            if global_refresh_button:
-                st.toast(f"Данные обновлены · пароль сохранён до {remembered_until:%d.%m.%Y}", icon="🔄")
+            st.toast(f"Пароль запомнен до {remembered_until:%d.%m.%Y}", icon="🔐")
         except Exception as error:
-            st.warning(f"Данные загружены, но пароль не удалось запомнить: {error}")
+            st.warning(f"Подключение работает, но пароль не удалось запомнить: {error}")
+    elif REMEMBERED_PG_FILE.exists():
+        forget_remembered_pg_credentials()
+    if available_shops.empty:
+        st.warning("За выбранный период база не вернула ни одного магазина. Проверьте даты.")
+    else:
+        mapping = available_shops.copy()
+        mapping.insert(0, "Использовать", True)
+        mapping.insert(2, "Название точки", mapping["shop_number"].map(lambda value: f"Т{int(value)}"))
+        st.session_state["shop_mapping"] = mapping
+
+edited_mapping = None
+if "shop_mapping" in st.session_state:
+    required_mapping = ensure_required_shops(st.session_state["shop_mapping"])
+    for shop_number, point_name in REQUIRED_POINT_SHOPS.items():
+        required_mask = pd.to_numeric(
+            required_mapping["shop_number"], errors="coerce"
+        ).eq(shop_number)
+        required_mapping.loc[required_mask, "Использовать"] = True
+        required_mapping.loc[required_mask, "Название точки"] = point_name
+    st.session_state["shop_mapping"] = required_mapping
+    st.subheader("Соответствие магазинов и точек")
+    st.caption("Проверьте столбец «Название точки». Оставьте галочку только у точек Т; столовые, ФСПК и точки Ф отключите.")
+    edited_mapping = st.data_editor(
+        st.session_state["shop_mapping"],
+        hide_index=True,
+        use_container_width=True,
+        disabled=["shop_number", "receipts", "sold_quantity", "first_sale_date", "last_sale_date"],
+        column_config={
+            "Использовать": st.column_config.CheckboxColumn("Использовать"),
+            "shop_number": st.column_config.NumberColumn("Номер магазина", format="%d"),
+            "Название точки": st.column_config.TextColumn("Название точки"),
+            "receipts": st.column_config.NumberColumn("Количество чеков", format="%d"),
+            "sold_quantity": st.column_config.NumberColumn("Продано, шт.", format="%.0f"),
+            "first_sale_date": st.column_config.DateColumn("Первая продажа", format="DD.MM.YYYY"),
+            "last_sale_date": st.column_config.DateColumn("Последняя продажа", format="DD.MM.YYYY"),
+        },
+        key="mapping_editor",
+    )
+
+if load_button:
+    if not valid_period:
+        st.error("Выберите дату начала и дату окончания.")
+        st.stop()
+    if edited_mapping is None:
+        st.error("Сначала нажмите «1. Найти магазины в базе».")
+        st.stop()
+    selected = edited_mapping[edited_mapping["Использовать"]].copy()
+    if selected.empty:
+        st.error("Отметьте хотя бы одну точку.")
+        st.stop()
+    selected["Название точки"] = selected["Название точки"].astype(str).str.strip()
+    selected = selected[selected["Название точки"].str.match(r"^Т\d+$", na=False)]
+    if selected.empty:
+        st.error("Для выбранных строк задайте названия в формате Т1, Т2 … Т29.")
+        st.stop()
+    start_date, end_date = date_range
+    for shop_number, point_name in REQUIRED_POINT_SHOPS.items():
+        if shop_number not in selected["shop_number"].astype(int).tolist():
+            selected = pd.concat(
+                [
+                    selected,
+                    pd.DataFrame(
+                        [{
+                            "Использовать": True,
+                            "shop_number": shop_number,
+                            "Название точки": point_name,
+                            "receipts": 0,
+                            "sold_quantity": 0.0,
+                            "first_sale_date": pd.NaT,
+                            "last_sale_date": pd.NaT,
+                        }]
+                    ),
+                ],
+                ignore_index=True,
+            )
+    selected_shop_numbers = tuple(selected["shop_number"].astype(int).tolist())
+    point_mapping = dict(zip(selected["shop_number"].astype(int), selected["Название точки"]))
+    try:
+        sales = load_sales(start_date, end_date + timedelta(days=1), selected_shop_numbers)
+    except Exception as error:
+        st.error(f"Не удалось получить данные: {error}")
+        st.stop()
+    if sales.empty:
+        st.warning("За выбранный период продаж не найдено.")
+        st.stop()
+    st.session_state["analysis"] = prepare_analysis(sales, entities, point_mapping)
+    st.session_state["period"] = (start_date, end_date)
+    st.session_state["point_mapping"] = point_mapping
+    if remember_connection:
+        try:
+            remembered_until = save_remembered_pg_credentials(
+                pg_host, int(pg_port), pg_database, pg_user, pg_password
+            )
+            st.toast(f"Пароль запомнен до {remembered_until:%d.%m.%Y}", icon="🔐")
+        except Exception as error:
+            st.warning(f"Продажи загружены, но пароль не удалось запомнить: {error}")
     elif REMEMBERED_PG_FILE.exists():
         forget_remembered_pg_credentials()
 
 if "analysis" not in st.session_state:
-    st.info("Данные загружаются автоматически после подключения к PostgreSQL.")
+    st.info("Сначала найдите магазины, сопоставьте их с Т1–Т29, затем загрузите продажи.")
     st.stop()
-
-if st.session_state.get("_analysis_updated_at_v760"):
-    updated_at = st.session_state["_analysis_updated_at_v760"]
-    st.caption(f"Данные анализа обновлены: {updated_at:%d.%m.%Y %H:%M:%S}")
 
 sku_point, category_profile, entity_profile, daily_detail = st.session_state["analysis"]
 period = st.session_state["period"]
@@ -5835,66 +5125,6 @@ if tab_report.open:
                         "Разница, %": st.column_config.NumberColumn(format="%+.1f%%"),
                     },
                 )
-
-                st.markdown("##### Раскрыть категорию → продажи SKU по дням")
-                st.caption(
-                    "Откройте нужную категорию. Строка = SKU товара, колонки = дни недели. "
-                    "Продажи всех одинаковых дней недели внутри выбранного периода суммируются."
-                )
-                category_rows_for_drilldown = category_compare_table[
-                    category_compare_table["Категория"].astype(str).ne("ВСЕГО")
-                ].copy()
-                for _, category_row in category_rows_for_drilldown.iterrows():
-                    drill_category = str(category_row["Категория"])
-                    drill_p1_value = pd.to_numeric(category_row.get("Период 1, шт."), errors="coerce")
-                    drill_p2_value = pd.to_numeric(category_row.get("Период 2, шт."), errors="coerce")
-                    drill_p1 = 0.0 if pd.isna(drill_p1_value) else float(drill_p1_value)
-                    drill_p2 = 0.0 if pd.isna(drill_p2_value) else float(drill_p2_value)
-                    with st.expander(
-                        f"{drill_category} · П1 {drill_p1:,.0f} шт. · П2 {drill_p2:,.0f} шт.".replace(",", " "),
-                        expanded=False,
-                    ):
-                        sku_period_1_tab, sku_period_2_tab = st.tabs(["Период 1", "Период 2"])
-                        with sku_period_1_tab:
-                            st.caption(
-                                f"{report_period_1[0]:%d.%m.%Y}–{report_period_1[1]:%d.%m.%Y}"
-                            )
-                            drill_detail_1 = build_report_category_sku_daily_detail(
-                                filtered_report_1, drill_category
-                            )
-                            if drill_detail_1.empty:
-                                st.info("В Периоде 1 продаж SKU этой категории нет.")
-                            else:
-                                st.dataframe(
-                                    drill_detail_1,
-                                    use_container_width=True,
-                                    hide_index=True,
-                                    height=min(620, 35 * len(drill_detail_1) + 80),
-                                    column_config={
-                                        **{day: st.column_config.NumberColumn(format="%.0f") for day in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]},
-                                        "ВСЕГО": st.column_config.NumberColumn(format="%.0f"),
-                                    },
-                                )
-                        with sku_period_2_tab:
-                            st.caption(
-                                f"{report_period_2[0]:%d.%m.%Y}–{report_period_2[1]:%d.%m.%Y}"
-                            )
-                            drill_detail_2 = build_report_category_sku_daily_detail(
-                                filtered_report_2, drill_category
-                            )
-                            if drill_detail_2.empty:
-                                st.info("В Периоде 2 продаж SKU этой категории нет.")
-                            else:
-                                st.dataframe(
-                                    drill_detail_2,
-                                    use_container_width=True,
-                                    hide_index=True,
-                                    height=min(620, 35 * len(drill_detail_2) + 80),
-                                    column_config={
-                                        **{day: st.column_config.NumberColumn(format="%.0f") for day in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]},
-                                        "ВСЕГО": st.column_config.NumberColumn(format="%.0f"),
-                                    },
-                                )
             else:
                 st.info("Для выбранных фильтров нет категорий для сравнения.")
 
@@ -5916,62 +5146,16 @@ if tab_report.open:
                 },
             )
 
-            st.markdown("#### Продажи по отдельным датам и категориям")
-            st.caption(
-                "Одинаковые дни недели не складываются между собой: каждая календарная дата — отдельная строка. "
-                "Столбец «ВСЕГО» показывает сумму всех выбранных категорий за эту дату; последняя строка — итог всего периода."
-            )
-
-            st.markdown(
-                f"**Период 1 · {report_period_1[0]:%d.%m.%Y}–{report_period_1[1]:%d.%m.%Y}**"
-            )
-            daily_category_1_display = report_tables["daily_category_1"].copy()
-            daily_number_config_1 = {
-                column: st.column_config.NumberColumn(format="%.0f")
-                for column in daily_category_1_display.columns
-                if column not in {"Дата", "День недели"}
-            }
+            st.markdown("#### Сверка одинаковых дней недели")
             st.dataframe(
-                daily_category_1_display,
+                report_tables["weekday_summary"],
                 use_container_width=True,
                 hide_index=True,
-                height=min(620, 38 * len(daily_category_1_display) + 80),
-                column_config=daily_number_config_1,
-            )
-
-            st.markdown(
-                f"**Период 2 · {report_period_2[0]:%d.%m.%Y}–{report_period_2[1]:%d.%m.%Y}**"
-            )
-            daily_category_2_display = report_tables["daily_category_2"].copy()
-            daily_number_config_2 = {
-                column: st.column_config.NumberColumn(format="%.0f")
-                for column in daily_category_2_display.columns
-                if column not in {"Дата", "День недели"}
-            }
-            st.dataframe(
-                daily_category_2_display,
-                use_container_width=True,
-                hide_index=True,
-                height=min(620, 38 * len(daily_category_2_display) + 80),
-                column_config=daily_number_config_2,
-            )
-
-            st.markdown("#### Сравнение двух периодов по одинаковым дням недели и категориям")
-            st.caption(
-                "Сопоставляются конкретные даты: например, понедельник П1 с понедельником П2. "
-                "Для каждой пары дат категории показаны отдельно; строка «ВСЕГО» — итог всех выбранных категорий этой пары дат."
-            )
-            category_date_compare_display = report_tables["category_date_compare"].copy()
-            st.dataframe(
-                category_date_compare_display,
-                use_container_width=True,
-                hide_index=True,
-                height=min(700, 38 * len(category_date_compare_display) + 80),
                 column_config={
                     "Период 1, шт.": st.column_config.NumberColumn(format="%.0f"),
                     "Период 2, шт.": st.column_config.NumberColumn(format="%.0f"),
-                    "Разница, шт.": st.column_config.NumberColumn(format="%+.0f"),
-                    "Разница, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                    "Изменение, шт.": st.column_config.NumberColumn(format="%+.0f"),
+                    "Изменение, %": st.column_config.NumberColumn(format="%+.1f%%"),
                 },
             )
 
@@ -9160,7 +8344,7 @@ if tab_sales_time.open:
             ]
             if not available_point_labels:
                 st.warning(
-                    "Для выбранного периода нет доступных точек Т1–Т29."
+                    "Для выбранного периода нет сопоставленных точек. Сначала найдите магазины и задайте им названия Т1–Т29."
                 )
             else:
                 selected_time_points = st.multiselect(
@@ -10563,252 +9747,142 @@ if tab_forecast.open:
     with tab_forecast:
         st.subheader("Прогноз плана по средним продажам SKU")
         st.caption(
-            "Меню берётся автоматически из той же актуальной матрицы 2.3, что используется "
-            "во вкладке «Окно свежести». Можно выбрать сразу несколько дат — приложение соберёт "
-            "их в один рабочий файл и рассчитает каждую дату отдельно. Исходная Google-матрица "
-            "не изменяется. Для каждого SKU и точки используется ровно два календарных месяца "
-            "до соответствующей даты меню: Япония — ×1 от среднего, вторые блюда — ×3, "
-            "напитки — ×4, остальные категории — ×2. Если продаж не было, базовое среднее "
-            "принимается равным 1 шт./день."
+            "Загрузите только пустое меню — приложение обработает все даты и все блоки на листе. "
+            "Для каждого SKU и каждой точки приложение берёт два календарных "
+            "месяца до даты плана и считает среднее только по дням, когда SKU действительно продавался. "
+            "Множитель загрузки зависит от текущей категории SKU: Япония — ×1 от среднего, "
+            "вторые блюда — ×3, напитки — ×4, остальные категории — ×2. "
+            "Если SKU на точке не продавался, среднее принимается равным 1 шт./день. "
+            "Если за 2 месяца продажи были только в 1–2 дня, итоговый прогноз в Excel "
+            "подсвечивается светло-красным как значение с недостаточной выборкой. "
+            "Ф-столбцы не изменяются, Т11 пустая."
         )
-
-        forecast_matrix_bytes, forecast_matrix_source, forecast_checked_at, forecast_matrix_error = (
-            _load_matrix_context_for_active_tab()
-        )
-        status_cols = st.columns([4.0, 1.0])
-        with status_cols[0]:
-            if forecast_matrix_bytes:
-                st.success(
-                    f"Источник меню: {forecast_matrix_source} · "
-                    f"проверено {forecast_checked_at.replace('T', ' ')}."
-                )
-            else:
-                st.error("Матрица 2.3 сейчас недоступна.")
-                if forecast_matrix_error:
-                    st.caption(f"Причина: {forecast_matrix_error}")
-        with status_cols[1]:
-            if st.button(
-                "Обновить матрицу",
-                use_container_width=True,
-                key="refresh_forecast_matrix_v81",
-            ):
-                _fetch_apps_script_matrix_snapshot.clear()
-                st.rerun()
-
-        if forecast_matrix_bytes:
+        matrix_file = st.file_uploader("Меню (.xlsx)", type=["xlsx"], key="forecast_matrix")
+        if matrix_file is not None:
             try:
-                source_matrix_menu, _ = parse_menu_matrix(forecast_matrix_bytes)
+                matrix_menu, matrix_capacity = parse_menu_matrix(matrix_file.getvalue())
             except Exception as error:
-                st.error(f"Не удалось прочитать актуальную матрицу: {error}")
-                source_matrix_menu = pd.DataFrame()
+                st.error(f"Не удалось прочитать матрицу: {error}")
+                matrix_menu = pd.DataFrame()
+                matrix_capacity = pd.DataFrame()
 
-            if source_matrix_menu.empty:
-                st.warning("В актуальной матрице не найдено меню с датами и SKU.")
+            if matrix_menu.empty:
+                st.warning("В файле не найдено меню с датой, SKU и колонками точек.")
             else:
-                available_forecast_dates = sorted(
-                    source_matrix_menu["target_date"].dropna().unique().tolist()
+                block_options = (
+                    matrix_menu[["target_date", "sheet", "day_label"]]
+                    .drop_duplicates()
+                    .sort_values(["target_date", "sheet"])
                 )
-                selected_forecast_dates = st.multiselect(
-                    "Даты меню",
-                    available_forecast_dates,
-                    default=available_forecast_dates[:1],
-                    format_func=lambda value: (
-                        f"{value:%d.%m.%Y} · {WEEKDAY_RU.get(value.weekday(), '')}"
-                    ),
-                    key="forecast_matrix_dates_v81",
-                    help="Можно выбрать одну или несколько дат одновременно.",
+                block_records = block_options.to_dict("records")
+                selected_block = st.selectbox(
+                    "Предпросмотр даты и листа (расчёт выполнится по всему файлу)",
+                    block_records,
+                    format_func=lambda item: f"{item['target_date']:%d.%m.%Y} · {item['sheet']} · {item['day_label']}",
                 )
-                selected_forecast_dates = sorted(selected_forecast_dates)
+                selected_menu = matrix_menu[
+                    (matrix_menu["target_date"] == selected_block["target_date"])
+                    & (matrix_menu["sheet"] == selected_block["sheet"])
+                ].copy()
+                preview_menu = selected_menu.merge(
+                    entities[["sku", "category", "entity"]], on="sku", how="left"
+                )
+                preview_menu["category"] = preview_menu["category"].fillna(preview_menu["matrix_category"])
+                preview_menu["entity"] = preview_menu["entity"].fillna("Не сопоставлено")
+                forecast_metrics = st.columns(4)
+                forecast_metrics[0].metric("SKU в меню", preview_menu["sku"].nunique())
+                forecast_metrics[1].metric("Категорий", preview_menu["category"].nunique())
+                forecast_metrics[2].metric("Сущностей", preview_menu["entity"].nunique())
+                forecast_metrics[3].metric(
+                    "Без сущности", preview_menu.loc[preview_menu["entity"] == "Не сопоставлено", "sku"].nunique()
+                )
+                with st.expander("Показать распознанное меню"):
+                    st.dataframe(
+                        preview_menu[["sku", "product_name", "category", "entity", "price"]].rename(
+                            columns={
+                                "sku": "SKU",
+                                "product_name": "Название товара",
+                                "category": "Категория",
+                                "entity": "Сущность",
+                                "price": "Цена",
+                            }
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-                current_dates_key = tuple(selected_forecast_dates)
-                previous_dates_key = st.session_state.get("forecast_active_dates_v81")
-                if previous_dates_key != current_dates_key:
-                    for stale_key in [
-                        "forecast_result",
-                        "forecast_menu",
-                        "forecast_history_from",
-                        "forecast_target_date",
-                        "forecast_target_dates",
-                        "forecast_first_target_date",
-                        "forecast_matrix_bytes",
-                    ]:
-                        st.session_state.pop(stale_key, None)
-                    st.session_state["forecast_active_dates_v81"] = current_dates_key
-
-                if not selected_forecast_dates:
-                    st.info("Выберите хотя бы одну дату меню.")
-                else:
+                all_target_dates = sorted(matrix_menu["target_date"].dropna().unique().tolist())
+                first_target_date = all_target_dates[0]
+                last_target_date = all_target_dates[-1]
+                history_from = (pd.Timestamp(first_target_date) - pd.DateOffset(months=2)).date()
+                st.info(
+                    f"Будут рассчитаны все {len(all_target_dates)} дат меню: "
+                    f"{first_target_date:%d.%m.%Y}–{last_target_date:%d.%m.%Y}. "
+                    "Для каждой даты используется своё окно предыдущих двух календарных месяцев."
+                )
+                forecast_button = st.button("Рассчитать рекомендуемый план", type="primary", key="calculate_forecast")
+                if forecast_button:
+                    forecast_points = {
+                        int(number): label
+                        for number, label in st.session_state.get("point_mapping", {}).items()
+                        if str(label).startswith("Т")
+                        and 1 <= int(str(label)[1:]) <= 29
+                        and int(str(label)[1:]) != 11
+                    }
+                    if not forecast_points:
+                        forecast_points = {
+                            number: f"Т{number}" for number in range(1, 30) if number != 11
+                        }
                     try:
-                        blank_menu_bytes = build_blank_menu_for_dates(
-                            forecast_matrix_bytes, selected_forecast_dates
+                        forecast_history = load_forecast_history(
+                            history_from,
+                            last_target_date,
+                            tuple(sorted(forecast_points)),
                         )
-                        matrix_menu, matrix_capacity = parse_menu_matrix(blank_menu_bytes)
                     except Exception as error:
-                        st.error(f"Не удалось подготовить пустое меню: {error}")
-                        blank_menu_bytes = b""
-                        matrix_menu = pd.DataFrame()
-                        matrix_capacity = pd.DataFrame()
-
-                    if not matrix_menu.empty:
-                        preview_menu = matrix_menu.merge(
-                            entities[["sku", "category", "entity"]], on="sku", how="left"
-                        )
-                        preview_menu["category"] = preview_menu["category"].fillna(
-                            preview_menu["matrix_category"]
-                        ).map(normalize_matrix_category)
-                        preview_menu["entity"] = preview_menu["entity"].fillna("Не сопоставлено")
-                        preview_menu["Дата меню"] = preview_menu["target_date"].map(
-                            lambda value: value.strftime("%d.%m.%Y") if pd.notna(value) else ""
-                        )
-
-                        st.markdown("#### Меню выбранных дат")
-                        forecast_metrics = st.columns(4)
-                        forecast_metrics[0].metric("Дат", preview_menu["target_date"].nunique())
-                        forecast_metrics[1].metric("Строк меню", len(preview_menu))
-                        forecast_metrics[2].metric("Уникальных SKU", preview_menu["sku"].nunique())
-                        forecast_metrics[3].metric(
-                            "Без сущности",
-                            preview_menu.loc[
-                                preview_menu["entity"].eq("Не сопоставлено"), "sku"
-                            ].nunique(),
-                        )
-                        st.dataframe(
-                            preview_menu[
-                                ["Дата меню", "sku", "product_name", "category", "entity", "price"]
-                            ].rename(
-                                columns={
-                                    "sku": "SKU",
-                                    "product_name": "Название товара",
-                                    "category": "Категория",
-                                    "entity": "Сущность",
-                                    "price": "Цена",
-                                }
-                            ),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-
-                    if blank_menu_bytes:
-                        first_selected = selected_forecast_dates[0]
-                        last_selected = selected_forecast_dates[-1]
-                        blank_filename = (
-                            f"пустое_меню_{first_selected:%Y-%m-%d}.xlsx"
-                            if len(selected_forecast_dates) == 1
-                            else (
-                                f"пустое_меню_{first_selected:%Y-%m-%d}_"
-                                f"{last_selected:%Y-%m-%d}.xlsx"
-                            )
-                        )
-                        st.download_button(
-                            "Скачать пустое меню",
-                            data=blank_menu_bytes,
-                            file_name=blank_filename,
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key="download_blank_forecast_menu_v81",
-                            type="secondary",
-                        )
-                        st.caption(
-                            "Каждая выбранная дата находится на отдельном листе Excel. "
-                            "Дата, SKU, названия, категории и цены сохранены; Т1–Т29 и ПЛАН пустые."
-                        )
-
-                    if not matrix_menu.empty:
-                        history_from_by_date = {
-                            target_date: (
+                        st.error(f"Не удалось загрузить историю продаж: {error}")
+                        forecast_history = pd.DataFrame()
+                    if forecast_history.empty:
+                        st.warning("За исторический период продажи не найдены.")
+                    else:
+                        forecast_parts: list[pd.DataFrame] = []
+                        for (target_date, sheet_name), menu_block in matrix_menu.groupby(
+                            ["target_date", "sheet"], sort=True
+                        ):
+                            block_history_from = (
                                 pd.Timestamp(target_date) - pd.DateOffset(months=2)
                             ).date()
-                            for target_date in selected_forecast_dates
-                        }
-                        earliest_history_from = min(history_from_by_date.values())
-                        latest_target_date = max(selected_forecast_dates)
-                        st.info(
-                            f"Будет рассчитано дат меню: {len(selected_forecast_dates)}. "
-                            "Для каждой даты используется свой двухмесячный период до неё. "
-                            f"Общий диапазон загрузки истории: {earliest_history_from:%d.%m.%Y}–"
-                            f"{(latest_target_date - timedelta(days=1)):%d.%m.%Y}."
-                        )
-                        forecast_button = st.button(
-                            "Рассчитать рекомендуемый план",
-                            type="primary",
-                            key="calculate_forecast_v81",
-                        )
-                        if forecast_button:
-                            forecast_points = {
-                                int(number): label
-                                for number, label in st.session_state.get("point_mapping", {}).items()
-                                if str(label).startswith("Т")
-                                and 1 <= int(str(label)[1:]) <= 29
-                                and int(str(label)[1:]) != 11
-                            }
-                            if not forecast_points:
-                                forecast_points = {
-                                    number: f"Т{number}"
-                                    for number in range(1, 30)
-                                    if number != 11
-                                }
-                            try:
-                                forecast_history_all = load_forecast_history(
-                                    earliest_history_from,
-                                    latest_target_date,
-                                    tuple(sorted(forecast_points)),
+                            block_history = forecast_history[
+                                pd.to_datetime(
+                                    forecast_history["business_date"], errors="coerce"
+                                ).dt.date.between(
+                                    block_history_from,
+                                    target_date - timedelta(days=1),
+                                    inclusive="both",
                                 )
-                            except Exception as error:
-                                st.error(f"Не удалось загрузить историю продаж: {error}")
-                                forecast_history_all = pd.DataFrame()
-
-                            if forecast_history_all.empty:
-                                st.warning("За исторический период продажи не найдены.")
-                            else:
-                                forecast_parts: list[pd.DataFrame] = []
-                                for target_date in selected_forecast_dates:
-                                    date_menu = matrix_menu[
-                                        matrix_menu["target_date"].eq(target_date)
-                                    ].copy()
-                                    if date_menu.empty:
-                                        continue
-                                    date_history_from = history_from_by_date[target_date]
-                                    date_history = forecast_history_all[
-                                        pd.to_datetime(
-                                            forecast_history_all["business_date"], errors="coerce"
-                                        ).dt.date.between(
-                                            date_history_from,
-                                            target_date - timedelta(days=1),
-                                            inclusive="both",
-                                        )
-                                    ].copy()
-                                    if date_history.empty:
-                                        # calculate_sku_daily_forecast умеет использовать базовое
-                                        # среднее 1 шт./день, поэтому передаём пустой каркас с колонками.
-                                        date_history = forecast_history_all.iloc[0:0].copy()
-                                    date_result = calculate_sku_daily_forecast(
-                                        date_menu,
-                                        date_history,
-                                        entities,
-                                        target_date,
-                                        forecast_points,
-                                    )
-                                    if not date_result.empty:
-                                        forecast_parts.append(date_result)
-
-                                forecast_result = (
-                                    pd.concat(forecast_parts, ignore_index=True)
-                                    if forecast_parts
-                                    else pd.DataFrame()
-                                )
-                                if forecast_result.empty:
-                                    st.warning("Не удалось сформировать расчёт для выбранных меню.")
-                                else:
-                                    st.session_state["forecast_result"] = forecast_result
-                                    st.session_state["forecast_menu"] = matrix_menu
-                                    st.session_state["forecast_history_from"] = earliest_history_from
-                                    st.session_state["forecast_target_date"] = latest_target_date
-                                    st.session_state["forecast_target_dates"] = tuple(
-                                        selected_forecast_dates
-                                    )
-                                    st.session_state["forecast_first_target_date"] = min(
-                                        selected_forecast_dates
-                                    )
-                                    st.session_state["forecast_matrix_bytes"] = blank_menu_bytes
+                            ].copy()
+                            block_result = calculate_sku_daily_forecast(
+                                menu_block,
+                                block_history,
+                                entities,
+                                target_date,
+                                forecast_points,
+                            )
+                            if not block_result.empty:
+                                forecast_parts.append(block_result)
+                        forecast_result = (
+                            pd.concat(forecast_parts, ignore_index=True)
+                            if forecast_parts else pd.DataFrame()
+                        )
+                        if forecast_result.empty:
+                            st.warning("Не удалось сформировать расчёт ни для одного блока меню.")
+                            st.stop()
+                        st.session_state["forecast_result"] = forecast_result
+                        st.session_state["forecast_menu"] = matrix_menu
+                        st.session_state["forecast_history_from"] = history_from
+                        st.session_state["forecast_target_date"] = last_target_date
+                        st.session_state["forecast_first_target_date"] = first_target_date
+                        st.session_state["forecast_matrix_bytes"] = matrix_file.getvalue()
 
                 if "forecast_result" in st.session_state:
                     forecast_result = st.session_state["forecast_result"]
@@ -10825,15 +9899,6 @@ if tab_forecast.open:
                         "Пустых ячеек без данных",
                         int(forecast_result["Рекомендованный план"].isna().sum()),
                     )
-
-                    result_dates = sorted(forecast_result["Дата плана"].dropna().unique().tolist())
-                    visible_dates = st.multiselect(
-                        "Показать даты прогноза",
-                        result_dates,
-                        default=result_dates,
-                        format_func=lambda value: value.strftime("%d.%m.%Y"),
-                        key="forecast_result_dates_v81",
-                    )
                     result_point_options = sorted(
                         forecast_result["Точка"].unique(), key=lambda value: int(str(value)[1:])
                     )
@@ -10841,21 +9906,32 @@ if tab_forecast.open:
                         "Показать точки прогноза",
                         result_point_options,
                         default=result_point_options[:1],
-                        key="forecast_result_points_v81",
+                        key="forecast_result_points",
                     )
-                    visible_forecast = forecast_result[
-                        forecast_result["Точка"].isin(result_points)
-                        & forecast_result["Дата плана"].isin(visible_dates)
+                    visible_forecast = forecast_result[forecast_result["Точка"].isin(result_points)]
+                    result_dates = st.multiselect(
+                        "Показать даты меню",
+                        sorted(forecast_result["Дата плана"].unique()),
+                        default=sorted(forecast_result["Дата плана"].unique()),
+                        format_func=lambda value: value.strftime("%d.%m.%Y"),
+                        key="forecast_result_dates_v66",
+                    )
+                    visible_forecast = visible_forecast[
+                        visible_forecast["Дата плана"].isin(result_dates)
                     ]
                     st.dataframe(visible_forecast, use_container_width=True, hide_index=True)
                     hide_average_values = st.checkbox(
                         "Убрать числовые значения СР из выгрузки",
                         value=False,
-                        key="forecast_hide_average_values_export_v81",
+                        key="forecast_hide_average_values_export",
                         help=(
                             "Синяя строка СР, подпись и цикл загрузки останутся. "
                             "Будут очищены только числовые средние по точкам и итог СР в колонке ПЛАН."
                         ),
+                    )
+                    st.caption(
+                        "В скачанном меню столбцы Ф удаляются полностью. "
+                        "Исходный загруженный файл не изменяется."
                     )
                     filled_matrix = fill_forecast_into_matrix(
                         st.session_state["forecast_matrix_bytes"],
@@ -10864,20 +9940,15 @@ if tab_forecast.open:
                         st.session_state["forecast_target_date"],
                         hide_average_values=hide_average_values,
                     )
-                    export_dates = list(st.session_state.get("forecast_target_dates", ()))
-                    export_first = min(export_dates) if export_dates else st.session_state["forecast_target_date"]
-                    export_last = max(export_dates) if export_dates else st.session_state["forecast_target_date"]
-                    forecast_filename = (
-                        f"меню_с_прогнозом_{export_first:%Y-%m-%d}.xlsx"
-                        if export_first == export_last
-                        else f"меню_с_прогнозом_{export_first:%Y-%m-%d}_{export_last:%Y-%m-%d}.xlsx"
-                    )
                     st.download_button(
                         "Скачать меню с заполненными Т1–Т29",
                         data=filled_matrix,
-                        file_name=forecast_filename,
+                        file_name=(
+                            f"матрица_с_прогнозом_"
+                            f"{st.session_state['forecast_first_target_date']:%Y-%m-%d}_"
+                            f"{st.session_state['forecast_target_date']:%Y-%m-%d}.xlsx"
+                        ),
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="download_filled_forecast_menu_v81",
                     )
 
     excel_bytes = export_excel(filtered_sku, filtered_category, filtered_entity, filtered_detail)
