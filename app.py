@@ -447,6 +447,12 @@ def normalize_sku(value: object) -> str | None:
     except (ValueError, TypeError):
         return None
 
+
+# Точечные бизнес-исправления категорий для SKU, которые отсутствуют
+# или неверно классифицированы в текущем справочнике entities.xlsx.
+# Применяются глобально при загрузке справочника, поэтому работают
+# в отчетах, ABC, прогнозе и остальных разделах приложения.
+
 def numeric_series(series: pd.Series) -> pd.Series:
     """Return a plain float64 Series even when source values are object/nullable."""
     return pd.to_numeric(series, errors="coerce").astype("float64")
@@ -477,6 +483,7 @@ def styler_safe_preview(frame: pd.DataFrame, preferred_rows: int | None = None) 
 
 @st.cache_data(show_spinner=False)
 def load_entities(path: str, modified_at: float) -> pd.DataFrame:
+    """Загружает только сущности/атрибуты SKU. Категория НЕ берётся из Excel."""
     raw = pd.read_excel(path, header=None)
     header_row = None
     for index, row in raw.head(20).iterrows():
@@ -489,7 +496,7 @@ def load_entities(path: str, modified_at: float) -> pd.DataFrame:
 
     data = pd.read_excel(path, header=header_row)
     data.columns = [str(column).strip() for column in data.columns]
-    required = ["код", "Название блюда", "Категория", "Атрибут 1", "Атрибут 2", "Атрибут 3"]
+    required = ["код", "Название блюда", "Атрибут 1", "Атрибут 2", "Атрибут 3"]
     missing = [column for column in required if column not in data.columns]
     if missing:
         raise ValueError(f"В справочнике отсутствуют колонки: {', '.join(missing)}")
@@ -500,20 +507,94 @@ def load_entities(path: str, modified_at: float) -> pd.DataFrame:
     result = result.rename(
         columns={
             "Название блюда": "entity_product_name",
-            "Категория": "category",
             "Атрибут 1": "attribute_1",
             "Атрибут 2": "attribute_2",
             "Атрибут 3": "attribute_3",
         }
     )
-    attributes = result[["attribute_1", "attribute_2", "attribute_3"]].fillna("").astype(str)
-    result["entity"] = attributes.apply(
+    attrs = result[["attribute_1", "attribute_2", "attribute_3"]].fillna("").astype(str)
+    result["entity"] = attrs.apply(
         lambda row: " • ".join(value.strip() for value in row if value.strip()) or "Не задана",
         axis=1,
     )
-    return result[
-        ["sku", "entity_product_name", "category", "attribute_1", "attribute_2", "attribute_3", "entity"]
-    ]
+    return result[["sku", "entity_product_name", "attribute_1", "attribute_2", "attribute_3", "entity"]]
+
+
+SQL_CATEGORY_COLUMN_CANDIDATES = (
+    "category", "category_name", "product_category", "product_category_name",
+    "item_category", "item_category_name", "goods_category", "goods_category_name",
+    "erp_category", "erp_category_name", "product_group", "product_group_name",
+    "nomenclature_group", "nomenclature_group_name", "assortment_group",
+    "assortment_group_name", "product_type", "product_type_name",
+    "department", "department_name", "section", "section_name",
+)
+
+
+def _quote_sql_identifier(identifier: str) -> str:
+    return '"' + str(identifier).replace('"', '""') + '"'
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def resolve_sales_category_column() -> str:
+    """Определяет SQL-поле категории. Excel fallback принципиально не используется."""
+    with psycopg.connect(**connection_settings()) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'dwh' AND table_name = 'v_sales_item'
+                ORDER BY ordinal_position
+                """
+            )
+            columns = [str(row[0]) for row in cursor.fetchall()]
+            if not columns:
+                raise RuntimeError("Не удалось прочитать структуру dwh.v_sales_item.")
+            lower_map = {column.casefold(): column for column in columns}
+            configured = str(os.getenv("PGCATEGORYCOLUMN", "")).strip()
+            if configured:
+                configured_actual = lower_map.get(configured.casefold())
+                if not configured_actual:
+                    raise RuntimeError(
+                        f"PGCATEGORYCOLUMN={configured!r} не найден в dwh.v_sales_item."
+                    )
+                return configured_actual
+            candidates = [lower_map[c.casefold()] for c in SQL_CATEGORY_COLUMN_CANDIDATES if c.casefold() in lower_map]
+            if not candidates:
+                for column in columns:
+                    low = column.casefold()
+                    if (
+                        "categor" in low or "катег" in low
+                        or ("group" in low and any(token in low for token in ("product", "item", "goods", "erp", "nomenclature", "assort")))
+                        or ("type" in low and any(token in low for token in ("product", "item", "goods")))
+                    ):
+                        candidates.append(column)
+            if not candidates:
+                raise RuntimeError(
+                    "В dwh.v_sales_item не найдено поле категории. Категория из entities.xlsx отключена; "
+                    "нужно указать имя SQL-колонки категории."
+                )
+
+            canonical = {"Завтраки", "Салаты", "Вторые блюда", "Супы", "Сэндвичи", "Десерты", "Напитки", "Япония", "Хлеб"}
+            best_column, best_score = candidates[0], -1
+            for candidate in candidates:
+                try:
+                    ident = _quote_sql_identifier(candidate)
+                    cursor.execute(
+                        f"SELECT DISTINCT {ident}::text FROM dwh.v_sales_item WHERE {ident} IS NOT NULL LIMIT 250"
+                    )
+                    values = [row[0] for row in cursor.fetchall()]
+                    score = sum(1 for value in values if normalize_matrix_category(value) in canonical)
+                except Exception:
+                    score = -1
+                if score > best_score:
+                    best_column, best_score = candidate, score
+            return best_column
+
+
+def _sales_category_sql_expression() -> str:
+    column = resolve_sales_category_column()
+    return f"NULLIF(BTRIM({_quote_sql_identifier(column)}::text), '')"
 
 
 def connection_settings() -> dict[str, object]:
@@ -534,7 +615,8 @@ def connection_settings() -> dict[str, object]:
 
 @st.cache_data(ttl=900, show_spinner="Загружаю продажи из PostgreSQL…")
 def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]) -> pd.DataFrame:
-    query = """
+    category_expr = _sales_category_sql_expression()
+    query = f"""
         SELECT
             business_date,
             sale_datetime,
@@ -547,6 +629,7 @@ def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]
                 'БЕЗ_SKU'
             ) AS sku,
             MAX(product_name) AS product_name,
+            MAX({category_expr}) AS category,
             SUM(net_quantity)::numeric AS sold_quantity,
             SUM(net_line_amount)::numeric AS revenue
         FROM dwh.v_sales_item
@@ -561,27 +644,19 @@ def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]
                      NULLIF(TRIM(product_hash), ''),
                      'БЕЗ_SKU'
                  )
-        ORDER BY business_date, sale_datetime, shop_number,
-                 COALESCE(
-                     NULLIF(TRIM(erp_code), ''),
-                     NULLIF(TRIM(product_code), ''),
-                     NULLIF(TRIM(barcode), ''),
-                     NULLIF(TRIM(product_hash), ''),
-                     'БЕЗ_SKU'
-                 )
+        ORDER BY business_date, sale_datetime, shop_number, sku
     """
     with psycopg.connect(**connection_settings()) as connection:
         with connection.cursor() as cursor:
-            cursor.execute(
-                query,
-                {"date_from": date_from, "date_to": date_to_exclusive, "points": list(points)},
-            )
+            cursor.execute(query, {"date_from": date_from, "date_to": date_to_exclusive, "points": list(points)})
             records = cursor.fetchall()
             columns = [description.name for description in cursor.description]
     frame = pd.DataFrame(records, columns=columns)
     if frame.empty:
         return frame
     frame["sku"] = frame["sku"].map(normalize_sku)
+    frame["product_name"] = frame["product_name"].fillna("").astype(str).str.strip()
+    frame["category"] = frame["category"].fillna("").map(normalize_matrix_category).replace("", "Не сопоставлено")
     frame["sold_quantity"] = pd.to_numeric(frame["sold_quantity"], errors="coerce").fillna(0.0)
     frame["revenue"] = pd.to_numeric(frame["revenue"], errors="coerce").fillna(0.0)
     return frame
@@ -643,7 +718,8 @@ def ensure_required_shops(frame: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=900, show_spinner="Загружаю историю для прогноза…")
 def load_forecast_history(date_from: date, date_to_exclusive: date, points: tuple[int, ...]) -> pd.DataFrame:
-    query = """
+    category_expr = _sales_category_sql_expression()
+    query = f"""
         SELECT
             business_date,
             sale_datetime,
@@ -656,6 +732,7 @@ def load_forecast_history(date_from: date, date_to_exclusive: date, points: tupl
                 'БЕЗ_SKU'
             ) AS sku,
             MAX(product_name) AS product_name,
+            MAX({category_expr}) AS category,
             SUM(net_quantity)::numeric AS sold_quantity,
             SUM(net_line_amount)::numeric AS revenue
         FROM dwh.v_sales_item
@@ -673,16 +750,15 @@ def load_forecast_history(date_from: date, date_to_exclusive: date, points: tupl
     """
     with psycopg.connect(**connection_settings()) as connection:
         with connection.cursor() as cursor:
-            cursor.execute(
-                query,
-                {"date_from": date_from, "date_to": date_to_exclusive, "points": list(points)},
-            )
+            cursor.execute(query, {"date_from": date_from, "date_to": date_to_exclusive, "points": list(points)})
             records = cursor.fetchall()
             columns = [description.name for description in cursor.description]
     result = pd.DataFrame(records, columns=columns)
     if result.empty:
         return result
     result["sku"] = result["sku"].map(normalize_sku)
+    result["product_name"] = result["product_name"].fillna("").astype(str).str.strip()
+    result["category"] = result["category"].fillna("").map(normalize_matrix_category).replace("", "Не сопоставлено")
     result["business_date"] = pd.to_datetime(result["business_date"]).dt.date
     result["sale_datetime"] = pd.to_datetime(result["sale_datetime"], errors="coerce")
     result["sold_quantity"] = pd.to_numeric(result["sold_quantity"], errors="coerce").fillna(0.0)
@@ -1661,17 +1737,17 @@ def calculate_learned_forecast(
     point_mapping: dict[int, str],
     analyst_plans: pd.DataFrame,
 ) -> pd.DataFrame:
-    menu_enriched = menu.merge(entities[["sku", "category", "entity"]], on="sku", how="left")
-    menu_enriched["category"] = menu_enriched["category"].fillna(menu_enriched["matrix_category"])
+    menu_enriched = menu.merge(entities[["sku", "entity"]], on="sku", how="left")
+    menu_enriched["category"] = menu_enriched["matrix_category"].map(normalize_matrix_category)
     menu_enriched["entity"] = menu_enriched["entity"].fillna("Не сопоставлено")
 
-    history_enriched = history.merge(entities[["sku", "category", "entity"]], on="sku", how="left")
-    history_enriched = history_enriched[history_enriched["category"].notna()].copy()
+    history_enriched = history.merge(entities[["sku", "entity"]], on="sku", how="left")
+    history_enriched["category"] = history_enriched["category"].fillna("Не сопоставлено").map(normalize_matrix_category)
     history_enriched["sold_quantity"] = history_enriched["sold_quantity"].clip(lower=0)
     history_enriched["business_date"] = pd.to_datetime(history_enriched["business_date"]).dt.date
 
-    plans = analyst_plans.merge(entities[["sku", "category", "entity"]], on="sku", how="left")
-    plans["category"] = plans["category"].fillna(plans["matrix_category"])
+    plans = analyst_plans.merge(entities[["sku", "entity"]], on="sku", how="left")
+    plans["category"] = plans["matrix_category"].map(normalize_matrix_category)
     plans_prior = plans[plans["plan_date"] < target_date].copy()
     plans_target = plans[plans["plan_date"] == target_date].copy()
 
@@ -1960,11 +2036,9 @@ def calculate_sku_daily_forecast(
 ) -> pd.DataFrame:
     """Прогнозирует каждую ячейку Т по среднему SKU за фактический день продажи."""
     menu_enriched = menu.merge(
-        entities[["sku", "category", "entity"]], on="sku", how="left"
+        entities[["sku", "entity"]], on="sku", how="left"
     )
-    menu_enriched["category"] = menu_enriched["category"].fillna(
-        menu_enriched["matrix_category"]
-    ).map(normalize_matrix_category)
+    menu_enriched["category"] = menu_enriched["matrix_category"].map(normalize_matrix_category)
     menu_enriched["entity"] = menu_enriched["entity"].fillna("Не сопоставлено")
 
     sold = history.copy()
@@ -2088,17 +2162,16 @@ def calculate_entity_forecast(
     capacity: pd.DataFrame,
 ) -> pd.DataFrame:
     menu_enriched = menu.merge(
-        entities[["sku", "category", "entity"]], on="sku", how="left"
+        entities[["sku", "entity"]], on="sku", how="left"
     )
-    menu_enriched["category"] = menu_enriched["category"].fillna(menu_enriched["matrix_category"])
+    menu_enriched["category"] = menu_enriched["matrix_category"].map(normalize_matrix_category)
     menu_enriched["entity"] = menu_enriched["entity"].fillna("Не сопоставлено")
 
     history_enriched = history.merge(
-        entities[["sku", "category", "entity"]], on="sku", how="left"
+        entities[["sku", "entity"]], on="sku", how="left"
     )
-    history_enriched = history_enriched[
-        history_enriched["category"].notna() & history_enriched["entity"].notna()
-    ].copy()
+    history_enriched["category"] = history_enriched["category"].fillna("Не сопоставлено").map(normalize_matrix_category)
+    history_enriched = history_enriched[history_enriched["entity"].notna()].copy()
     history_enriched = history_enriched[
         pd.to_datetime(history_enriched["business_date"]).dt.weekday == target_date.weekday()
     ].copy()
@@ -2762,9 +2835,8 @@ def build_sales_time_menu(
     """Сопоставляет партию из плана с продажами по дням её срока годности."""
     if plan_rows.empty:
         return pd.DataFrame()
-    menu = plan_rows.merge(entities[["sku", "category", "entity"]], on="sku", how="left")
-    menu["category"] = menu["category"].fillna(menu["matrix_category"])
-    menu["category"] = menu["category"].map(normalize_matrix_category)
+    menu = plan_rows.merge(entities[["sku", "entity"]], on="sku", how="left")
+    menu["category"] = menu["matrix_category"].map(normalize_matrix_category)
     menu["entity"] = menu["entity"].fillna("Не сопоставлено")
     menu["analyst_plan"] = pd.to_numeric(menu["analyst_plan"], errors="coerce").fillna(0).clip(lower=0)
 
@@ -2829,11 +2901,9 @@ def build_sales_time_period(
     if allocation_plan_rows.empty:
         return pd.DataFrame()
     batches = allocation_plan_rows.merge(
-        entities[["sku", "category", "entity"]], on="sku", how="left"
+        entities[["sku", "entity"]], on="sku", how="left"
     )
-    batches["category"] = batches["category"].fillna(batches["matrix_category"]).map(
-        normalize_matrix_category
-    )
+    batches["category"] = batches["matrix_category"].map(normalize_matrix_category)
     batches["entity"] = batches["entity"].fillna("Не сопоставлено")
     batches["analyst_plan"] = pd.to_numeric(
         batches["analyst_plan"], errors="coerce"
@@ -3354,10 +3424,9 @@ def calculate_product_abc(sales: pd.DataFrame, entities: pd.DataFrame) -> pd.Dat
         source["sold_quantity"], errors="coerce"
     ).fillna(0.0)
     source["revenue"] = pd.to_numeric(source["revenue"], errors="coerce").fillna(0.0)
-    source = source.merge(
-        entities[["sku", "category"]], on="sku", how="left", validate="many_to_one"
-    )
-    source["category"] = source["category"].fillna("Не сопоставлено")
+    if "category" not in source.columns:
+        source["category"] = "Не сопоставлено"
+    source["category"] = source["category"].fillna("Не сопоставлено").map(normalize_matrix_category)
     summary = (
         source.groupby(["category", "sku"], as_index=False, dropna=False)
         .agg(
@@ -4086,8 +4155,9 @@ def prepare_analysis(
     sales = sales.copy()
     sales["point"] = sales["shop_number"].astype(int).map(point_mapping)
     sales = sales[sales["point"].notna()].copy()
-    merged = sales.merge(entities, on="sku", how="left", validate="many_to_one")
-    merged["category"] = merged["category"].fillna("Не сопоставлено")
+    entity_columns = [column for column in ["sku", "entity", "attribute_1", "attribute_2", "attribute_3"] if column in entities.columns]
+    merged = sales.merge(entities[entity_columns], on="sku", how="left", validate="many_to_one")
+    merged["category"] = merged["category"].fillna("Не сопоставлено").map(normalize_matrix_category)
     merged["entity"] = merged["entity"].fillna("Не сопоставлено")
 
     daily_detail = (
@@ -4261,13 +4331,14 @@ def prepare_report_sales_frame(
 
     report = sales[[
         column for column in [
-            "business_date", "shop_number", "sku", "product_name", "sold_quantity"
+            "business_date", "shop_number", "sku", "product_name", "category", "sold_quantity"
         ]
         if column in sales.columns
     ]].copy()
     if "product_name" not in report.columns:
         report["product_name"] = ""
-    report = report.rename(columns={"product_name": "source_product_name"})
+    if "category" not in report.columns:
+        report["category"] = "Не сопоставлено"
     report["business_date"] = pd.to_datetime(report["business_date"], errors="coerce").dt.date
     report["shop_number"] = pd.to_numeric(report["shop_number"], errors="coerce").astype("Int64")
     report = report[report["business_date"].notna() & report["shop_number"].notna()].copy()
@@ -4277,26 +4348,14 @@ def prepare_report_sales_frame(
     report["point"] = report["shop_number"].map(lambda value: f"Т{int(value)}")
     report["sku"] = report["sku"].map(normalize_sku)
 
-    entity_columns = [
-        column for column in ["sku", "category", "entity", "entity_product_name"]
-        if column in entities.columns
-    ]
+    entity_columns = [column for column in ["sku", "entity"] if column in entities.columns]
     entity_map = entities[entity_columns].copy()
     entity_map["sku"] = entity_map["sku"].map(normalize_sku)
     entity_map = entity_map.drop_duplicates("sku")
     report = report.merge(entity_map, on="sku", how="left", validate="many_to_one")
-    report["category"] = report["category"].fillna("Не сопоставлено")
+    report["category"] = report["category"].fillna("Не сопоставлено").map(normalize_matrix_category)
     report["entity"] = report["entity"].fillna("Не сопоставлено")
-
-    canonical_name = (
-        report["entity_product_name"]
-        if "entity_product_name" in report.columns
-        else pd.Series("", index=report.index, dtype=object)
-    )
-    source_name = report["source_product_name"].fillna("").astype(str).str.strip()
-    canonical_name = canonical_name.fillna("").astype(str).str.strip()
-    report["product_name"] = canonical_name.where(canonical_name.ne(""), source_name)
-    report["product_name"] = report["product_name"].replace("", "Без названия")
+    report["product_name"] = report["product_name"].fillna("").astype(str).str.strip().replace("", "Без названия")
     report["sku"] = report["sku"].fillna("БЕЗ_SKU")
     report["sales"] = pd.to_numeric(report["sold_quantity"], errors="coerce").fillna(0.0)
 
@@ -4869,7 +4928,7 @@ def build_period_comparison_html(
 
 
 st.title("Анализ структуры спроса")
-st.caption("Версия 75.8.0 · Глобальное автообновление данных")
+st.caption("Версия 75.8.1 · Категории и выгрузка из PostgreSQL")
 
 if not ENTITY_FILE.exists():
     st.error(f"Не найден справочник: {ENTITY_FILE.name}")
@@ -5148,6 +5207,10 @@ if "analysis" not in st.session_state:
 if st.session_state.get("_analysis_updated_at_v760"):
     updated_at = st.session_state["_analysis_updated_at_v760"]
     st.caption(f"Данные анализа обновлены: {updated_at:%d.%m.%Y %H:%M:%S}")
+try:
+    st.caption(f"Категория продаж: PostgreSQL · dwh.v_sales_item.{resolve_sales_category_column()}")
+except Exception:
+    pass
 
 sku_point, category_profile, entity_profile, daily_detail = st.session_state["analysis"]
 period = st.session_state["period"]
@@ -7878,7 +7941,7 @@ if tab_category_analysis.open:
         with category_analysis_controls[0]:
             selected_analysis_category = st.selectbox(
                 "Категория",
-                sorted(entities["category"].dropna().astype(str).unique()),
+                sorted(category_profile["category"].dropna().astype(str).unique()),
                 key="category_analysis_category_v37",
             )
         with category_analysis_controls[1]:
@@ -7989,12 +8052,9 @@ if tab_category_analysis.open:
                     .astype("Int64")
                     .map({shop: point for point, shop in category_point_to_shop.items()})
                 )
-                category_sales_history = category_sales_history.merge(
-                    entities[["sku", "category"]], on="sku", how="left", validate="many_to_one"
-                )
                 category_sales_history["category"] = category_sales_history["category"].fillna(
                     "Не сопоставлено"
-                )
+                ).map(normalize_matrix_category)
                 category_lifecycle_history = category_sales_history[
                     category_sales_history["category"] == selected_analysis_category
                 ].copy()
@@ -8942,11 +9002,9 @@ if tab_sales_time.open:
                 # Верхний блок — фактический вид общего меню за реальные даты
                 # плана. При смене точки меняются только количества.
                 period_menu = selected_plan_rows.merge(
-                    entities[["sku", "category", "entity"]], on="sku", how="left"
+                    entities[["sku", "entity"]], on="sku", how="left"
                 )
-                period_menu["category"] = period_menu["category"].fillna(
-                    period_menu["matrix_category"]
-                ).map(normalize_matrix_category)
+                period_menu["category"] = period_menu["matrix_category"].map(normalize_matrix_category)
                 period_menu["entity"] = period_menu["entity"].fillna("Не сопоставлено")
                 menu_pivot = period_menu.pivot_table(
                     index=["category", "entity", "sku", "product_name"],
@@ -10401,11 +10459,9 @@ if tab_forecast.open:
 
                     if not matrix_menu.empty:
                         preview_menu = matrix_menu.merge(
-                            entities[["sku", "category", "entity"]], on="sku", how="left"
+                            entities[["sku", "entity"]], on="sku", how="left"
                         )
-                        preview_menu["category"] = preview_menu["category"].fillna(
-                            preview_menu["matrix_category"]
-                        ).map(normalize_matrix_category)
+                        preview_menu["category"] = preview_menu["matrix_category"].map(normalize_matrix_category)
                         preview_menu["entity"] = preview_menu["entity"].fillna("Не сопоставлено")
                         preview_menu["Дата меню"] = preview_menu["target_date"].map(
                             lambda value: value.strftime("%d.%m.%Y") if pd.notna(value) else ""
