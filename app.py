@@ -4090,17 +4090,44 @@ def build_report_tables(
 
     matrix_1 = matrix(frame_1)
     matrix_2 = matrix(frame_2)
-    matrix_delta = matrix_2.copy()
+    matrix_delta = pd.DataFrame()
     if not matrix_1.empty or not matrix_2.empty:
         key_cols = ["Категория", "Сущность"]
-        matrix_delta = matrix_1.merge(matrix_2, on=key_cols, how="outer", suffixes=("__1", "__2")).fillna(0.0)
+        matrix_delta = matrix_1.merge(
+            matrix_2,
+            on=key_cols,
+            how="outer",
+            suffixes=("__1", "__2"),
+        ).fillna(0.0)
+
+        # В представлении «Изменение» для каждой точки показываем
+        # количественную разницу и рядом процентное изменение.
         result_columns = key_cols.copy()
-        for point in [*points, "ВСЕГО"]:
-            matrix_delta[point] = matrix_delta.get(f"{point}__2", 0.0) - matrix_delta.get(f"{point}__1", 0.0)
-            result_columns.append(point)
+        for point in points:
+            p1 = pd.to_numeric(matrix_delta.get(f"{point}__1", 0.0), errors="coerce").fillna(0.0)
+            p2 = pd.to_numeric(matrix_delta.get(f"{point}__2", 0.0), errors="coerce").fillna(0.0)
+            delta = p2 - p1
+            pct = delta.div(p1.replace(0, pd.NA)) * 100
+            pct = pct.mask(p1.eq(0), pd.NA)
+            qty_col = f"{point} Δ, шт."
+            pct_col = f"{point} Δ, %"
+            matrix_delta[qty_col] = delta
+            matrix_delta[pct_col] = pct
+            result_columns.extend([qty_col, pct_col])
+
+        total_p1 = pd.to_numeric(matrix_delta.get("ВСЕГО__1", 0.0), errors="coerce").fillna(0.0)
+        total_p2 = pd.to_numeric(matrix_delta.get("ВСЕГО__2", 0.0), errors="coerce").fillna(0.0)
+        total_delta = total_p2 - total_p1
+        matrix_delta["ВСЕГО Δ, шт."] = total_delta
+        matrix_delta["ВСЕГО Δ, %"] = total_delta.div(total_p1.replace(0, pd.NA)) * 100
+        matrix_delta.loc[total_p1.eq(0), "ВСЕГО Δ, %"] = pd.NA
+        result_columns.extend(["ВСЕГО Δ, шт.", "ВСЕГО Δ, %"])
+
         matrix_delta = matrix_delta[result_columns]
         matrix_delta["_is_total"] = matrix_delta["Категория"].eq("ВСЕГО")
-        matrix_delta = matrix_delta.sort_values(["_is_total", "Категория", "Сущность"], kind="stable").drop(columns="_is_total")
+        matrix_delta = matrix_delta.sort_values(
+            ["_is_total", "Категория", "Сущность"], kind="stable"
+        ).drop(columns="_is_total")
 
     return {
         "category_summary": category_summary.sort_values("Период 2, шт.", ascending=False, kind="stable"),
@@ -4273,6 +4300,23 @@ def build_period_comparison_excel(
                         if isinstance(value, (int, float)):
                             sheet.cell(row, delta_col).fill = positive_fill if value >= 0 else negative_fill
 
+        matrix_delta_sheet = workbook["Изменение матрицы"]
+        matrix_delta_headers = {str(cell.value): cell.column for cell in matrix_delta_sheet[1]}
+        for header, col in matrix_delta_headers.items():
+            if header.endswith("Δ, %"):
+                for row in range(2, matrix_delta_sheet.max_row + 1):
+                    matrix_delta_sheet.cell(row, col).number_format = '0.0"%"'
+            elif header.endswith("Δ, шт."):
+                for row in range(2, matrix_delta_sheet.max_row + 1):
+                    matrix_delta_sheet.cell(row, col).number_format = '+#,##0;-#,##0;0'
+                    value = matrix_delta_sheet.cell(row, col).value
+                    if isinstance(value, (int, float)):
+                        matrix_delta_sheet.cell(row, col).fill = positive_fill if value >= 0 else negative_fill
+        if matrix_delta_sheet.max_row > 1:
+            for cell in matrix_delta_sheet[matrix_delta_sheet.max_row]:
+                cell.fill = total_fill
+                cell.font = Font(bold=True)
+
         charts_sheet = workbook.create_sheet("Графики")
         charts_sheet.sheet_view.showGridLines = False
         charts_sheet["A1"] = "Сравнение продаж по категориям"
@@ -4358,7 +4402,7 @@ def build_period_comparison_html(
 
 
 st.title("Анализ структуры спроса")
-st.caption("Версия 75.7.3 · Оптимизация памяти Streamlit Cloud")
+st.caption("Версия 75.7.4 · Отчет: изменение по точкам в шт. и %")
 
 if not ENTITY_FILE.exists():
     st.error(f"Не найден справочник: {ENTITY_FILE.name}")
@@ -4926,6 +4970,30 @@ with tab_report:
         report_metrics[4].metric("СР/день П1", f"{avg_1:,.1f}".replace(",", " "))
         report_metrics[5].metric("СР/день П2", f"{avg_2:,.1f}".replace(",", " "))
 
+        st.markdown("#### Сравнение по категории")
+        category_compare_options = report_tables["category_summary"]["Категория"].dropna().astype(str).tolist()
+        if category_compare_options:
+            compare_category = st.selectbox(
+                "Категория для быстрой сверки",
+                category_compare_options,
+                key="report_category_compare_v7574",
+            )
+            compare_row = report_tables["category_summary"][
+                report_tables["category_summary"]["Категория"].astype(str).eq(compare_category)
+            ].iloc[0]
+            category_cards = st.columns(4)
+            cat_p1 = float(pd.to_numeric(compare_row.get("Период 1, шт."), errors="coerce") or 0.0)
+            cat_p2 = float(pd.to_numeric(compare_row.get("Период 2, шт."), errors="coerce") or 0.0)
+            cat_delta = float(pd.to_numeric(compare_row.get("Изменение, шт."), errors="coerce") or 0.0)
+            cat_pct_raw = pd.to_numeric(compare_row.get("Изменение, %"), errors="coerce")
+            cat_pct = float(cat_pct_raw) if pd.notna(cat_pct_raw) else None
+            category_cards[0].metric("Период 1, шт.", f"{cat_p1:,.0f}".replace(",", " "))
+            category_cards[1].metric("Период 2, шт.", f"{cat_p2:,.0f}".replace(",", " "))
+            category_cards[2].metric("Разница, шт.", f"{cat_delta:+,.0f}".replace(",", " "))
+            category_cards[3].metric("Разница, %", f"{cat_pct:+.1f}%" if cat_pct is not None else "—")
+        else:
+            st.info("Для выбранных фильтров нет категорий для сравнения.")
+
         st.markdown("#### Сверка по категориям и сущностям")
         report_category_entity_display = _append_report_total_row(report_tables["category_entity"])
         st.dataframe(
@@ -4970,12 +5038,30 @@ with tab_report:
             "Изменение": "matrix_delta",
         }[matrix_choice]
         report_matrix_display = report_tables[matrix_key].copy()
-        st.caption("Последний столбец «ВСЕГО» — итог по всем выбранным точкам.")
+        if matrix_choice == "Изменение":
+            st.caption(
+                "По каждой точке: сначала разница в штуках, затем изменение в %. "
+                "В конце — «ВСЕГО Δ, шт.» и «ВСЕГО Δ, %» по всем выбранным точкам."
+            )
+            matrix_column_config = {}
+            for column in report_matrix_display.columns:
+                if column.endswith("Δ, шт."):
+                    matrix_column_config[column] = st.column_config.NumberColumn(format="%+.0f")
+                elif column.endswith("Δ, %"):
+                    matrix_column_config[column] = st.column_config.NumberColumn(format="%+.1f%%")
+        else:
+            st.caption("Последний столбец «ВСЕГО» — итог количества продаж по всем выбранным точкам.")
+            matrix_column_config = {
+                column: st.column_config.NumberColumn(format="%.0f")
+                for column in report_matrix_display.columns
+                if column not in {"Категория", "Сущность"}
+            }
         st.dataframe(
             report_matrix_display,
             use_container_width=True,
             hide_index=True,
             height=min(700, 38 * len(report_matrix_display) + 80),
+            column_config=matrix_column_config,
         )
 
         st.markdown("#### Графически: рост и снижение по категориям")
