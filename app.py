@@ -4318,8 +4318,9 @@ def build_report_category_sku_daily_detail(
     frame: pd.DataFrame,
     category: str,
 ) -> pd.DataFrame:
-    """Проданные SKU выбранной категории по отдельным датам периода."""
-    columns = ["Дата", "День недели", "SKU", "Название блюда", "Продано, шт."]
+    """Проданные SKU выбранной категории: строки SKU, колонки дней недели."""
+    weekday_columns = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    columns = ["SKU", "Название блюда", *weekday_columns, "ВСЕГО"]
     if frame.empty:
         return pd.DataFrame(columns=columns)
 
@@ -4332,39 +4333,44 @@ def build_report_category_sku_daily_detail(
     if category_frame.empty:
         return pd.DataFrame(columns=columns)
 
-    detail = (
+    category_frame["День недели"] = category_frame["business_date"].map(
+        lambda value: REPORT_WEEKDAYS_RU.get(value.weekday(), "") if pd.notna(value) else ""
+    )
+    category_frame = category_frame[category_frame["День недели"].isin(weekday_columns)].copy()
+    if category_frame.empty:
+        return pd.DataFrame(columns=columns)
+
+    grouped = (
         category_frame.groupby(
-            ["business_date", "sku", "product_name"],
+            ["sku", "product_name", "День недели"],
             as_index=False,
             dropna=False,
         )["sales"].sum()
     )
-    detail["_date_sort"] = pd.to_datetime(detail["business_date"], errors="coerce")
-    detail["День недели"] = detail["business_date"].map(
-        lambda value: REPORT_WEEKDAYS_RU.get(value.weekday(), "") if pd.notna(value) else ""
-    )
-    detail["Дата"] = detail["business_date"].map(
-        lambda value: value.strftime("%d.%m.%Y") if pd.notna(value) else ""
-    )
-    detail = detail.rename(
-        columns={
-            "sku": "SKU",
-            "product_name": "Название блюда",
-            "sales": "Продано, шт.",
-        }
-    )
-    detail = detail.sort_values(
-        ["_date_sort", "Продано, шт.", "SKU"],
-        ascending=[True, False, True],
+    detail = grouped.pivot_table(
+        index=["sku", "product_name"],
+        columns="День недели",
+        values="sales",
+        aggfunc="sum",
+        fill_value=0.0,
+    ).reset_index()
+
+    for weekday in weekday_columns:
+        if weekday not in detail.columns:
+            detail[weekday] = 0.0
+    detail["ВСЕГО"] = detail[weekday_columns].sum(axis=1)
+    detail = detail.rename(columns={"sku": "SKU", "product_name": "Название блюда"})
+    detail = detail[columns].sort_values(
+        ["ВСЕГО", "SKU"],
+        ascending=[False, True],
         kind="stable",
-    )
-    detail = detail[columns].reset_index(drop=True)
+    ).reset_index(drop=True)
 
     total_row = {column: "" for column in columns}
-    total_row["Дата"] = "ВСЕГО"
-    total_row["Продано, шт."] = float(
-        pd.to_numeric(detail["Продано, шт."], errors="coerce").fillna(0.0).sum()
-    )
+    total_row["SKU"] = "ВСЕГО"
+    for weekday in weekday_columns:
+        total_row[weekday] = float(pd.to_numeric(detail[weekday], errors="coerce").fillna(0.0).sum())
+    total_row["ВСЕГО"] = float(pd.to_numeric(detail["ВСЕГО"], errors="coerce").fillna(0.0).sum())
     return pd.concat([detail, pd.DataFrame([total_row])], ignore_index=True)
 
 
@@ -5582,8 +5588,8 @@ if tab_report.open:
 
                 st.markdown("##### Раскрыть категорию → продажи SKU по дням")
                 st.caption(
-                    "Откройте нужную категорию. Внутри показаны только проданные SKU, "
-                    "каждая фактическая дата периода остаётся отдельной."
+                    "Откройте нужную категорию. Строка = SKU товара, колонки = дни недели. "
+                    "Продажи всех одинаковых дней недели внутри выбранного периода суммируются."
                 )
                 category_rows_for_drilldown = category_compare_table[
                     category_compare_table["Категория"].astype(str).ne("ВСЕГО")
@@ -5615,7 +5621,8 @@ if tab_report.open:
                                     hide_index=True,
                                     height=min(620, 35 * len(drill_detail_1) + 80),
                                     column_config={
-                                        "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                        **{day: st.column_config.NumberColumn(format="%.0f") for day in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]},
+                                        "ВСЕГО": st.column_config.NumberColumn(format="%.0f"),
                                     },
                                 )
                         with sku_period_2_tab:
@@ -5634,7 +5641,8 @@ if tab_report.open:
                                     hide_index=True,
                                     height=min(620, 35 * len(drill_detail_2) + 80),
                                     column_config={
-                                        "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                        **{day: st.column_config.NumberColumn(format="%.0f") for day in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]},
+                                        "ВСЕГО": st.column_config.NumberColumn(format="%.0f"),
                                     },
                                 )
             else:
