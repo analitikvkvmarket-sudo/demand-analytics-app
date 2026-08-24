@@ -771,73 +771,173 @@ def parse_excel_date(value: object) -> date | None:
 
 @st.cache_data(show_spinner="Читаю матрицу меню…")
 def parse_menu_matrix(file_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Читает меню из XLSX и устойчиво пропускает пустые/служебные листы.
+
+    Поддерживаются рабочие файлы, где строка с датой находится не обязательно
+    в первом столбце, а строка заголовков может идти через несколько строк после неё.
+    """
     source = io.BytesIO(file_bytes)
     excel = pd.ExcelFile(source)
     blocks: list[pd.DataFrame] = []
+
+    def row_values(frame: pd.DataFrame, row_index: int) -> list[object]:
+        if row_index < 0 or row_index >= len(frame):
+            return []
+        return frame.iloc[row_index].tolist()
+
+    def normalized_text(value: object) -> str:
+        return str(value or "").strip().replace("T", "Т").replace("t", "т")
+
+    def header_info(values: list[object]) -> tuple[int | None, int | None, int | None, int | None, bool]:
+        header = [normalized_text(value) if pd.notna(value) else "" for value in values]
+        code_col = next(
+            (
+                i for i, value in enumerate(header)
+                if value.casefold().replace(" ", "") in {"код", "код№", "sku", "ску"}
+            ),
+            None,
+        )
+        name_col = next(
+            (
+                i for i, value in enumerate(header)
+                if "название блюда" in value.casefold()
+                or "название товара" in value.casefold()
+                or "наименование" == value.casefold()
+            ),
+            None,
+        )
+        category_col = next(
+            (i for i, value in enumerate(header) if "категор" in value.casefold()),
+            None,
+        )
+        price_col = next(
+            (i for i, value in enumerate(header) if value.casefold() == "цена"),
+            None,
+        )
+        has_point_columns = any(
+            re.fullmatch(r"Т\s*0*1", value.upper().replace(" ", ""))
+            for value in header if value
+        )
+        return code_col, name_col, category_col, price_col, has_point_columns
+
     # В рабочих файлах меню блоки могут находиться как на листах «План ...»,
     # так и на обычном «Лист1». На одном листе может быть несколько дат.
     for sheet_name in excel.sheet_names:
-        raw = pd.read_excel(excel, sheet_name=sheet_name, header=None)
-        date_rows = [
-            index
-            for index, value in raw.iloc[:, 0].items()
-            if str(value or "").strip().lower().startswith("дата")
-        ]
+        try:
+            raw = pd.read_excel(excel, sheet_name=sheet_name, header=None)
+        except Exception:
+            # Один повреждённый/служебный лист не должен ломать весь файл.
+            continue
+
+        # Ключевой фикс: пустой Excel-лист может иметь 0 столбцов.
+        if raw is None or raw.empty or raw.shape[1] == 0:
+            continue
+
+        # Ищем строку даты по ВСЕЙ строке, а не только по первому столбцу.
+        date_rows: list[int] = []
+        for row_index in range(len(raw)):
+            values = row_values(raw, row_index)
+            texts = [normalized_text(value).casefold() for value in values if pd.notna(value)]
+            has_date_label = any(text.startswith("дата") for text in texts)
+            has_plan_label = any("план на день кухня" in text for text in texts)
+            parsed_date = next(
+                (parsed for value in values if (parsed := parse_excel_date(value)) is not None),
+                None,
+            )
+            if parsed_date is not None and (has_date_label or has_plan_label):
+                date_rows.append(row_index)
+
         for position, date_row in enumerate(date_rows):
+            date_values = row_values(raw, date_row)
             target_date = next(
-                (
-                    parsed
-                    for value in raw.iloc[date_row].tolist()
-                    if (parsed := parse_excel_date(value)) is not None
-                ),
+                (parsed for value in date_values if (parsed := parse_excel_date(value)) is not None),
                 None,
             )
-            if target_date is None or date_row + 1 >= len(raw):
+            if target_date is None:
                 continue
-            header = [str(value).strip() if pd.notna(value) else "" for value in raw.iloc[date_row + 1].tolist()]
-            code_col = next(
-                (i for i, value in enumerate(header) if value.lower() in {"код", "код №"}),
-                None,
-            )
-            name_col = next(
-                (i for i, value in enumerate(header) if "название блюда" in value.lower()),
-                None,
-            )
-            category_col = next(
-                (i for i, value in enumerate(header) if "категор" in value.lower()),
-                None,
-            )
-            price_col = next(
-                (i for i, value in enumerate(header) if value.lower() == "цена"),
-                None,
-            )
-            has_point_columns = any(value.upper() == "Т1" for value in header)
-            if None in {code_col, name_col, category_col, price_col} or not has_point_columns:
+
+            # Заголовок обычно следующей строкой, но допускаем до 5 служебных строк.
+            header_row: int | None = None
+            header_meta: tuple[int | None, int | None, int | None, int | None, bool] | None = None
+            search_end = min(len(raw), date_row + 7)
+            for candidate in range(date_row + 1, search_end):
+                meta = header_info(row_values(raw, candidate))
+                code_col, name_col, category_col, _, has_point_columns = meta
+                if code_col is not None and name_col is not None and category_col is not None and has_point_columns:
+                    header_row = candidate
+                    header_meta = meta
+                    break
+            if header_row is None or header_meta is None:
                 continue
-            end_row = date_rows[position + 1] if position + 1 < len(date_rows) else len(raw)
-            block = raw.iloc[date_row + 2 : end_row, [code_col, price_col, category_col, name_col]].copy()
-            block.columns = ["sku", "price", "matrix_category", "product_name"]
+
+            code_col, name_col, category_col, price_col, _ = header_meta
+            assert code_col is not None and name_col is not None and category_col is not None
+
+            # Блок заканчивается перед следующей датой или перед служебным
+            # разделом «Участок комплектации», если он встречается раньше.
+            next_date_row = date_rows[position + 1] if position + 1 < len(date_rows) else len(raw)
+            end_row = next_date_row
+            for candidate in range(header_row + 1, next_date_row):
+                label = " ".join(
+                    normalized_text(value).casefold()
+                    for value in row_values(raw, candidate)
+                    if pd.notna(value)
+                )
+                if "участок комплектации" in label:
+                    end_row = candidate
+                    break
+
+            data_rows = raw.iloc[header_row + 1 : end_row].copy()
+            if data_rows.empty:
+                continue
+
+            block = pd.DataFrame(index=data_rows.index)
+            block["sku"] = data_rows.iloc[:, code_col]
+            block["price"] = (
+                data_rows.iloc[:, price_col]
+                if price_col is not None and price_col < data_rows.shape[1]
+                else pd.NA
+            )
+            block["matrix_category"] = data_rows.iloc[:, category_col]
+            block["product_name"] = data_rows.iloc[:, name_col]
             block["excel_row"] = block.index + 1
             block["sku"] = block["sku"].map(normalize_sku)
             block = block[block["sku"].notna() & block["product_name"].notna()].copy()
             if block.empty:
                 continue
+
             block["price"] = pd.to_numeric(block["price"], errors="coerce")
             block["matrix_category"] = block["matrix_category"].map(normalize_matrix_category)
             block["target_date"] = target_date
             block["sheet"] = sheet_name
-            block["header_excel_row"] = date_row + 2
-            block["day_label"] = str(raw.iloc[date_row, 4] if raw.shape[1] > 4 else "").strip()
+            block["header_excel_row"] = header_row + 1
+
+            day_label = next(
+                (
+                    normalized_text(value)
+                    for value in date_values
+                    if isinstance(value, str) and "план на день кухня" in value.casefold()
+                ),
+                "",
+            )
+            if not day_label and raw.shape[1] > 4:
+                day_label = normalized_text(raw.iloc[date_row, 4])
+            block["day_label"] = day_label
             blocks.append(block)
 
     menu = pd.concat(blocks, ignore_index=True) if blocks else pd.DataFrame()
     capacity = pd.DataFrame()
     if "Ёмкость точек" in excel.sheet_names:
-        capacity_raw = pd.read_excel(excel, sheet_name="Ёмкость точек", header=2)
-        capacity_raw.columns = [str(column).strip() for column in capacity_raw.columns]
-        if len(capacity_raw.columns) >= 3:
+        try:
+            capacity_raw = pd.read_excel(excel, sheet_name="Ёмкость точек", header=2)
+        except Exception:
+            capacity_raw = pd.DataFrame()
+        if not capacity_raw.empty and len(capacity_raw.columns) >= 3:
+            capacity_raw.columns = [str(column).strip() for column in capacity_raw.columns]
             capacity = capacity_raw.copy()
-            capacity = capacity.rename(columns={capacity.columns[0]: "point_number", capacity.columns[1]: "point_name"})
+            capacity = capacity.rename(
+                columns={capacity.columns[0]: "point_number", capacity.columns[1]: "point_name"}
+            )
             capacity["point_number"] = pd.to_numeric(capacity["point_number"], errors="coerce")
             capacity = capacity[capacity["point_number"].notna()].copy()
             capacity["point_number"] = capacity["point_number"].astype(int)
@@ -3961,200 +4061,6 @@ def build_report_comparison_dates(
     return matched_1, matched_2, pairs
 
 
-
-def load_menu_analysis_sales(
-    date_from: date,
-    date_to_exclusive: date,
-    points: tuple[int, ...],
-) -> pd.DataFrame:
-    """Компактная выгрузка продаж для анализа меню без хранения чековой детализации.
-
-    Один ряд = дата + точка + SKU. Функция намеренно не кешируется,
-    чтобы крупная выгрузка не оставалась в памяти Streamlit после скачивания.
-    """
-    query = """
-        SELECT
-            business_date,
-            shop_number,
-            COALESCE(
-                NULLIF(TRIM(erp_code), ''),
-                NULLIF(TRIM(product_code), ''),
-                NULLIF(TRIM(barcode), ''),
-                NULLIF(TRIM(product_hash), ''),
-                'БЕЗ_SKU'
-            ) AS sku,
-            MAX(product_name) AS product_name,
-            SUM(net_quantity)::numeric AS sold_quantity,
-            SUM(net_line_amount)::numeric AS revenue
-        FROM dwh.v_sales_item
-        WHERE business_date >= %(date_from)s
-          AND business_date < %(date_to)s
-          AND shop_number = ANY(%(points)s)
-        GROUP BY
-            business_date,
-            shop_number,
-            COALESCE(
-                NULLIF(TRIM(erp_code), ''),
-                NULLIF(TRIM(product_code), ''),
-                NULLIF(TRIM(barcode), ''),
-                NULLIF(TRIM(product_hash), ''),
-                'БЕЗ_SKU'
-            )
-        ORDER BY business_date, shop_number, sku
-    """
-    with psycopg.connect(**connection_settings()) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                query,
-                {
-                    "date_from": date_from,
-                    "date_to": date_to_exclusive,
-                    "points": list(points),
-                },
-            )
-            records = cursor.fetchall()
-            columns = [description.name for description in cursor.description]
-    frame = pd.DataFrame(records, columns=columns)
-    if frame.empty:
-        return frame
-    frame["sku"] = frame["sku"].map(normalize_sku)
-    frame["sold_quantity"] = pd.to_numeric(frame["sold_quantity"], errors="coerce").fillna(0.0)
-    frame["revenue"] = pd.to_numeric(frame["revenue"], errors="coerce").fillna(0.0)
-    return frame
-
-
-def prepare_menu_analysis_export(
-    sales: pd.DataFrame,
-    entities: pd.DataFrame,
-    period_label: str,
-) -> pd.DataFrame:
-    """Добавляет к продажам атрибуты меню для белковой/ассортиментной аналитики."""
-    columns = [
-        "Период", "Дата", "День недели", "Точка", "№ точки", "SKU", "Блюдо",
-        "Категория", "Гарнир / углевод", "Белок", "Тип блюда", "Сущность",
-        "Продано, шт.", "Выручка, ₽",
-    ]
-    if sales.empty:
-        return pd.DataFrame(columns=columns)
-
-    export = sales.copy()
-    export["business_date"] = pd.to_datetime(export["business_date"], errors="coerce")
-    export["shop_number"] = pd.to_numeric(export["shop_number"], errors="coerce").astype("Int64")
-    export = export[export["business_date"].notna() & export["shop_number"].notna()].copy()
-    export["shop_number"] = export["shop_number"].astype(int)
-    export = export[(export["shop_number"] >= 1) & (export["shop_number"] <= 29)]
-    export = export[export["shop_number"] != 11].copy()
-    export["sku"] = export["sku"].map(normalize_sku)
-
-    entity_columns = [
-        "sku", "entity_product_name", "category", "attribute_1",
-        "attribute_2", "attribute_3", "entity",
-    ]
-    entity_map = entities[[column for column in entity_columns if column in entities.columns]].copy()
-    entity_map["sku"] = entity_map["sku"].map(normalize_sku)
-    entity_map = entity_map.drop_duplicates("sku")
-    export = export.merge(entity_map, on="sku", how="left", validate="many_to_one")
-
-    export["product_name"] = export.get("product_name", pd.Series(index=export.index, dtype="object"))
-    if "entity_product_name" in export.columns:
-        export["product_name"] = export["product_name"].fillna(export["entity_product_name"])
-    export["product_name"] = export["product_name"].fillna("Не указано")
-    for column in ["category", "attribute_1", "attribute_2", "attribute_3", "entity"]:
-        if column not in export.columns:
-            export[column] = "Не сопоставлено"
-        export[column] = export[column].fillna("Не сопоставлено").astype(str).str.strip()
-        export.loc[export[column].eq(""), column] = "Не сопоставлено"
-
-    weekdays = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
-    export["Период"] = period_label
-    export["Дата"] = export["business_date"].dt.date
-    export["День недели"] = export["business_date"].dt.weekday.map(weekdays)
-    export["№ точки"] = export["shop_number"]
-    export["Точка"] = export["shop_number"].map(lambda value: f"Т{int(value)}")
-    export["SKU"] = export["sku"]
-    export["Блюдо"] = export["product_name"]
-    export["Категория"] = export["category"]
-    # В текущем справочнике Атрибут 1 = гарнир/основа, Атрибут 2 = белок,
-    # Атрибут 3 = тип/форма блюда. Оставляем исходные значения без догадок.
-    export["Гарнир / углевод"] = export["attribute_1"]
-    export["Белок"] = export["attribute_2"]
-    export["Тип блюда"] = export["attribute_3"]
-    export["Сущность"] = export["entity"]
-    export["Продано, шт."] = pd.to_numeric(export["sold_quantity"], errors="coerce").fillna(0.0)
-    export["Выручка, ₽"] = pd.to_numeric(export["revenue"], errors="coerce").fillna(0.0)
-    export = export[columns].sort_values(
-        ["Дата", "Точка", "Категория", "Белок", "SKU"],
-        kind="stable",
-    )
-    return export.reset_index(drop=True)
-
-
-def build_menu_analysis_excel(export_frame: pd.DataFrame) -> bytes:
-    """Excel: подробные продажи + сводка по белку."""
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        export_frame.to_excel(writer, sheet_name="Продажи меню", index=False)
-
-        if export_frame.empty:
-            protein_summary = pd.DataFrame(
-                columns=["Белок", "Продано, шт.", "Выручка, ₽", "SKU, шт.", "Дней продаж"]
-            )
-        else:
-            protein_summary = (
-                export_frame.groupby("Белок", as_index=False, dropna=False)
-                .agg(
-                    **{
-                        "Продано, шт.": ("Продано, шт.", "sum"),
-                        "Выручка, ₽": ("Выручка, ₽", "sum"),
-                        "SKU, шт.": ("SKU", "nunique"),
-                        "Дней продаж": ("Дата", "nunique"),
-                    }
-                )
-                .sort_values("Продано, шт.", ascending=False, kind="stable")
-            )
-        protein_summary.to_excel(writer, sheet_name="Сводка по белку", index=False)
-
-        day_protein = (
-            export_frame.groupby(["Дата", "День недели", "Белок"], as_index=False, dropna=False)
-            .agg(**{"Продано, шт.": ("Продано, шт.", "sum"), "Выручка, ₽": ("Выручка, ₽", "sum")})
-            if not export_frame.empty
-            else pd.DataFrame(columns=["Дата", "День недели", "Белок", "Продано, шт.", "Выручка, ₽"])
-        )
-        day_protein.to_excel(writer, sheet_name="Белок по дням", index=False)
-
-        header_fill = PatternFill("solid", fgColor="1F4E78")
-        header_font = Font(color="FFFFFF", bold=True)
-        for sheet in writer.book.worksheets:
-            sheet.freeze_panes = "A2"
-            sheet.auto_filter.ref = sheet.dimensions
-            for cell in sheet[1]:
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            for column_cells in sheet.columns:
-                width = min(max(len(str(cell.value or "")) for cell in column_cells) + 2, 42)
-                sheet.column_dimensions[column_cells[0].column_letter].width = max(width, 10)
-            for row in sheet.iter_rows(min_row=2):
-                for cell in row:
-                    cell.alignment = Alignment(vertical="center")
-            # Форматы чисел без лишних десятичных хвостов.
-            header_map = {cell.value: cell.column for cell in sheet[1]}
-            for header in ["Продано, шт.", "SKU, шт.", "Дней продаж"]:
-                if header in header_map:
-                    for cell in sheet.iter_cols(
-                        min_col=header_map[header], max_col=header_map[header], min_row=2
-                    ):
-                        for item in cell:
-                            item.number_format = '#,##0.##'
-            if "Выручка, ₽" in header_map:
-                for cell in sheet.iter_cols(
-                    min_col=header_map["Выручка, ₽"], max_col=header_map["Выручка, ₽"], min_row=2
-                ):
-                    for item in cell:
-                        item.number_format = '#,##0.00'
-    return buffer.getvalue()
-
-
 def prepare_report_sales_frame(
     sales: pd.DataFrame,
     entities: pd.DataFrame,
@@ -5046,7 +4952,6 @@ if tab_report.open:
                             "report_graph_category_v770",
                             "report_graph_entity_v770",
                             "report_graph_point_v770",
-                            "menu_analysis_export_v1",
                         ]:
                             st.session_state.pop(stale_key, None)
                         st.session_state["period_comparison_report_v770"] = {
@@ -5070,7 +4975,6 @@ if tab_report.open:
             help="Удаляет сохранённые данные двух периодов из памяти приложения.",
         ):
             st.session_state.pop("period_comparison_report_v770", None)
-            st.session_state.pop("menu_analysis_export_v1", None)
             st.rerun()
         if report_state:
             report_frame_1 = report_state["frame_1"]
@@ -5134,117 +5038,6 @@ if tab_report.open:
                     default=report_point_options,
                     key="report_point_filter_v770",
                 )
-
-            st.markdown("#### Выгрузка данных для анализа меню")
-            st.caption(
-                "Компактная выгрузка из PostgreSQL на уровне Дата → Точка → SKU. "
-                "В Excel добавляются атрибуты из справочника: гарнир/углевод, белок и тип блюда. "
-                "Выгрузка не хранит чековую детализацию и после формирования сохраняет в памяти только готовый Excel."
-            )
-            export_controls = st.columns([1.4, 1.0, 1.0])
-            with export_controls[0]:
-                menu_export_period_choice = st.radio(
-                    "Период выгрузки",
-                    ["Период 1", "Период 2"],
-                    horizontal=True,
-                    key="menu_analysis_period_v1",
-                )
-            with export_controls[1]:
-                menu_export_positive_only = st.checkbox(
-                    "Только продажи > 0",
-                    value=True,
-                    key="menu_analysis_positive_v1",
-                    help="Исключает нулевые и отрицательные движения/возвраты из аналитической выгрузки.",
-                )
-            with export_controls[2]:
-                st.write("")
-                build_menu_export = st.button(
-                    "Сформировать Excel",
-                    use_container_width=True,
-                    key="menu_analysis_build_v1",
-                )
-
-            if build_menu_export:
-                if not selected_report_points:
-                    st.error("Для выгрузки выберите хотя бы одну точку в поле «Точки в результате».")
-                else:
-                    if menu_export_period_choice == "Период 1":
-                        export_period = report_period_1
-                        export_label = "Период 1"
-                    else:
-                        export_period = report_period_2
-                        export_label = "Период 2"
-                    export_point_numbers = tuple(sorted(int(point[1:]) for point in selected_report_points))
-                    try:
-                        with st.spinner("Формирую компактную выгрузку для анализа меню…"):
-                            menu_raw = load_menu_analysis_sales(
-                                export_period[0],
-                                export_period[1] + timedelta(days=1),
-                                export_point_numbers,
-                            )
-                            menu_export_frame = prepare_menu_analysis_export(
-                                menu_raw,
-                                entities,
-                                export_label,
-                            )
-                            if menu_export_positive_only and not menu_export_frame.empty:
-                                menu_export_frame = menu_export_frame[
-                                    pd.to_numeric(menu_export_frame["Продано, шт."], errors="coerce").fillna(0) > 0
-                                ].copy()
-                            menu_excel = build_menu_analysis_excel(menu_export_frame)
-                            preview = menu_export_frame.head(100).copy()
-                        st.session_state["menu_analysis_export_v1"] = {
-                            "bytes": menu_excel,
-                            "period_label": export_label,
-                            "period": export_period,
-                            "points": list(selected_report_points),
-                            "rows": int(len(menu_export_frame)),
-                            "sales": float(menu_export_frame["Продано, шт."].sum()) if not menu_export_frame.empty else 0.0,
-                            "revenue": float(menu_export_frame["Выручка, ₽"].sum()) if not menu_export_frame.empty else 0.0,
-                            "preview": preview,
-                        }
-                        del menu_raw, menu_export_frame, menu_excel
-                    except Exception as error:
-                        st.error(f"Не удалось сформировать выгрузку для анализа меню: {error}")
-
-            menu_export_state = st.session_state.get("menu_analysis_export_v1")
-            if menu_export_state:
-                export_metric_cols = st.columns(3)
-                export_metric_cols[0].metric("Строк в выгрузке", f"{menu_export_state['rows']:,}".replace(",", " "))
-                export_metric_cols[1].metric("Продано, шт.", f"{menu_export_state['sales']:,.0f}".replace(",", " "))
-                export_metric_cols[2].metric("Выручка, ₽", f"{menu_export_state['revenue']:,.0f}".replace(",", " "))
-                st.dataframe(
-                    menu_export_state["preview"],
-                    use_container_width=True,
-                    hide_index=True,
-                    height=min(430, 36 * len(menu_export_state["preview"]) + 70),
-                    column_config={
-                        "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
-                        "Выручка, ₽": st.column_config.NumberColumn(format="%.0f"),
-                    },
-                )
-                export_p1, export_p2 = menu_export_state["period"]
-                file_name = (
-                    f"menu_analysis_{export_p1:%Y-%m-%d}_{export_p2:%Y-%m-%d}.xlsx"
-                )
-                download_cols = st.columns([2, 1])
-                with download_cols[0]:
-                    st.download_button(
-                        "Скачать Excel для анализа меню",
-                        data=menu_export_state["bytes"],
-                        file_name=file_name,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        key="menu_analysis_download_v1",
-                    )
-                with download_cols[1]:
-                    if st.button(
-                        "Очистить выгрузку",
-                        use_container_width=True,
-                        key="menu_analysis_clear_v1",
-                    ):
-                        st.session_state.pop("menu_analysis_export_v1", None)
-                        st.rerun()
 
             filtered_report_1 = report_frame_1[
                 report_frame_1["category"].isin(selected_report_categories)
