@@ -3966,34 +3966,47 @@ def prepare_report_sales_frame(
     entities: pd.DataFrame,
     period_name: str,
 ) -> pd.DataFrame:
-    if sales.empty:
-        return pd.DataFrame(
-            columns=[
-                "period", "business_date", "point", "shop_number", "sku", "product_name",
-                "category", "entity", "sales", "revenue",
-            ]
-        )
+    """Подготавливает компактный дневной набор для отчёта.
 
-    report = sales.copy()
+    В session_state не храним сырые строки чеков: для отчёта достаточно
+    день + точка + категория + сущность. Это резко снижает расход RAM.
+    """
+    compact_columns = [
+        "period", "business_date", "point", "shop_number",
+        "category", "entity", "sales",
+    ]
+    if sales.empty:
+        return pd.DataFrame(columns=compact_columns)
+
+    report = sales[[
+        column for column in ["business_date", "shop_number", "sku", "sold_quantity"]
+        if column in sales.columns
+    ]].copy()
     report["business_date"] = pd.to_datetime(report["business_date"], errors="coerce").dt.date
     report["shop_number"] = pd.to_numeric(report["shop_number"], errors="coerce").astype("Int64")
-    report = report[report["shop_number"].notna()].copy()
+    report = report[report["business_date"].notna() & report["shop_number"].notna()].copy()
     report["shop_number"] = report["shop_number"].astype(int)
     report = report[(report["shop_number"] >= 1) & (report["shop_number"] <= 29)]
     report = report[report["shop_number"] != 11].copy()
     report["point"] = report["shop_number"].map(lambda value: f"Т{int(value)}")
-    report = report.merge(entities[["sku", "category", "entity"]], on="sku", how="left", validate="many_to_one")
+    report["sku"] = report["sku"].map(normalize_sku)
+    entity_map = entities[["sku", "category", "entity"]].copy()
+    entity_map["sku"] = entity_map["sku"].map(normalize_sku)
+    entity_map = entity_map.drop_duplicates("sku")
+    report = report.merge(entity_map, on="sku", how="left", validate="many_to_one")
     report["category"] = report["category"].fillna("Не сопоставлено")
     report["entity"] = report["entity"].fillna("Не сопоставлено")
     report["sales"] = pd.to_numeric(report["sold_quantity"], errors="coerce").fillna(0.0)
-    report["revenue"] = pd.to_numeric(report["revenue"], errors="coerce").fillna(0.0)
+
+    report = (
+        report.groupby(
+            ["business_date", "point", "shop_number", "category", "entity"],
+            as_index=False,
+            dropna=False,
+        )["sales"].sum()
+    )
     report["period"] = period_name
-    return report[
-        [
-            "period", "business_date", "point", "shop_number", "sku", "product_name",
-            "category", "entity", "sales", "revenue",
-        ]
-    ]
+    return report[compact_columns]
 
 
 def _report_group_period_values(
@@ -4345,7 +4358,7 @@ def build_period_comparison_html(
 
 
 st.title("Анализ структуры спроса")
-st.caption("Версия 75.7.0 · Добавлена вкладка «Отчет» со сверкой двух периодов")
+st.caption("Версия 75.7.3 · Оптимизация памяти Streamlit Cloud")
 
 if not ENTITY_FILE.exists():
     st.error(f"Не найден справочник: {ENTITY_FILE.name}")
@@ -4571,17 +4584,12 @@ try:
         parse_freshness_plan(matrix_snapshot_bytes)
         if matrix_snapshot_bytes else pd.DataFrame()
     )
-    daily_detail_with_loading = attach_loading_dates_to_sales(daily_detail, detail_loading_plan)
 except Exception:
-    daily_detail_with_loading = daily_detail.copy()
-    daily_detail_with_loading["loading_date"] = pd.NaT
-    daily_detail_with_loading["freshness_stage"] = "Нет партии"
-    daily_detail_with_loading["plan_quantity"] = pd.NA
-    daily_detail_with_loading["batch_expiry_date"] = pd.NaT
-    daily_detail_with_loading["batch_sold_total"] = pd.NA
-    daily_detail_with_loading["batch_live_remaining"] = pd.NA
-    daily_detail_with_loading["batch_writeoff_quantity"] = pd.NA
-    daily_detail_with_loading["batch_status"] = "Нет партии"
+    detail_loading_plan = pd.DataFrame()
+
+# Не создаём вторую тяжёлую копию всей детализации с FIFO на каждом rerun.
+# Партии/даты загрузки рассчитываются ниже только для выбранного пользователем среза.
+daily_detail_with_loading = daily_detail
 
 # Необязательный фактический снимок остатков. Источник общий для «Детализации»
 # и «Окна свежести», поэтому загрузчик расположен до вкладок.
@@ -4670,9 +4678,9 @@ with st.expander("Фактические остатки по точкам · н�
                 & stock_balances["point"].isin(point_filter)
             ].copy()
 
-filtered_detail = daily_detail_with_loading[
-    daily_detail_with_loading["category"].isin(category_filter)
-    & daily_detail_with_loading["point"].isin(point_filter)
+filtered_detail = daily_detail[
+    daily_detail["category"].isin(category_filter)
+    & daily_detail["point"].isin(point_filter)
 ]
 
 total_sales = filtered_sku["sales"].sum()
@@ -4808,9 +4816,16 @@ with tab_report:
                     st.error(f"Не удалось сформировать отчет: {error}")
 
     report_state = st.session_state.get("period_comparison_report_v770")
+    if report_state and st.button(
+        "Очистить данные отчета из памяти",
+        key="report_clear_memory_v7573",
+        help="Удаляет сохранённые данные двух периодов из памяти приложения.",
+    ):
+        st.session_state.pop("period_comparison_report_v770", None)
+        st.rerun()
     if report_state:
-        report_frame_1 = report_state["frame_1"].copy()
-        report_frame_2 = report_state["frame_2"].copy()
+        report_frame_1 = report_state["frame_1"]
+        report_frame_2 = report_state["frame_2"]
         report_period_1 = report_state["period_1"]
         report_period_2 = report_state["period_2"]
         report_dates_1 = report_state["dates_1"]
@@ -5635,6 +5650,26 @@ with tab_detail:
             )
             period_detail = period_detail[detail_search_mask]
 
+        detail_batch_enrichment = st.checkbox(
+            "Рассчитать партии, дату загрузки и списания для этого среза",
+            value=False,
+            key="detail_batch_enrichment_v7573",
+            help="Тяжёлый FIFO-расчёт выполняется только по текущему отфильтрованному срезу, чтобы приложение не превышало память Streamlit Cloud.",
+        )
+        if detail_batch_enrichment and not period_detail.empty and not detail_loading_plan.empty:
+            with st.spinner("Сопоставляю продажи с партиями…"):
+                period_detail = attach_loading_dates_to_sales(period_detail, detail_loading_plan)
+        else:
+            period_detail = period_detail.copy()
+            period_detail["loading_date"] = pd.NaT
+            period_detail["freshness_stage"] = "Нет партии"
+            period_detail["plan_quantity"] = pd.NA
+            period_detail["batch_expiry_date"] = pd.NaT
+            period_detail["batch_sold_total"] = pd.NA
+            period_detail["batch_live_remaining"] = pd.NA
+            period_detail["batch_writeoff_quantity"] = pd.NA
+            period_detail["batch_status"] = "Не рассчитано"
+
         detail_metrics = st.columns(4)
         detail_metrics[0].metric(
             "Продано в окне, шт.",
@@ -5826,7 +5861,7 @@ with tab_category_detail:
         "Сначала выберите одну категорию. Таблица ниже учитывает только её товары. "
         "Можно выбрать несколько SKU одновременно: они появятся на одном графике, а покупки будут объединены в общей таблице."
     )
-    category_detail_source = daily_detail_with_loading.copy()
+    category_detail_source = daily_detail.copy()
     category_detail_source["sale_datetime"] = pd.to_datetime(
         category_detail_source["sale_datetime"], errors="coerce"
     )
@@ -5868,6 +5903,18 @@ with tab_category_detail:
             category_detail_source["category"].astype(str).eq(selected_detail_category)
             & category_detail_source["point"].isin(selected_detail_points)
         ].copy()
+        if not category_only.empty and not detail_loading_plan.empty:
+            # Здесь FIFO считается только по одной выбранной категории, а не по всей базе.
+            category_only = attach_loading_dates_to_sales(category_only, detail_loading_plan)
+        else:
+            category_only["loading_date"] = pd.NaT
+            category_only["freshness_stage"] = "Нет партии"
+            category_only["plan_quantity"] = pd.NA
+            category_only["batch_expiry_date"] = pd.NaT
+            category_only["batch_sold_total"] = pd.NA
+            category_only["batch_live_remaining"] = pd.NA
+            category_only["batch_writeoff_quantity"] = pd.NA
+            category_only["batch_status"] = "Нет партии"
         if category_only.empty:
             st.info("По выбранной категории и точкам продаж за период нет.")
         else:
@@ -8206,7 +8253,7 @@ with tab_sales_time:
                     selected_history_name = str(selected_menu_item.get("Название товара", "") or "")
 
                     history_start, history_end = period
-                    sku_history = daily_detail_with_loading.copy()
+                    sku_history = daily_detail.copy()
                     sku_history["sku"] = sku_history["sku"].map(normalize_sku)
                     sku_history["business_date"] = pd.to_datetime(
                         sku_history["business_date"], errors="coerce"
