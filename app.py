@@ -1104,11 +1104,21 @@ def parse_menu_matrix(file_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
             texts = [normalized_text(value).casefold() for value in values if pd.notna(value)]
             has_date_label = any(text.startswith("дата") for text in texts)
             has_plan_label = any("план на день кухня" in text for text in texts)
+            # В матрице после основного меню бывает служебный блок
+            # «Дата + Участок комплектации». Он может содержать те же SKU и
+            # похожий заголовок, но это НЕ второе меню. Раньше такой блок
+            # ошибочно распознавался как ещё одно меню и при выгрузке полностью
+            # дублировал выбранную дату снизу.
+            has_packaging_label = any("участок комплектации" in text for text in texts)
             parsed_date = next(
                 (parsed for value in values if (parsed := parse_excel_date(value)) is not None),
                 None,
             )
-            if parsed_date is not None and (has_date_label or has_plan_label):
+            if (
+                parsed_date is not None
+                and (has_date_label or has_plan_label)
+                and not has_packaging_label
+            ):
                 date_rows.append(row_index)
 
         for position, date_row in enumerate(date_rows):
@@ -5133,7 +5143,7 @@ def build_period_comparison_html(
 
 
 st.title("Анализ структуры спроса")
-st.caption("Версия 75.8.3 · Автозагрузка + встроенные категории SKU")
+st.caption("Версия 75.8.4 · Исправлена двойная выгрузка меню")
 
 if not ENTITY_FILE.exists():
     st.error(f"Не найден справочник: {ENTITY_FILE.name}")
