@@ -28,7 +28,6 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.1-PLAN-EXPORT-PERIOD"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -94,7 +93,6 @@ def resolve_app_file(filename: str, *name_fragments: str) -> Path:
 ENTITY_FILE = resolve_app_file("entities.xlsx", "сущност", "entit")
 ANALYST_LOGIC_FILE = resolve_app_file("analyst_logic.xlsx", "логика", "аналит", "analyst")
 COMBO_MATRIX_FILE = resolve_app_file("combo_matrix.xlsx", "матрица", "комбо", "combo")
-AUTO_UNIT_FILE = resolve_app_file("auto_unit_points_vm.xlsx", "авто юнит", "auto_unit", "точки вм")
 MATRIX_APPS_SCRIPT_URL = os.getenv(
     "MATRIX_APPS_SCRIPT_URL",
     "https://script.google.com/macros/s/AKfycbxzpVJGvkHTn8YogBOLO4PtvdQqmkoMx-chNCZ2ijmMIRc_-kcd2WUQ283PNyo5hCo/exec",
@@ -112,12 +110,7 @@ MATRIX_PLAN_SHEETS = [
     "План 4-я неделя",
 ]
 
-st.set_page_config(
-    page_title="Аналитика спроса",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(page_title="Структура спроса", page_icon="📊", layout="wide")
 load_dotenv(APP_DIR / ".env", override=True)
 
 REMEMBERED_PG_FILE = APP_DIR / ".remembered_pg.json"
@@ -845,9 +838,6 @@ def parse_menu_matrix(file_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
         for row_index in range(len(raw)):
             values = row_values(raw, row_index)
             texts = [normalized_text(value).casefold() for value in values if pd.notna(value)]
-            is_service_row = any("участок комплектации" in text for text in texts)
-            if is_service_row:
-                continue
             has_date_label = any(text.startswith("дата") for text in texts)
             has_plan_label = any("план на день кухня" in text for text in texts)
             parsed_date = next(
@@ -922,15 +912,20 @@ def parse_menu_matrix(file_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
             block["sheet"] = sheet_name
             block["header_excel_row"] = header_row + 1
 
-            day_label = WEEKDAY_RU.get(target_date.weekday(), "")
+            day_label = next(
+                (
+                    normalized_text(value)
+                    for value in date_values
+                    if isinstance(value, str) and "план на день кухня" in value.casefold()
+                ),
+                "",
+            )
+            if not day_label and raw.shape[1] > 4:
+                day_label = normalized_text(raw.iloc[date_row, 4])
             block["day_label"] = day_label
             blocks.append(block)
 
     menu = pd.concat(blocks, ignore_index=True) if blocks else pd.DataFrame()
-    if not menu.empty:
-        menu = menu.drop_duplicates(
-            subset=["target_date", "sheet", "sku", "excel_row"], keep="first"
-        ).reset_index(drop=True)
     capacity = pd.DataFrame()
     if "Ёмкость точек" in excel.sheet_names:
         try:
@@ -1850,7 +1845,7 @@ def calculate_sku_daily_forecast(
             results.append(
                 {
                     "Дата плана": target_date,
-                    "День недели": WEEKDAY_RU.get(target_date.weekday(), ""),
+                    "День меню": item.get("day_label", ""),
                     "Точка": point_name,
                     "Номер точки": point_number,
                     "Номер магазина": int(shop_number),
@@ -2250,164 +2245,6 @@ def _delete_columns_preserving_merges(sheet, columns: list[int]) -> None:
 
 
 
-def _forecast_export_date_label(forecast: pd.DataFrame) -> str:
-    """Human-readable range of the plan dates that are actually exported."""
-    if forecast is None or forecast.empty or "Дата плана" not in forecast.columns:
-        return "выбранные даты"
-    dates = sorted(set(
-        pd.to_datetime(forecast["Дата плана"], errors="coerce").dropna().dt.date.tolist()
-    ))
-    if not dates:
-        return "выбранные даты"
-    if len(dates) == 1:
-        return dates[0].strftime("%d.%m.%Y")
-    return f"{dates[0]:%d.%m.%Y}–{dates[-1]:%d.%m.%Y}"
-
-
-def _find_selected_plan_blocks(sheet, selected_dates: set[date]) -> list[tuple[int, int]]:
-    """Return only matrix row ranges that belong to the selected plan dates."""
-    date_rows: list[tuple[int, date]] = []
-    max_scan_column = min(sheet.max_column, 12)
-    for row_number in range(1, sheet.max_row + 1):
-        values = [sheet.cell(row_number, column).value for column in range(1, max_scan_column + 1)]
-        texts = [str(value or "").strip().casefold() for value in values if value is not None]
-        if any("участок комплектации" in text for text in texts):
-            continue
-        has_date_label = any(text.startswith("дата") for text in texts)
-        has_plan_label = any("план на день кухня" in text for text in texts)
-        parsed_date = next(
-            (parsed for value in values if (parsed := parse_excel_date(value)) is not None),
-            None,
-        )
-        if parsed_date is not None and (has_date_label or has_plan_label):
-            date_rows.append((row_number, parsed_date))
-
-    selected_ranges: list[tuple[int, int]] = []
-    for position, (date_row, block_date) in enumerate(date_rows):
-        if block_date not in selected_dates:
-            continue
-        next_date_row = (
-            date_rows[position + 1][0]
-            if position + 1 < len(date_rows)
-            else sheet.max_row + 1
-        )
-        end_row = next_date_row - 1
-        for candidate_row in range(date_row + 1, next_date_row):
-            candidate_values = [
-                sheet.cell(candidate_row, column).value
-                for column in range(1, max_scan_column + 1)
-            ]
-            candidate_label = " ".join(
-                str(value or "").strip().casefold()
-                for value in candidate_values
-                if value is not None
-            )
-            if "участок комплектации" in candidate_label:
-                end_row = candidate_row - 1
-                break
-        if end_row >= date_row:
-            selected_ranges.append((date_row, end_row))
-    return selected_ranges
-
-
-def _copy_selected_plan_sheet(source_sheet, target_sheet, row_ranges: list[tuple[int, int]]) -> None:
-    """Copy selected plan blocks to a clean worksheet while keeping useful formatting."""
-    from openpyxl.utils.cell import range_boundaries
-
-    row_map: dict[int, int] = {}
-    next_target_row = 1
-    for range_index, (start_row, end_row) in enumerate(row_ranges):
-        if range_index:
-            next_target_row += 1
-        for source_row_number in range(start_row, end_row + 1):
-            target_row_number = next_target_row
-            row_map[source_row_number] = target_row_number
-            source_dimension = source_sheet.row_dimensions[source_row_number]
-            target_dimension = target_sheet.row_dimensions[target_row_number]
-            target_dimension.height = source_dimension.height
-            target_dimension.hidden = source_dimension.hidden
-            target_dimension.outlineLevel = source_dimension.outlineLevel
-
-            for column in range(1, source_sheet.max_column + 1):
-                source_cell = source_sheet.cell(source_row_number, column)
-                target_cell = target_sheet.cell(target_row_number, column)
-                target_cell.value = source_cell.value
-                if source_cell.has_style:
-                    target_cell._style = copy(source_cell._style)
-                target_cell.number_format = source_cell.number_format
-                target_cell.alignment = copy(source_cell.alignment)
-                target_cell.border = copy(source_cell.border)
-                target_cell.fill = copy(source_cell.fill)
-                target_cell.font = copy(source_cell.font)
-                target_cell.protection = copy(source_cell.protection)
-                if source_cell.comment is not None:
-                    target_cell.comment = copy(source_cell.comment)
-                if source_cell.hyperlink is not None:
-                    target_cell._hyperlink = copy(source_cell.hyperlink)
-            next_target_row += 1
-
-    for column_letter, source_dimension in source_sheet.column_dimensions.items():
-        target_dimension = target_sheet.column_dimensions[column_letter]
-        target_dimension.width = source_dimension.width
-        target_dimension.hidden = source_dimension.hidden
-        target_dimension.bestFit = source_dimension.bestFit
-        target_dimension.outlineLevel = source_dimension.outlineLevel
-
-    for merged_range in list(source_sheet.merged_cells.ranges):
-        min_col, min_row, max_col, max_row = range_boundaries(str(merged_range))
-        if min_row not in row_map or max_row not in row_map:
-            continue
-        if row_map[max_row] - row_map[min_row] != max_row - min_row:
-            continue
-        target_sheet.merge_cells(
-            start_row=row_map[min_row],
-            start_column=min_col,
-            end_row=row_map[max_row],
-            end_column=max_col,
-        )
-
-    target_sheet.sheet_view.showGridLines = source_sheet.sheet_view.showGridLines
-    target_sheet.sheet_format.defaultRowHeight = source_sheet.sheet_format.defaultRowHeight
-    target_sheet.sheet_properties.tabColor = copy(source_sheet.sheet_properties.tabColor)
-
-
-def _restrict_forecast_workbook_to_selected_dates(workbook, forecast: pd.DataFrame):
-    """Build a download workbook containing only the selected menu dates, never the full matrix."""
-    from openpyxl import Workbook
-
-    if forecast is None or forecast.empty:
-        return workbook
-
-    normalized = forecast.copy()
-    normalized["_export_date"] = pd.to_datetime(
-        normalized["Дата плана"], errors="coerce"
-    ).dt.date
-    selected_by_sheet: dict[str, set[date]] = {}
-    for sheet_name, group in normalized.dropna(subset=["_export_date"]).groupby("Лист"):
-        selected_by_sheet[str(sheet_name)] = set(group["_export_date"].tolist())
-
-    if not selected_by_sheet:
-        return workbook
-
-    export_workbook = Workbook()
-    export_workbook.remove(export_workbook.active)
-    copied_any = False
-    for sheet_name in workbook.sheetnames:
-        if sheet_name not in selected_by_sheet:
-            continue
-        source_sheet = workbook[sheet_name]
-        row_ranges = _find_selected_plan_blocks(source_sheet, selected_by_sheet[sheet_name])
-        if not row_ranges:
-            continue
-        target_sheet = export_workbook.create_sheet(title=sheet_name)
-        _copy_selected_plan_sheet(source_sheet, target_sheet, row_ranges)
-        copied_any = True
-
-    if copied_any:
-        return export_workbook
-    return workbook
-
-
 def fill_forecast_into_matrix(
     file_bytes: bytes,
     forecast: pd.DataFrame,
@@ -2572,18 +2409,13 @@ def fill_forecast_into_matrix(
         if sheet_name in workbook.sheetnames:
             _delete_columns_preserving_merges(workbook[sheet_name], columns)
 
-    # Critical export rule: the downloaded plan must contain ONLY the dates selected
-    # in «Прогноз плана». The source matrix can contain four weeks and many dates,
-    # but none of the unselected blocks are carried into the downloaded workbook.
-    workbook = _restrict_forecast_workbook_to_selected_dates(workbook, forecast)
-
     calculation_name = "Расчёт по меню"
     if calculation_name in workbook.sheetnames:
         del workbook[calculation_name]
     calculation_sheet = workbook.create_sheet(calculation_name)
     calculation_rows: list[dict[str, object]] = []
     calculation_keys = [
-        "Дата плана", "День недели", "Лист", "Строка Excel", "Категория", "Сущность",
+        "Дата плана", "День меню", "Лист", "Строка Excel", "Категория", "Сущность",
         "SKU", "Название товара", "Жизненный цикл, дней",
     ]
     for _, group in forecast.groupby(calculation_keys, dropna=False, sort=False):
@@ -2640,7 +2472,7 @@ def fill_forecast_into_matrix(
     detail_sheet = workbook.create_sheet(detail_name)
     preferred_export_columns = [
         "Дата плана",
-        "День недели",
+        "День меню",
         "Точка",
         "Тип точки",
         "Номер магазина",
@@ -2723,18 +2555,16 @@ def fill_forecast_into_matrix(
         width = min(max(len(str(cell.value or "")) for cell in cells) + 2, 45)
         detail_sheet.column_dimensions[cells[0].column_letter].width = width
     metadata_column = len(export_columns) + 2
-    detail_sheet.cell(row=1, column=metadata_column).value = "Период выгрузки плана"
-    detail_sheet.cell(row=2, column=metadata_column).value = _forecast_export_date_label(forecast)
-    detail_sheet.cell(row=3, column=metadata_column).value = "Исторический период"
-    detail_sheet.cell(row=4, column=metadata_column).value = (
+    detail_sheet.cell(row=1, column=metadata_column).value = "Исторический период"
+    detail_sheet.cell(row=2, column=metadata_column).value = (
         f"{history_from:%d.%m.%Y}–{(target_date - timedelta(days=1)):%d.%m.%Y}"
     )
-    detail_sheet.cell(row=5, column=metadata_column).value = "Легенда"
-    detail_sheet.cell(row=6, column=metadata_column).value = (
+    detail_sheet.cell(row=3, column=metadata_column).value = "Легенда"
+    detail_sheet.cell(row=4, column=metadata_column).value = (
         "Светло-красный план = продажи SKU на точке были только в 1–2 дня "
         "за расчётные 2 месяца; значение требует осторожной оценки."
     )
-    detail_sheet.cell(row=6, column=metadata_column).fill = PatternFill(
+    detail_sheet.cell(row=4, column=metadata_column).fill = PatternFill(
         "solid", fgColor="F4CCCC"
     )
 
@@ -4122,757 +3952,6 @@ def prepare_analysis(
     return sku_point, category_profile, entity_profile, daily_detail
 
 
-
-def plan_check_minimum(category: object) -> int:
-    """Business minimum for one SKU in one point when validating a ready plan."""
-    normalized = normalize_matrix_category(category)
-    if normalized == "Вторые блюда":
-        return 3
-    if normalized == "Напитки":
-        return 5
-    if normalized == "Япония":
-        return 1
-    return 2
-
-
-PLAN_CHECK_LIGHT_VEGETABLE_DEFAULT = (
-    "овощ", "винегрет", "свекл", "морков", "капуст", "брокколи", "огур",
-    "томат", "помидор", "зелень", "редис", "баклаж", "кабач", "тыкв",
-)
-
-
-def _plan_check_trend(recent_value: float, previous_value: float) -> float:
-    recent = max(0.0, float(recent_value or 0.0))
-    previous = max(0.0, float(previous_value or 0.0))
-    if previous <= 0:
-        return 1.0 if recent > 0 else 0.0
-    return (recent - previous) / previous
-
-
-def _auto_unit_number(value: object) -> float | None:
-    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
-    return None if pd.isna(number) else float(number)
-
-
-@st.cache_data(show_spinner=False)
-def parse_auto_unit_points(file_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Read point parameters and daily economics from «Авто Юнит точки ВМ»."""
-    if not file_bytes:
-        return pd.DataFrame(), pd.DataFrame()
-    workbook = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=False)
-    profile_rows: list[dict[str, object]] = []
-    daily_rows: list[dict[str, object]] = []
-
-    for sheet_name in workbook.sheetnames:
-        if not re.fullmatch(r"\d+", str(sheet_name).strip()):
-            continue
-        fallback_point = int(str(sheet_name).strip())
-        if not 1 <= fallback_point <= 29:
-            continue
-        sheet = workbook[sheet_name]
-        point_number_value = _auto_unit_number(sheet["B1"].value)
-        point_number = int(point_number_value) if point_number_value is not None else fallback_point
-        if not 1 <= point_number <= 29:
-            continue
-
-        point_type = str(sheet["F1"].value or "").strip()
-        active_text = str(sheet["H1"].value or "").strip()
-        work_days: float | None = None
-        work_hours = ""
-        audience_start_row: int | None = None
-        audience_label_col: int | None = None
-
-        scan_max_row = min(sheet.max_row, 120)
-        scan_max_col = min(sheet.max_column, 20)
-        for row_number in range(1, scan_max_row + 1):
-            for column_number in range(1, scan_max_col + 1):
-                value = str(sheet.cell(row_number, column_number).value or "").strip().casefold()
-                if "топ-3 целевой аудитории" in value:
-                    audience_start_row = row_number + 2
-                    audience_label_col = column_number
-                if "график работы" in value:
-                    days_value = _auto_unit_number(sheet.cell(row_number + 1, column_number + 1).value)
-                    if days_value is not None:
-                        work_days = days_value
-                    work_hours = str(sheet.cell(row_number + 1, column_number + 2).value or "").strip()
-
-        female_share = 0.0
-        male_share = 0.0
-        audience_parts: list[str] = []
-        if audience_start_row is not None and audience_label_col is not None:
-            for row_number in range(audience_start_row, audience_start_row + 3):
-                sex = str(sheet.cell(row_number, audience_label_col).value or "").strip()
-                age = str(sheet.cell(row_number, audience_label_col + 1).value or "").strip()
-                share = _auto_unit_number(sheet.cell(row_number, audience_label_col + 2).value) or 0.0
-                sex_low = sex.casefold()
-                if "жен" in sex_low:
-                    female_share += share
-                elif sex_low:
-                    # В рабочем файле встречаются опечатки «мудчины»/«муччины».
-                    male_share += share
-                if sex or age or share:
-                    audience_parts.append(
-                        f"{sex or '—'} {age or ''} {share * 100:.0f}%".strip()
-                    )
-
-        female_dominant = female_share > male_share and female_share > 0
-        profile_rows.append(
-            {
-                "point_number": point_number,
-                "point": f"Т{point_number}",
-                "point_type": point_type,
-                "active": active_text.casefold() in {"да", "yes", "true", "1"},
-                "work_days_per_week": int(round(work_days)) if work_days is not None else pd.NA,
-                "work_hours": work_hours,
-                "female_top3_share": round(female_share, 4),
-                "male_top3_share": round(male_share, 4),
-                "female_dominant": bool(female_dominant),
-                "audience_top3": " · ".join(audience_parts),
-            }
-        )
-
-        header_row: int | None = None
-        header_map: dict[str, int] = {}
-        for row_number in range(1, min(sheet.max_row, 12) + 1):
-            row_headers = {
-                str(sheet.cell(row_number, column_number).value or "").strip(): column_number
-                for column_number in range(1, min(sheet.max_column, 15) + 1)
-                if sheet.cell(row_number, column_number).value is not None
-            }
-            if "Дата" in row_headers and ("$ Итог" in row_headers or "Ср.-й чек" in row_headers):
-                header_row = row_number
-                header_map = row_headers
-                break
-        if header_row is None:
-            continue
-
-        date_col = header_map.get("Дата", 1)
-        revenue_col = header_map.get("$ Итог")
-        checks_col = header_map.get("Чеки Итог")
-        average_check_col = header_map.get("Ср.-й чек")
-        writeoff_col = header_map.get("Списания")
-        for row_number in range(header_row + 1, sheet.max_row + 1):
-            raw_date = sheet.cell(row_number, date_col).value
-            parsed_date = parse_excel_date(raw_date)
-            if parsed_date is None:
-                continue
-            revenue = _auto_unit_number(sheet.cell(row_number, revenue_col).value) if revenue_col else None
-            checks = _auto_unit_number(sheet.cell(row_number, checks_col).value) if checks_col else None
-            avg_check = _auto_unit_number(sheet.cell(row_number, average_check_col).value) if average_check_col else None
-            writeoff = _auto_unit_number(sheet.cell(row_number, writeoff_col).value) if writeoff_col else None
-            if revenue is None and checks is None and avg_check is None and writeoff is None:
-                continue
-            daily_rows.append(
-                {
-                    "point_number": point_number,
-                    "business_date": parsed_date,
-                    "revenue": max(0.0, revenue or 0.0),
-                    "checks": max(0.0, checks or 0.0),
-                    "average_check": max(0.0, avg_check or 0.0),
-                    "writeoff_rub": max(0.0, writeoff or 0.0),
-                }
-            )
-
-    profiles = pd.DataFrame(profile_rows)
-    if not profiles.empty:
-        profiles = profiles.drop_duplicates("point_number", keep="last").sort_values("point_number").reset_index(drop=True)
-    daily = pd.DataFrame(daily_rows)
-    if not daily.empty:
-        daily["business_date"] = pd.to_datetime(daily["business_date"], errors="coerce").dt.date
-        daily = daily[daily["business_date"].notna()].sort_values(["point_number", "business_date"]).reset_index(drop=True)
-    return profiles, daily
-
-
-def build_auto_unit_period_metrics(
-    daily: pd.DataFrame,
-    analysis_date: date,
-    window_days: int = 14,
-) -> dict[int, dict[str, object]]:
-    """Compare recent and previous equal periods for average check and daily revenue."""
-    if daily is None or daily.empty:
-        return {}
-    source = daily.copy()
-    source["business_date"] = pd.to_datetime(source["business_date"], errors="coerce").dt.date
-    source["point_number"] = pd.to_numeric(source["point_number"], errors="coerce")
-    source = source[source["business_date"].notna() & source["point_number"].notna()].copy()
-    source["point_number"] = source["point_number"].astype(int)
-    result: dict[int, dict[str, object]] = {}
-
-    def summarize(period: pd.DataFrame) -> dict[str, float]:
-        if period.empty:
-            return {"revenue": 0.0, "checks": 0.0, "avg_check": 0.0, "revenue_day": 0.0, "days": 0.0}
-        revenue = float(pd.to_numeric(period["revenue"], errors="coerce").fillna(0).clip(lower=0).sum())
-        checks = float(pd.to_numeric(period["checks"], errors="coerce").fillna(0).clip(lower=0).sum())
-        trading = period[(pd.to_numeric(period["revenue"], errors="coerce").fillna(0) > 0) | (pd.to_numeric(period["checks"], errors="coerce").fillna(0) > 0)]
-        days = int(trading["business_date"].nunique())
-        if checks > 0:
-            avg_check = revenue / checks
-        else:
-            avg_check = float(pd.to_numeric(period["average_check"], errors="coerce").dropna().mean() or 0.0)
-        return {
-            "revenue": revenue,
-            "checks": checks,
-            "avg_check": avg_check,
-            "revenue_day": revenue / max(1, days),
-            "days": float(days),
-        }
-
-    for point_number, group in source.groupby("point_number"):
-        eligible = group[group["business_date"] <= analysis_date].copy()
-        if eligible.empty:
-            continue
-        point_as_of = min(analysis_date, max(eligible["business_date"]))
-        recent_start = point_as_of - timedelta(days=window_days - 1)
-        previous_end = recent_start - timedelta(days=1)
-        previous_start = previous_end - timedelta(days=window_days - 1)
-        recent = summarize(eligible[eligible["business_date"].between(recent_start, point_as_of, inclusive="both")])
-        previous = summarize(eligible[eligible["business_date"].between(previous_start, previous_end, inclusive="both")])
-        result[int(point_number)] = {
-            "as_of": point_as_of,
-            "recent_start": recent_start,
-            "previous_start": previous_start,
-            "previous_end": previous_end,
-            "avg_check_recent": recent["avg_check"],
-            "avg_check_previous": previous["avg_check"],
-            "avg_check_trend": _plan_check_trend(recent["avg_check"], previous["avg_check"]),
-            "revenue_day_recent": recent["revenue_day"],
-            "revenue_day_previous": previous["revenue_day"],
-            "revenue_day_trend": _plan_check_trend(recent["revenue_day"], previous["revenue_day"]),
-            "recent_days": int(recent["days"]),
-            "previous_days": int(previous["days"]),
-        }
-    return result
-
-
-def _plan_check_light_vegetable(
-    category: object,
-    entity: object,
-    product_name: object,
-    keywords: tuple[str, ...] | list[str],
-) -> bool:
-    text = " ".join(
-        [
-            str(normalize_matrix_category(category) or ""),
-            str(entity or ""),
-            str(product_name or ""),
-        ]
-    ).casefold().replace("ё", "е")
-    for keyword in keywords:
-        normalized_keyword = str(keyword or "").strip().casefold().replace("ё", "е")
-        if normalized_keyword and normalized_keyword in text:
-            return True
-    return False
-
-
-def build_ready_plan_check(
-    matrix_plans: pd.DataFrame,
-    sales: pd.DataFrame,
-    entities: pd.DataFrame,
-    target_date: date,
-    point_mapping: dict[int, str],
-    trend_threshold: float = 0.10,
-    writeoff_threshold: float = 0.20,
-    minimum_sale_days: int = 3,
-    selected_points: tuple[str, ...] | list[str] | None = None,
-    selected_categories: tuple[str, ...] | list[str] | None = None,
-    auto_unit_profiles: pd.DataFrame | None = None,
-    auto_unit_daily: pd.DataFrame | None = None,
-    avg_check_growth_target: float = 0.05,
-    revenue_growth_target: float = 0.05,
-    light_vegetable_keywords: tuple[str, ...] | list[str] = PLAN_CHECK_LIGHT_VEGETABLE_DEFAULT,
-) -> pd.DataFrame:
-    """Validate an already-filled matrix plan and only adjust the existing values."""
-    if matrix_plans is None or matrix_plans.empty:
-        return pd.DataFrame()
-
-    plans = matrix_plans.copy()
-    plans["plan_date"] = pd.to_datetime(plans["plan_date"], errors="coerce").dt.date
-    plans["point_number"] = pd.to_numeric(plans["point_number"], errors="coerce")
-    plans["analyst_plan"] = pd.to_numeric(plans["analyst_plan"], errors="coerce").fillna(0.0).clip(lower=0)
-    plans["unit_price"] = pd.to_numeric(plans.get("unit_price", 0), errors="coerce").fillna(0.0).clip(lower=0)
-    plans["sku"] = plans["sku"].map(normalize_sku)
-    plans = plans[plans["plan_date"].notna() & plans["point_number"].notna() & plans["sku"].notna()].copy()
-    plans["point_number"] = plans["point_number"].astype(int)
-    plans = plans[plans["point_number"].ne(11)].copy()
-
-    plans = plans.merge(entities[["sku", "category", "entity"]], on="sku", how="left")
-    plans["category"] = plans["category"].fillna(plans["matrix_category"]).map(normalize_matrix_category)
-    plans["entity"] = plans["entity"].fillna("Не сопоставлено")
-
-    target = plans[plans["plan_date"].eq(target_date)].copy()
-    if target.empty:
-        return pd.DataFrame()
-
-    point_to_shop = {
-        int(str(label).lstrip("Тт")): int(shop)
-        for shop, label in point_mapping.items()
-        if str(label).strip().startswith("Т")
-        and str(label).strip().lstrip("Тт").isdigit()
-        and int(str(label).strip().lstrip("Тт")) != 11
-    }
-    target["point"] = target["point_number"].map(lambda number: f"Т{int(number)}")
-    target["shop_number"] = target["point_number"].map(point_to_shop)
-    target["shop_number"] = target["shop_number"].fillna(target["point_number"]).astype(int)
-
-    if selected_points:
-        allowed_points = {normalize_point_label(value) for value in selected_points}
-        target = target[target["point"].isin(allowed_points)].copy()
-    if selected_categories:
-        allowed_categories = {normalize_matrix_category(value) for value in selected_categories}
-        target = target[target["category"].isin(allowed_categories)].copy()
-    if target.empty:
-        return pd.DataFrame()
-
-    analysis_date = min(date.today(), target_date - timedelta(days=1))
-    two_month_start = (pd.Timestamp(target_date) - pd.DateOffset(months=2)).date()
-    trend_start = analysis_date - timedelta(days=13)
-    previous_end = analysis_date - timedelta(days=7)
-    recent_start = analysis_date - timedelta(days=6)
-
-    sold = sales.copy() if sales is not None else pd.DataFrame()
-    if sold.empty:
-        sold = pd.DataFrame(columns=["business_date", "shop_number", "sku", "sold_quantity"])
-    sold["business_date"] = pd.to_datetime(sold.get("business_date"), errors="coerce").dt.date
-    sold["shop_number"] = pd.to_numeric(sold.get("shop_number"), errors="coerce")
-    sold["sku"] = sold.get("sku", pd.Series(index=sold.index, dtype=object)).map(normalize_sku)
-    sold["sold_quantity"] = pd.to_numeric(sold.get("sold_quantity"), errors="coerce").fillna(0.0).clip(lower=0)
-    sold = sold[
-        sold["business_date"].notna()
-        & sold["shop_number"].notna()
-        & sold["sku"].notna()
-        & sold["business_date"].between(two_month_start - timedelta(days=7), analysis_date, inclusive="both")
-    ].copy()
-    sold["shop_number"] = sold["shop_number"].astype(int)
-
-    matrix_sku_category = plans[["sku", "category"]].dropna().drop_duplicates("sku", keep="last").set_index("sku")["category"].to_dict()
-    matrix_sku_entity = plans[["sku", "entity"]].dropna().drop_duplicates("sku", keep="last").set_index("sku")["entity"].to_dict()
-    sold = sold.merge(entities[["sku", "category", "entity"]], on="sku", how="left")
-    sold["category"] = sold["category"].fillna(sold["sku"].map(matrix_sku_category)).map(normalize_matrix_category)
-    sold["entity"] = sold["entity"].fillna(sold["sku"].map(matrix_sku_entity)).fillna("Не сопоставлено")
-
-    sku_window = sold[sold["business_date"].between(two_month_start, analysis_date, inclusive="both")].copy()
-    sku_daily = (
-        sku_window.groupby(["shop_number", "sku", "business_date"], as_index=False)["sold_quantity"].sum()
-        if not sku_window.empty
-        else pd.DataFrame(columns=["shop_number", "sku", "business_date", "sold_quantity"])
-    )
-    sku_daily = sku_daily[sku_daily["sold_quantity"] > 0].copy()
-    sku_stats: dict[tuple[int, str], dict[str, float]] = {}
-    if not sku_daily.empty:
-        for (shop_number, sku), group in sku_daily.groupby(["shop_number", "sku"]):
-            sku_stats[(int(shop_number), str(sku))] = {
-                "sale_days": float(group["business_date"].nunique()),
-                "sold_total": float(group["sold_quantity"].sum()),
-                "avg_sale_day": float(group["sold_quantity"].sum() / max(1, group["business_date"].nunique())),
-            }
-
-    trend_sales = sold[sold["business_date"].between(trend_start, analysis_date, inclusive="both")].copy()
-
-    def build_trend_lookup(group_columns: list[str]) -> dict[tuple, dict[str, float]]:
-        lookup: dict[tuple, dict[str, float]] = {}
-        if trend_sales.empty:
-            return lookup
-        grouped = trend_sales.groupby([*group_columns, "business_date"], as_index=False)["sold_quantity"].sum()
-        for keys, group in grouped.groupby(group_columns):
-            if not isinstance(keys, tuple):
-                keys = (keys,)
-            previous_sum = float(group.loc[group["business_date"].between(trend_start, previous_end, inclusive="both"), "sold_quantity"].sum())
-            recent_sum = float(group.loc[group["business_date"].between(recent_start, analysis_date, inclusive="both"), "sold_quantity"].sum())
-            total_14 = previous_sum + recent_sum
-            lookup[tuple(keys)] = {
-                "previous_avg": previous_sum / 7.0,
-                "recent_avg": recent_sum / 7.0,
-                "avg_14": total_14 / 14.0,
-                "trend": _plan_check_trend(recent_sum / 7.0, previous_sum / 7.0),
-            }
-        return lookup
-
-    sku_trends = build_trend_lookup(["shop_number", "sku"])
-    category_trends = build_trend_lookup(["shop_number", "category"])
-    entity_trends = build_trend_lookup(["shop_number", "category", "entity"])
-
-    freshness_lookup: dict[tuple[int, str], dict[str, float | int | str]] = {}
-    point_numbers = sorted(target["point_number"].unique().tolist())
-    freshness_start = two_month_start - timedelta(days=7)
-    historical_plans = plans[plans["plan_date"].between(freshness_start, analysis_date, inclusive="both")].copy()
-    for point_number in point_numbers:
-        shop_number = int(point_to_shop.get(int(point_number), int(point_number)))
-        point_plans = historical_plans[historical_plans["point_number"].eq(int(point_number))].copy()
-        if point_plans.empty:
-            continue
-        point_sales = sold[sold["shop_number"].eq(shop_number)].copy()
-        try:
-            freshness = build_sales_time_period(point_plans, point_sales, entities, two_month_start, analysis_date, as_of_date=analysis_date)
-        except Exception:
-            freshness = pd.DataFrame()
-        if freshness.empty:
-            continue
-        freshness["Дата отгрузки"] = pd.to_datetime(freshness["Дата отгрузки"], errors="coerce").dt.date
-        for sku, group in freshness.groupby("SKU", dropna=False):
-            sku_key = normalize_sku(sku)
-            if sku_key is None:
-                continue
-            completed_mask = group["Статус партии"].astype(str).str.startswith("Срок завершён") | group["Статус партии"].astype(str).eq("Реализована")
-            completed = group[completed_mask].copy()
-            expired = group[group["Статус партии"].astype(str).str.startswith("Срок завершён")].copy()
-            green_avg = float(pd.to_numeric(completed.get("Продано в зелёный период"), errors="coerce").fillna(0).mean()) if not completed.empty else 0.0
-            grey_avg = float(pd.to_numeric(completed.get("Продано в серый период"), errors="coerce").fillna(0).mean()) if not completed.empty else 0.0
-            expired_plan = float(pd.to_numeric(expired.get("Отгружено по плану"), errors="coerce").fillna(0).sum()) if not expired.empty else 0.0
-            expired_writeoff = float(pd.to_numeric(expired.get("Списания"), errors="coerce").fillna(0).sum()) if not expired.empty else 0.0
-            writeoff_rate = expired_writeoff / expired_plan if expired_plan > 0 else 0.0
-            green_remaining = 0
-            live_green_sales = 0.0
-            live = group[group["Статус партии"].astype(str).eq("В жизненном цикле")].sort_values("Дата отгрузки")
-            if not live.empty:
-                latest = live.iloc[-1]
-                shipment_date = latest["Дата отгрузки"]
-                green_days = int(pd.to_numeric(pd.Series([latest.get("Зелёный период, дней")]), errors="coerce").fillna(0).iloc[0])
-                if pd.notna(shipment_date):
-                    elapsed = max(0, (analysis_date - shipment_date).days)
-                    green_remaining = max(0, green_days - elapsed)
-                live_green_sales = float(pd.to_numeric(pd.Series([latest.get("Продано в зелёный период")]), errors="coerce").fillna(0).iloc[0])
-            freshness_lookup[(int(point_number), sku_key)] = {
-                "completed_batches": int(len(completed)),
-                "green_avg": green_avg,
-                "grey_avg": grey_avg,
-                "writeoff_rate": writeoff_rate,
-                "writeoff_qty": expired_writeoff,
-                "green_remaining": int(green_remaining),
-                "live_green_sales": live_green_sales,
-            }
-
-    profile_lookup: dict[int, dict[str, object]] = {}
-    if auto_unit_profiles is not None and not auto_unit_profiles.empty:
-        for _, profile in auto_unit_profiles.iterrows():
-            point_value = pd.to_numeric(pd.Series([profile.get("point_number")]), errors="coerce").iloc[0]
-            if pd.notna(point_value):
-                profile_lookup[int(point_value)] = profile.to_dict()
-    economics_lookup = build_auto_unit_period_metrics(auto_unit_daily, analysis_date, window_days=14)
-    point_price_median = (
-        target[target["unit_price"] > 0].groupby("point_number")["unit_price"].median().to_dict()
-        if "unit_price" in target.columns else {}
-    )
-
-    rows: list[dict[str, object]] = []
-    for _, item in target.iterrows():
-        point_number = int(item["point_number"])
-        shop_number = int(item["shop_number"])
-        sku = str(item["sku"])
-        category = normalize_matrix_category(item["category"])
-        entity = str(item.get("entity") or "Не сопоставлено")
-        product_name = str(item.get("product_name") or "")
-        unit_price = float(pd.to_numeric(pd.Series([item.get("unit_price", 0)]), errors="coerce").fillna(0).iloc[0])
-        current_plan = int(round(float(item["analyst_plan"])))
-        nominal_minimum = plan_check_minimum(category)
-        nominal_coverage_days = forecast_coverage_days(category)
-
-        profile = profile_lookup.get(point_number, {})
-        work_days_value = pd.to_numeric(pd.Series([profile.get("work_days_per_week")]), errors="coerce").iloc[0]
-        work_days = int(work_days_value) if pd.notna(work_days_value) else 0
-        five_day_thursday = work_days == 5 and target_date.weekday() == 3
-        minimum_applies = not five_day_thursday
-        effective_minimum = nominal_minimum if minimum_applies else 0
-        effective_coverage_days = 1 if five_day_thursday else nominal_coverage_days
-        female_dominant = bool(profile.get("female_dominant", False))
-        female_share = float(profile.get("female_top3_share", 0.0) or 0.0)
-        male_share = float(profile.get("male_top3_share", 0.0) or 0.0)
-        light_vegetable = _plan_check_light_vegetable(category, entity, product_name, light_vegetable_keywords)
-
-        stats = sku_stats.get((shop_number, sku), {})
-        sale_days = int(stats.get("sale_days", 0))
-        avg_sale_day = float(stats.get("avg_sale_day", 0.0))
-        sku_orientation = (
-            max(effective_minimum, int(math.ceil(avg_sale_day * effective_coverage_days)))
-            if avg_sale_day > 0 else effective_minimum
-        )
-
-        sku_trend = sku_trends.get((shop_number, sku), {"previous_avg": 0.0, "recent_avg": 0.0, "avg_14": 0.0, "trend": 0.0})
-        cat_trend = category_trends.get((shop_number, category), {"previous_avg": 0.0, "recent_avg": 0.0, "avg_14": 0.0, "trend": 0.0})
-        ent_trend = entity_trends.get((shop_number, category, entity), {"previous_avg": 0.0, "recent_avg": 0.0, "avg_14": 0.0, "trend": 0.0})
-        fresh = freshness_lookup.get((point_number, sku), {
-            "completed_batches": 0, "green_avg": 0.0, "grey_avg": 0.0,
-            "writeoff_rate": 0.0, "writeoff_qty": 0.0, "green_remaining": 0,
-            "live_green_sales": 0.0,
-        })
-        economics = economics_lookup.get(point_number, {})
-        avg_check_trend = float(economics.get("avg_check_trend", 0.0) or 0.0)
-        revenue_day_trend = float(economics.get("revenue_day_trend", 0.0) or 0.0)
-        avg_check_below_goal = bool(economics) and avg_check_trend < float(avg_check_growth_target)
-        revenue_below_goal = bool(economics) and revenue_day_trend < float(revenue_growth_target)
-        price_median = float(point_price_median.get(point_number, 0.0) or 0.0)
-        high_value_item = unit_price > 0 and price_median > 0 and unit_price >= price_median
-
-        # Важно: обновление идёт ОТ уже заполненного значения категорийщика.
-        recommended = current_plan
-        reasons: list[str] = []
-        checks: list[str] = []
-        if minimum_applies and current_plan < nominal_minimum:
-            recommended = nominal_minimum
-            reasons.append(f"минимум категории {nominal_minimum} шт.")
-        elif five_day_thursday:
-            checks.append("Авто Юнит: 5-дневная точка, четверг = загрузка 1 дня; нижний минимум категории отключён")
-
-        sparse_sku = sale_days < int(minimum_sale_days)
-        if sparse_sku:
-            checks.append(f"SKU: только {sale_days} дн. продаж — опора на категорию/сущность")
-
-        if int(fresh["green_remaining"]) == 1 and float(fresh["live_green_sales"]) > 0:
-            recommended += 1
-            reasons.append("+1: живая партия продаётся в зелёный период, остался 1 зелёный день")
-
-        if float(ent_trend["trend"]) >= float(trend_threshold):
-            if float(cat_trend["trend"]) > -float(trend_threshold):
-                recommended += 1
-                reasons.append(f"+1: сущность растёт {float(ent_trend['trend']) * 100:+.1f}% за 7д к предыдущим 7д")
-            else:
-                checks.append("рост сущности не подтверждён категорией")
-
-        # Авто Юнит: женская аудитория -> поддержка лёгких овощных блюд, но только без сильного встречного риска.
-        if female_dominant and light_vegetable:
-            if (
-                float(fresh["writeoff_rate"]) < float(writeoff_threshold)
-                and float(ent_trend["trend"]) > -float(trend_threshold)
-                and (avg_sale_day > 0 or float(ent_trend["recent_avg"]) > 0)
-            ):
-                recommended += 1
-                reasons.append(
-                    f"+1: Авто Юнит — в ТОП-3 аудитории преобладают женщины ({female_share * 100:.0f}% против {male_share * 100:.0f}%), лёгкое овощное блюдо"
-                )
-            else:
-                checks.append("женская аудитория поддерживает лёгкое блюдо, но падение/списания не дают автоматически увеличить")
-
-        if (
-            not sparse_sku
-            and float(sku_trend["trend"]) <= -float(trend_threshold)
-            and float(fresh["writeoff_rate"]) >= float(writeoff_threshold)
-        ):
-            recommended -= 1
-            reasons.append(f"−1: SKU падает {float(sku_trend['trend']) * 100:+.1f}% и списание {float(fresh['writeoff_rate']) * 100:.1f}%")
-
-        green_avg = float(fresh["green_avg"])
-        grey_avg = float(fresh["grey_avg"])
-        if int(fresh["completed_batches"]) > 0 and grey_avg > green_avg and green_avg > 0:
-            if five_day_thursday:
-                green_anchor_raw = green_avg / max(1, product_green_days(category))
-            else:
-                green_anchor_raw = green_avg
-            green_anchor = max(effective_minimum, int(math.ceil(green_anchor_raw)))
-            if recommended > green_anchor:
-                recommended = green_anchor
-                reasons.append(f"ориентир по зелёным продажам: серый период преобладает ({grey_avg:.1f} > {green_avg:.1f})")
-
-        if float(ent_trend["trend"]) <= -float(trend_threshold):
-            recommended -= 2
-            reasons.append(f"−2: сущность падает {float(ent_trend['trend']) * 100:+.1f}% за 7д к предыдущим 7д")
-
-        recommended = max(effective_minimum, int(round(recommended)))
-        delta = int(recommended - current_plan)
-        if delta > 0:
-            action = f"Добавить +{delta}"
-        elif delta < 0:
-            action = f"Убавить {delta}"
-        else:
-            action = "Оставить"
-
-        if current_plan >= sku_orientation + 2:
-            checks.append(f"текущий план выше SKU-ориентира {sku_orientation} шт.")
-        elif current_plan + 2 <= sku_orientation:
-            checks.append(f"текущий план ниже SKU-ориентира {sku_orientation} шт.")
-
-        economic_recommendation = "Нет данных Авто Юнит за сравнимые периоды"
-        if economics:
-            avg_check_recent = float(economics.get("avg_check_recent", 0.0) or 0.0)
-            avg_check_previous = float(economics.get("avg_check_previous", 0.0) or 0.0)
-            revenue_recent = float(economics.get("revenue_day_recent", 0.0) or 0.0)
-            revenue_previous = float(economics.get("revenue_day_previous", 0.0) or 0.0)
-            gaps: list[str] = []
-            if avg_check_below_goal:
-                gaps.append(f"ср. чек {avg_check_trend * 100:+.1f}% при цели ≥ {avg_check_growth_target * 100:+.1f}%")
-            if revenue_below_goal:
-                gaps.append(f"выручка/раб.день {revenue_day_trend * 100:+.1f}% при цели ≥ {revenue_growth_target * 100:+.1f}%")
-            if gaps:
-                if high_value_item and max(float(sku_trend["trend"]), float(ent_trend["trend"]), float(cat_trend["trend"])) >= 0 and float(fresh["writeoff_rate"]) < float(writeoff_threshold):
-                    economic_recommendation = "Поддерживать позицию: цена не ниже медианы меню, спрос не падает; может помогать росту среднего чека/дохода"
-                else:
-                    economic_recommendation = "Цель среднего чека/дохода не достигнута: увеличить стоит прежде всего растущие позиции с ценой не ниже медианы и без высокого списания"
-                checks.append("Авто Юнит: " + "; ".join(gaps))
-            else:
-                economic_recommendation = "Средний чек и выручка/раб.день соответствуют заданной цели роста"
-        else:
-            avg_check_recent = avg_check_previous = revenue_recent = revenue_previous = 0.0
-
-        strong_conflict = (
-            abs(delta) >= 2
-            or (
-                float(sku_trend["trend"]) <= -float(trend_threshold)
-                and float(fresh["writeoff_rate"]) >= float(writeoff_threshold)
-                and float(ent_trend["trend"]) <= -float(trend_threshold)
-            )
-        )
-        if strong_conflict:
-            agreement = "Красное · полное несогласие"
-        elif delta != 0 or sparse_sku or avg_check_below_goal or revenue_below_goal or (female_dominant and light_vegetable):
-            agreement = "Жёлтое · сомнение / рекомендация"
-        else:
-            agreement = "Зелёное · согласие"
-
-        if not reasons:
-            reasons.append("сигналов для изменения количества нет")
-
-        rows.append(
-            {
-                "Дата плана": target_date,
-                "День недели": WEEKDAY_RU.get(target_date.weekday(), ""),
-                "Точка": item["point"],
-                "Номер магазина": shop_number,
-                "Категория": category,
-                "Сущность": entity,
-                "SKU": sku,
-                "Название товара": product_name,
-                "Цена": round(unit_price, 2),
-                "Текущий план": current_plan,
-                "Рекомендованный план": recommended,
-                "Изменение": delta,
-                "Действие": action,
-                "Согласие системы": agreement,
-                "Минимум номинальный": nominal_minimum,
-                "Минимум действует": "Нет · четверг 5-дневной точки" if five_day_thursday else "Да",
-                "Дней покрытия проверки": effective_coverage_days,
-                "СР SKU / день продаж · 2 мес": round(avg_sale_day, 2),
-                "Дней продаж SKU · 2 мес": sale_days,
-                "Ориентир SKU × цикл": sku_orientation,
-                "Категория СР/день · 14д": round(float(cat_trend["avg_14"]), 2),
-                "Категория предыдущие 7д": round(float(cat_trend["previous_avg"]), 2),
-                "Категория последние 7д": round(float(cat_trend["recent_avg"]), 2),
-                "Тренд категории, %": round(float(cat_trend["trend"]) * 100, 1),
-                "Сущность предыдущие 7д": round(float(ent_trend["previous_avg"]), 2),
-                "Сущность последние 7д": round(float(ent_trend["recent_avg"]), 2),
-                "Тренд сущности, %": round(float(ent_trend["trend"]) * 100, 1),
-                "Тренд SKU, %": round(float(sku_trend["trend"]) * 100, 1),
-                "Зелёные продажи / партия": round(green_avg, 2),
-                "Серые продажи / партия": round(grey_avg, 2),
-                "Завершённых партий": int(fresh["completed_batches"]),
-                "Списание, %": round(float(fresh["writeoff_rate"]) * 100, 1),
-                "Списание, шт.": round(float(fresh["writeoff_qty"]), 2),
-                "Осталось зелёных дней": int(fresh["green_remaining"]),
-                "Продано в зелёном у живой партии": round(float(fresh["live_green_sales"]), 2),
-                "Авто Юнит · дней/нед": work_days if work_days else pd.NA,
-                "Авто Юнит · тип точки": str(profile.get("point_type", "")),
-                "Женская доля ТОП-3, %": round(female_share * 100, 1),
-                "Мужская доля ТОП-3, %": round(male_share * 100, 1),
-                "Женская аудитория преобладает": "Да" if female_dominant else "Нет",
-                "Лёгкое овощное блюдо": "Да" if light_vegetable else "Нет",
-                "Авто Юнит · данные по": economics.get("as_of") if economics else pd.NaT,
-                "Ср. чек · пред. 14д": round(avg_check_previous, 2),
-                "Ср. чек · посл. 14д": round(avg_check_recent, 2),
-                "Тренд ср. чека, %": round(avg_check_trend * 100, 1) if economics else pd.NA,
-                "Выручка/раб.день · пред. 14д": round(revenue_previous, 2),
-                "Выручка/раб.день · посл. 14д": round(revenue_recent, 2),
-                "Тренд выручки/раб.день, %": round(revenue_day_trend * 100, 1) if economics else pd.NA,
-                "Экономическая рекомендация": economic_recommendation,
-                "Причина": "; ".join(reasons),
-                "Контроль": "; ".join(checks),
-                "Основа при нехватке данных": "Сущность + категория" if sparse_sku else "SKU + свежесть + категория + сущность",
-                "Факт по состоянию на": analysis_date,
-            }
-        )
-
-    if not rows:
-        return pd.DataFrame()
-    result = pd.DataFrame(rows)
-    result["_point_sort"] = pd.to_numeric(result["Точка"].astype(str).str.extract(r"(\d+)", expand=False), errors="coerce")
-    return result.sort_values(["_point_sort", "Категория", "Сущность", "Название товара"], kind="stable").drop(columns="_point_sort").reset_index(drop=True)
-
-
-def ready_plan_check_excel(
-    result: pd.DataFrame,
-    target_date: date,
-    trend_threshold: float,
-    writeoff_threshold: float,
-    minimum_sale_days: int,
-    avg_check_growth_target: float = 0.05,
-    revenue_growth_target: float = 0.05,
-    light_vegetable_keywords: tuple[str, ...] | list[str] = PLAN_CHECK_LIGHT_VEGETABLE_DEFAULT,
-) -> bytes:
-    buffer = io.BytesIO()
-    rules = pd.DataFrame(
-        [
-            ["База", "Текущее значение матрицы", "Все изменения считаются только от уже заполненного плана категорийщика"],
-            ["SKU", "Среднее за 2 календарных месяца", "Среднее только по фактическим дням продаж SKU"],
-            ["Свежесть", "FIFO по факту продаж", "Зелёные/серые продажи и списание завершённых партий"],
-            ["Категория", "14 дней", "Последние 7 дней сравниваются с предыдущими 7 днями"],
-            ["Сущность", "Fallback / контроль", "Используется при нехватке данных SKU и как сигнал роста/падения"],
-            ["Добавить", "+1", "Продажи в зелёном + у живой партии остался 1 зелёный день"],
-            ["Добавить", "+1", f"Рост сущности не менее {trend_threshold * 100:.0f}% и категория не падает"],
-            ["Авто Юнит", "+1", "Если в ТОП-3 преобладает женская аудитория и SKU — лёгкое овощное блюдо без встречного риска"],
-            ["Убавить", "−1", f"Падение SKU не менее {trend_threshold * 100:.0f}% + списание не менее {writeoff_threshold * 100:.0f}%"],
-            ["Убавить", "Ориентир зелёных продаж", "Если продажи серого периода преобладают"],
-            ["Убавить", "−2", f"Падение сущности не менее {trend_threshold * 100:.0f}%"],
-            ["Минимум", "3", "Вторые блюда"],
-            ["Минимум", "5", "Напитки"],
-            ["Минимум", "1", "Япония"],
-            ["Минимум", "2", "Остальные категории"],
-            ["Авто Юнит · 5 дней", "Четверг = 1 день", "В четверг нижний минимум категории не применяется; цикл проверки = 1 день"],
-            ["Экономика", f"Ср. чек цель ≥ {avg_check_growth_target * 100:+.1f}%", "Сравниваются последние 14 дней с предыдущими 14 днями"],
-            ["Экономика", f"Выручка/раб.день цель ≥ {revenue_growth_target * 100:+.1f}%", "При недостижении цели система выделяет позиции, способные поддержать чек/доход"],
-            ["Цвет", "Зелёный", "Система согласна с текущим значением"],
-            ["Цвет", "Жёлтый", "Есть сомнение, нехватка данных или рекомендация ±1"],
-            ["Цвет", "Красный", "Полное несогласие: сильный конфликт или изменение минимум на 2 шт."],
-            ["Недостаточно данных SKU", f"< {minimum_sale_days} дней", "Основной fallback — сущность + категория"],
-        ],
-        columns=["Блок", "Правило", "Описание"],
-    )
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        result.to_excel(writer, index=False, sheet_name="Проверка")
-        rules.to_excel(writer, index=False, sheet_name="Логика")
-        pd.DataFrame(
-            {
-                "Параметр": [
-                    "Дата плана", "Порог тренда", "Большое списание", "Минимум дней продаж SKU",
-                    "Цель роста среднего чека", "Цель роста выручки/раб.день", "Ключи лёгких овощных блюд",
-                ],
-                "Значение": [
-                    target_date.strftime("%d.%m.%Y"),
-                    f"{trend_threshold * 100:.0f}%",
-                    f"{writeoff_threshold * 100:.0f}%",
-                    int(minimum_sale_days),
-                    f"{avg_check_growth_target * 100:+.1f}%",
-                    f"{revenue_growth_target * 100:+.1f}%",
-                    ", ".join(light_vegetable_keywords),
-                ],
-            }
-        ).to_excel(writer, index=False, sheet_name="Параметры")
-        auto_columns = [
-            "Точка", "Авто Юнит · дней/нед", "Авто Юнит · тип точки", "Женская доля ТОП-3, %",
-            "Мужская доля ТОП-3, %", "Женская аудитория преобладает", "Авто Юнит · данные по",
-            "Ср. чек · пред. 14д", "Ср. чек · посл. 14д", "Тренд ср. чека, %",
-            "Выручка/раб.день · пред. 14д", "Выручка/раб.день · посл. 14д", "Тренд выручки/раб.день, %",
-        ]
-        auto_columns = [column for column in auto_columns if column in result.columns]
-        if auto_columns:
-            result[auto_columns].drop_duplicates("Точка").to_excel(writer, index=False, sheet_name="Авто Юнит точки")
-
-        green_fill = PatternFill("solid", fgColor="D9EAD3")
-        yellow_fill = PatternFill("solid", fgColor="FFF2CC")
-        red_fill = PatternFill("solid", fgColor="F4CCCC")
-        for sheet in writer.book.worksheets:
-            sheet.freeze_panes = "A2"
-            sheet.auto_filter.ref = sheet.dimensions
-            for cells in sheet.columns:
-                width = min(max(len(str(cell.value or "")) for cell in cells) + 2, 52)
-                sheet.column_dimensions[cells[0].column_letter].width = width
-        check_sheet = writer.book["Проверка"]
-        header_map = {str(cell.value): cell.column for cell in check_sheet[1] if cell.value is not None}
-        agreement_col = header_map.get("Согласие системы")
-        if agreement_col:
-            for row_number in range(2, check_sheet.max_row + 1):
-                status = str(check_sheet.cell(row_number, agreement_col).value or "")
-                fill = red_fill if status.startswith("Красное") else yellow_fill if status.startswith("Жёлтое") else green_fill
-                for cell in check_sheet[row_number]:
-                    cell.fill = fill
-    return buffer.getvalue()
-
-
 def export_excel(
     sku_point: pd.DataFrame,
     category_profile: pd.DataFrame,
@@ -5441,8 +4520,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.11.1 · PLAN EXPORT PERIOD")
-    st.caption("Автозагрузка данных · SEPARATE-MENU")
+    st.caption("Аналитика спроса · версия 75.7.5")
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
         pg_host = st.text_input(
             "Сервер",
@@ -5470,7 +4548,6 @@ with st.sidebar:
             forget_remembered_pg_credentials()
             os.environ.pop("PGPASSWORD", None)
             st.session_state.pop("analysis", None)
-            st.session_state.pop("analysis_auto_signature_v7590", None)
             st.success("Сохранённый пароль удалён. При следующем подключении введите его снова.")
             st.rerun()
     date_range = st.date_input(
@@ -5478,10 +4555,9 @@ with st.sidebar:
         value=(previous_month_start, previous_month_end),
         max_value=today,
         format="DD.MM.YYYY",
-        key="main_period_v7590",
     )
-    auto_status = st.empty()
-    auto_status.caption("Точки и продажи загружаются автоматически.")
+    find_button = st.button("1. Найти магазины в базе", use_container_width=True)
+    load_button = st.button("2. Загрузить продажи", type="primary", use_container_width=True)
 
 os.environ["PGHOST"] = pg_host.strip()
 os.environ["PGPORT"] = str(int(pg_port))
@@ -5490,338 +4566,131 @@ os.environ["PGUSER"] = pg_user.strip()
 os.environ["PGPASSWORD"] = pg_password
 
 valid_period = isinstance(date_range, tuple) and len(date_range) == 2
-if not valid_period:
-    auto_status.warning("Выберите дату начала и дату окончания.")
-    st.info("Укажите полный период — после этого точки и продажи загрузятся автоматически.")
-    st.stop()
-
-start_date, end_date = date_range
-if start_date > end_date:
-    auto_status.warning("Дата начала позже даты окончания.")
-    st.error("Дата начала периода не может быть позже даты окончания.")
-    st.stop()
-
-# Автозагрузка выполняется только при изменении периода/подключения либо раз в 15 минут.
-# Обычные переходы по разделам используют уже подготовленный analysis из session_state.
-password_signature = (
-    hashlib.sha256(pg_password.encode("utf-8")).hexdigest()[:12]
-    if pg_password else "no-password"
-)
-refresh_bucket = int(datetime.now().timestamp() // (15 * 60))
-auto_signature = (
-    start_date.isoformat(),
-    end_date.isoformat(),
-    pg_host.strip(),
-    int(pg_port),
-    pg_database.strip(),
-    pg_user.strip(),
-    password_signature,
-    refresh_bucket,
-)
-
-analysis_needs_refresh = (
-    "analysis" not in st.session_state
-    or st.session_state.get("analysis_auto_signature_v7590") != auto_signature
-)
-
-if analysis_needs_refresh:
+if find_button:
+    if not valid_period:
+        st.error("Выберите дату начала и дату окончания.")
+        st.stop()
+    start_date, end_date = date_range
     try:
-        with st.spinner("Автоматически загружаю точки и продажи из PostgreSQL…"):
-            available_shops = ensure_required_shops(
-                load_available_shops(start_date, end_date + timedelta(days=1))
-            )
-            if available_shops.empty:
-                raise RuntimeError("за выбранный период база не вернула магазины")
-
-            # Рабочая сетка: Т1–Т29, Т11 исключена. Т25 добавляется обязательным правилом выше.
-            selected = available_shops.copy()
-            selected["shop_number"] = pd.to_numeric(selected["shop_number"], errors="coerce")
-            selected = selected[
-                selected["shop_number"].notna()
-                & selected["shop_number"].between(1, 29)
-                & selected["shop_number"].ne(11)
-            ].copy()
-            selected["shop_number"] = selected["shop_number"].astype(int)
-            selected = selected.drop_duplicates("shop_number").sort_values("shop_number")
-
-            if selected.empty:
-                raise RuntimeError("не найдены рабочие точки Т1–Т29")
-
-            selected_shop_numbers = tuple(selected["shop_number"].tolist())
-            point_mapping = {number: f"Т{number}" for number in selected_shop_numbers}
-            sales = load_sales(
-                start_date,
-                end_date + timedelta(days=1),
-                selected_shop_numbers,
-            )
-            if sales.empty:
-                raise RuntimeError("за выбранный период продаж не найдено")
-
-            st.session_state["analysis"] = prepare_analysis(sales, entities, point_mapping)
-            st.session_state["period"] = (start_date, end_date)
-            st.session_state["point_mapping"] = point_mapping
-            st.session_state["analysis_auto_signature_v7590"] = auto_signature
-            st.session_state["auto_loaded_shops_v7590"] = selected_shop_numbers
-            # Старое ручное сопоставление больше не управляет новой навигацией/автозагрузкой.
-            st.session_state.pop("shop_mapping", None)
-
-        if remember_connection:
-            try:
-                remembered_until = save_remembered_pg_credentials(
-                    pg_host, int(pg_port), pg_database, pg_user, pg_password
-                )
-                st.toast(f"Пароль запомнен до {remembered_until:%d.%m.%Y}", icon="🔐")
-            except Exception as error:
-                st.warning(f"Данные загружены, но пароль не удалось запомнить: {error}")
-        elif REMEMBERED_PG_FILE.exists():
-            forget_remembered_pg_credentials()
-
-        auto_status.success(
-            f"Автозагрузка завершена: {len(selected_shop_numbers)} точек · "
-            f"{start_date:%d.%m.%Y}–{end_date:%d.%m.%Y}"
+        available_shops = ensure_required_shops(
+            load_available_shops(start_date, end_date + timedelta(days=1))
         )
     except Exception as error:
-        auto_status.error("Автозагрузка не выполнена.")
-        st.error(f"Не удалось автоматически загрузить данные: {error}")
+        st.error(f"Не удалось получить список магазинов: {error}")
         st.stop()
-else:
-    cached_points = tuple(st.session_state.get("auto_loaded_shops_v7590", ()))
-    auto_status.success(
-        f"Данные готовы: {len(cached_points)} точек · "
-        f"{start_date:%d.%m.%Y}–{end_date:%d.%m.%Y}"
+    if remember_connection:
+        try:
+            remembered_until = save_remembered_pg_credentials(
+                pg_host, int(pg_port), pg_database, pg_user, pg_password
+            )
+            st.toast(f"Пароль запомнен до {remembered_until:%d.%m.%Y}", icon="🔐")
+        except Exception as error:
+            st.warning(f"Подключение работает, но пароль не удалось запомнить: {error}")
+    elif REMEMBERED_PG_FILE.exists():
+        forget_remembered_pg_credentials()
+    if available_shops.empty:
+        st.warning("За выбранный период база не вернула ни одного магазина. Проверьте даты.")
+    else:
+        mapping = available_shops.copy()
+        mapping.insert(0, "Использовать", True)
+        mapping.insert(2, "Название точки", mapping["shop_number"].map(lambda value: f"Т{int(value)}"))
+        st.session_state["shop_mapping"] = mapping
+
+edited_mapping = None
+if "shop_mapping" in st.session_state:
+    required_mapping = ensure_required_shops(st.session_state["shop_mapping"])
+    for shop_number, point_name in REQUIRED_POINT_SHOPS.items():
+        required_mask = pd.to_numeric(
+            required_mapping["shop_number"], errors="coerce"
+        ).eq(shop_number)
+        required_mapping.loc[required_mask, "Использовать"] = True
+        required_mapping.loc[required_mask, "Название точки"] = point_name
+    st.session_state["shop_mapping"] = required_mapping
+    st.subheader("Соответствие магазинов и точек")
+    st.caption("Проверьте столбец «Название точки». Оставьте галочку только у точек Т; столовые, ФСПК и точки Ф отключите.")
+    edited_mapping = st.data_editor(
+        st.session_state["shop_mapping"],
+        hide_index=True,
+        use_container_width=True,
+        disabled=["shop_number", "receipts", "sold_quantity", "first_sale_date", "last_sale_date"],
+        column_config={
+            "Использовать": st.column_config.CheckboxColumn("Использовать"),
+            "shop_number": st.column_config.NumberColumn("Номер магазина", format="%d"),
+            "Название точки": st.column_config.TextColumn("Название точки"),
+            "receipts": st.column_config.NumberColumn("Количество чеков", format="%d"),
+            "sold_quantity": st.column_config.NumberColumn("Продано, шт.", format="%.0f"),
+            "first_sale_date": st.column_config.DateColumn("Первая продажа", format="DD.MM.YYYY"),
+            "last_sale_date": st.column_config.DateColumn("Последняя продажа", format="DD.MM.YYYY"),
+        },
+        key="mapping_editor",
     )
 
+if load_button:
+    if not valid_period:
+        st.error("Выберите дату начала и дату окончания.")
+        st.stop()
+    if edited_mapping is None:
+        st.error("Сначала нажмите «1. Найти магазины в базе».")
+        st.stop()
+    selected = edited_mapping[edited_mapping["Использовать"]].copy()
+    if selected.empty:
+        st.error("Отметьте хотя бы одну точку.")
+        st.stop()
+    selected["Название точки"] = selected["Название точки"].astype(str).str.strip()
+    selected = selected[selected["Название точки"].str.match(r"^Т\d+$", na=False)]
+    if selected.empty:
+        st.error("Для выбранных строк задайте названия в формате Т1, Т2 … Т29.")
+        st.stop()
+    start_date, end_date = date_range
+    for shop_number, point_name in REQUIRED_POINT_SHOPS.items():
+        if shop_number not in selected["shop_number"].astype(int).tolist():
+            selected = pd.concat(
+                [
+                    selected,
+                    pd.DataFrame(
+                        [{
+                            "Использовать": True,
+                            "shop_number": shop_number,
+                            "Название точки": point_name,
+                            "receipts": 0,
+                            "sold_quantity": 0.0,
+                            "first_sale_date": pd.NaT,
+                            "last_sale_date": pd.NaT,
+                        }]
+                    ),
+                ],
+                ignore_index=True,
+            )
+    selected_shop_numbers = tuple(selected["shop_number"].astype(int).tolist())
+    point_mapping = dict(zip(selected["shop_number"].astype(int), selected["Название точки"]))
+    try:
+        sales = load_sales(start_date, end_date + timedelta(days=1), selected_shop_numbers)
+    except Exception as error:
+        st.error(f"Не удалось получить данные: {error}")
+        st.stop()
+    if sales.empty:
+        st.warning("За выбранный период продаж не найдено.")
+        st.stop()
+    st.session_state["analysis"] = prepare_analysis(sales, entities, point_mapping)
+    st.session_state["period"] = (start_date, end_date)
+    st.session_state["point_mapping"] = point_mapping
+    if remember_connection:
+        try:
+            remembered_until = save_remembered_pg_credentials(
+                pg_host, int(pg_port), pg_database, pg_user, pg_password
+            )
+            st.toast(f"Пароль запомнен до {remembered_until:%d.%m.%Y}", icon="🔐")
+        except Exception as error:
+            st.warning(f"Продажи загружены, но пароль не удалось запомнить: {error}")
+    elif REMEMBERED_PG_FILE.exists():
+        forget_remembered_pg_credentials()
+
 if "analysis" not in st.session_state:
-    st.info("Данные ещё не подготовлены.")
+    st.info("Сначала найдите магазины, сопоставьте их с Т1–Т29, затем загрузите продажи.")
     st.stop()
 
 sku_point, category_profile, entity_profile, daily_detail = st.session_state["analysis"]
 period = st.session_state["period"]
-
-MENU_ITEMS = [
-    ("Дашборд", ":material/dashboard:"),
-    ("Отчет", ":material/description:"),
-    ("Топ-3 сущности", ":material/account_tree:"),
-    ("Сущности", ":material/storefront:"),
-    ("Детализация", ":material/pie_chart:"),
-    ("Детализация категории", ":material/sell:"),
-    ("ABC продукции", ":material/inventory_2:"),
-    ("Анализ категории", ":material/bar_chart:"),
-    ("Окно свежести", ":material/calendar_month:"),
-    ("Списания категорий", ":material/delete:"),
-    ("Прогноз плана", ":material/track_changes:"),
-    ("Проверка", ":material/fact_check:"),
-]
-SECTION_STATE_KEY = "main_section_v759"
-MENU_LABELS = [label for label, _ in MENU_ITEMS]
-
-
-def _open_main_section(label: str) -> None:
-    if label in MENU_LABELS:
-        st.session_state[SECTION_STATE_KEY] = label
-        # Оставляем старый ключ только как совместимость для уже существующих session_state.
-        st.session_state["main_tabs_v1"] = label
-
-
-def _return_to_main_menu() -> None:
-    st.session_state[SECTION_STATE_KEY] = None
-
-
-selected_main_section = st.session_state.get(SECTION_STATE_KEY)
-if selected_main_section not in MENU_LABELS:
-    selected_main_section = None
-    st.session_state[SECTION_STATE_KEY] = None
-
-st.markdown(
-    """
-<style>
-:root {
-    --vk-red: #e42f35;
-    --vk-ink: #222327;
-    --vk-muted: #7b7d84;
-    --vk-shell: #f1f1f3;
-    --vk-card: #ffffff;
-    --vk-line: #e3e3e7;
-}
-.vk-menu-header {
-    position: relative;
-    margin: 18px 0 0 0;
-    padding: 28px 24px 18px 24px;
-    background: var(--vk-shell);
-    border-radius: 28px 28px 0 0;
-    text-align: center;
-}
-.vk-menu-brand {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    color: var(--vk-ink);
-    font-size: clamp(23px, 2.15vw, 34px);
-    line-height: 1.1;
-    font-weight: 760;
-    letter-spacing: -0.035em;
-}
-.vk-menu-brand svg { width: 34px; height: 34px; flex: 0 0 auto; }
-.vk-menu-subtitle {
-    margin-top: 8px;
-    color: #8a8c92;
-    font-size: 13px;
-    font-weight: 450;
-    letter-spacing: .01em;
-}
-.vk-menu-actions {
-    position: absolute;
-    top: 15px;
-    right: 18px;
-    display: flex;
-    gap: 7px;
-}
-.vk-menu-actions span {
-    width: 25px;
-    height: 25px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid #d6d7db;
-    border-radius: 999px;
-    color: #666970;
-    background: rgba(255,255,255,.55);
-    font-size: 11px;
-    font-weight: 700;
-    user-select: none;
-}
-.st-key-main_menu_cards_v759 {
-    padding: 10px 26px 30px 26px;
-    background: var(--vk-shell);
-    border-radius: 0 0 28px 28px;
-}
-.st-key-main_menu_cards_v759 div[data-testid="stButton"] > button {
-    width: 100%;
-    min-height: 112px;
-    margin: 0;
-    padding: 16px 12px 14px 12px;
-    border: 1px solid var(--vk-line);
-    border-radius: 12px;
-    background: var(--vk-card);
-    box-shadow: 0 5px 13px rgba(25, 27, 34, .10);
-    color: var(--vk-ink);
-    font-size: 14px;
-    font-weight: 650;
-    transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease;
-    white-space: normal;
-}
-.st-key-main_menu_cards_v759 div[data-testid="stButton"] > button:hover {
-    transform: translateY(-2px);
-    border-color: #d0d1d5;
-    box-shadow: 0 8px 19px rgba(25, 27, 34, .13);
-    color: #b72228;
-}
-.st-key-section_header_v759 {
-    padding: 8px 0 4px 0;
-    border-bottom: 1px solid #ececef;
-    margin-bottom: 12px;
-}
-.vk-current-section {
-    min-height: 40px;
-    display: flex;
-    align-items: center;
-    font-size: 21px;
-    font-weight: 760;
-    color: var(--vk-ink);
-}
-.vk-footer-brand {
-    margin: 42px 0 16px 0;
-    text-align: center;
-    color: var(--vk-red);
-    font-weight: 900;
-    font-size: clamp(30px, 4vw, 58px);
-    line-height: 1;
-    letter-spacing: -.04em;
-}
-@media (max-width: 620px) {
-    .vk-menu-header { padding-top: 52px; }
-    .vk-menu-actions { left: 50%; right: auto; transform: translateX(-50%); }
-    .st-key-main_menu_cards_v759 { padding-left: 16px; padding-right: 16px; }
-    .st-key-main_menu_cards_v759 div[data-testid="stButton"] > button { min-height: 90px; }
-}
-</style>
-    """,
-    unsafe_allow_html=True,
-)
-
-if selected_main_section is None:
-    st.markdown(
-        """
-<div class="vk-menu-header">
-    <div class="vk-menu-actions" aria-hidden="true"><span>i</span><span>◐</span><span>A</span></div>
-    <div class="vk-menu-brand">
-        <svg viewBox="0 0 34 34" fill="none" aria-hidden="true">
-            <path d="M4 27V22M9 27V17M14 27V20M19 27V11M24 27V15M29 27V6" stroke="#e42f35" stroke-width="2.7" stroke-linecap="round"/>
-            <path d="M4 18L10 14L15 16L21 8L26 11L30 4" stroke="#e42f35" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <span>Аналитика спроса</span>
-    </div>
-    <div class="vk-menu-subtitle">Анализируйте. Принимайте решения. Достигайте результата.</div>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    with st.container(key="main_menu_cards_v759"):
-        first_row = st.columns(4)
-        for column, (label, icon) in zip(first_row, MENU_ITEMS[:4]):
-            with column:
-                st.button(
-                    label,
-                    key=f"main_menu_card_v759_{MENU_LABELS.index(label)}",
-                    icon=icon,
-                    use_container_width=True,
-                    on_click=_open_main_section,
-                    args=(label,),
-                )
-        second_row = st.columns(4)
-        for column, (label, icon) in zip(second_row, MENU_ITEMS[4:8]):
-            with column:
-                st.button(
-                    label,
-                    key=f"main_menu_card_v759_{MENU_LABELS.index(label)}",
-                    icon=icon,
-                    use_container_width=True,
-                    on_click=_open_main_section,
-                    args=(label,),
-                )
-        third_row = st.columns(4)
-        for column, (label, icon) in zip(third_row, MENU_ITEMS[8:12]):
-            with column:
-                st.button(
-                    label,
-                    key=f"main_menu_card_v759_{MENU_LABELS.index(label)}",
-                    icon=icon,
-                    use_container_width=True,
-                    on_click=_open_main_section,
-                    args=(label,),
-                )
-    st.markdown('<div class="vk-footer-brand">ВКУСНО МАРКЕТ</div>', unsafe_allow_html=True)
-    st.stop()
-
-with st.container(key="section_header_v759"):
-    section_header_columns = st.columns([1.15, 4.85])
-    with section_header_columns[0]:
-        st.button(
-            "В главное меню",
-            key="return_to_main_menu_v759",
-            icon=":material/arrow_back:",
-            use_container_width=True,
-            on_click=_return_to_main_menu,
-        )
-    with section_header_columns[1]:
-        st.markdown(
-            f'<div class="vk-current-section">{selected_main_section}</div>',
-            unsafe_allow_html=True,
-        )
-
-# Совместимость с внутренними участками, которые могут читать прежний ключ навигации.
-st.session_state["main_tabs_v1"] = selected_main_section
 
 categories = sorted(category_profile["category"].unique())
 filter_columns = st.columns(2)
@@ -5974,26 +4843,18 @@ def _load_detail_plan_for_active_tab() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-class _MainSection:
-    """Совместимый контекст раздела без создания нативной полосы st.tabs."""
+st.markdown('\n<style>\n:root {\n    --vk-red: #e42f35;\n    --vk-ink: #222327;\n    --vk-muted: #7b7d84;\n    --vk-shell: #f1f1f3;\n    --vk-card: #ffffff;\n    --vk-line: #e3e3e7;\n}\n.vk-menu-header {\n    position: relative;\n    margin: 18px 0 0 0;\n    padding: 24px 24px 13px 24px;\n    background: var(--vk-shell);\n    border-radius: 28px 28px 0 0;\n    text-align: center;\n}\n.vk-menu-brand {\n    display: inline-flex;\n    align-items: center;\n    justify-content: center;\n    gap: 10px;\n    color: var(--vk-ink);\n    font-size: clamp(23px, 2.15vw, 34px);\n    line-height: 1.1;\n    font-weight: 760;\n    letter-spacing: -0.035em;\n}\n.vk-menu-brand svg { width: 34px; height: 34px; flex: 0 0 auto; }\n.vk-menu-subtitle {\n    margin-top: 8px;\n    color: #8a8c92;\n    font-size: 13px;\n    font-weight: 450;\n    letter-spacing: .01em;\n}\n.vk-menu-actions {\n    position: absolute;\n    top: 15px;\n    right: 18px;\n    display: flex;\n    gap: 7px;\n}\n.vk-menu-actions span {\n    width: 25px;\n    height: 25px;\n    display: inline-flex;\n    align-items: center;\n    justify-content: center;\n    border: 1px solid #d6d7db;\n    border-radius: 999px;\n    color: #666970;\n    background: rgba(255,255,255,.55);\n    font-size: 11px;\n    font-weight: 700;\n    user-select: none;\n}\n.st-key-main_tabs_v1 [data-baseweb="tab-list"],\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) [data-baseweb="tab-list"] {\n    display: grid !important;\n    grid-template-columns: repeat(8, minmax(0, 1fr)) !important;\n    gap: 15px !important;\n    width: 100% !important;\n    padding: 10px 26px 30px 26px !important;\n    margin: 0 !important;\n    background: var(--vk-shell) !important;\n    border-radius: 0 0 28px 28px !important;\n    overflow: visible !important;\n    box-sizing: border-box !important;\n}\n.st-key-main_tabs_v1 button[role="tab"],\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"] {\n    position: relative !important;\n    grid-column: span 2;\n    width: 100% !important;\n    min-width: 0 !important;\n    min-height: 112px !important;\n    height: auto !important;\n    margin: 0 !important;\n    padding: 16px 12px 14px 12px !important;\n    display: flex !important;\n    flex-direction: column !important;\n    align-items: center !important;\n    justify-content: center !important;\n    gap: 8px !important;\n    border: 1px solid var(--vk-line) !important;\n    border-radius: 12px !important;\n    background: var(--vk-card) !important;\n    box-shadow: 0 5px 13px rgba(25, 27, 34, .10) !important;\n    color: var(--vk-ink) !important;\n    transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease !important;\n    white-space: normal !important;\n    overflow: visible !important;\n}\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(9),\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(9) {\n    grid-column: 2 / span 2;\n}\n.st-key-main_tabs_v1 button[role="tab"]::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]::before {\n    content: "";\n    display: block;\n    width: 30px;\n    height: 30px;\n    flex: 0 0 30px;\n    background-color: #25262a;\n    -webkit-mask-repeat: no-repeat;\n    mask-repeat: no-repeat;\n    -webkit-mask-position: center;\n    mask-position: center;\n    -webkit-mask-size: contain;\n    mask-size: contain;\n    transition: background-color .16s ease, transform .16s ease;\n}\n.st-key-main_tabs_v1 button[role="tab"] p,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"] p {\n    margin: 0 !important;\n    text-align: center !important;\n    color: inherit !important;\n    font-size: 14px !important;\n    line-height: 1.22 !important;\n    font-weight: 650 !important;\n}\n.st-key-main_tabs_v1 button[role="tab"]:hover,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:hover {\n    transform: translateY(-2px) !important;\n    border-color: #d0d1d5 !important;\n    box-shadow: 0 8px 19px rgba(25, 27, 34, .13) !important;\n}\n.st-key-main_tabs_v1 button[role="tab"][aria-selected="true"],\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"][aria-selected="true"] {\n    color: #b72228 !important;\n    border-color: rgba(228,47,53,.44) !important;\n    box-shadow: 0 8px 20px rgba(228,47,53,.12), 0 4px 10px rgba(25,27,34,.08) !important;\n}\n.st-key-main_tabs_v1 button[role="tab"][aria-selected="true"]::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"][aria-selected="true"]::before {\n    background-color: var(--vk-red) !important;\n    transform: scale(1.04);\n}\n.st-key-main_tabs_v1 [data-baseweb="tab-highlight"],\n.st-key-main_tabs_v1 [data-baseweb="tab-border"],\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) [data-baseweb="tab-highlight"],\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) [data-baseweb="tab-border"] {\n    display: none !important;\n}\n.vk-footer-brand {\n    margin: 42px 0 16px 0;\n    text-align: center;\n    color: var(--vk-red);\n    font-weight: 900;\n    font-size: clamp(30px, 4vw, 58px);\n    line-height: 1;\n    letter-spacing: -.04em;\n}\n@media (max-width: 950px) {\n    .st-key-main_tabs_v1 [data-baseweb="tab-list"],\n    div[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) [data-baseweb="tab-list"] {\n        grid-template-columns: repeat(4, minmax(0, 1fr)) !important;\n    }\n    .st-key-main_tabs_v1 button[role="tab"],\n    div[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"] { grid-column: span 2; }\n    .st-key-main_tabs_v1 button[role="tab"]:nth-of-type(9),\n    div[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(9) { grid-column: span 2; }\n}\n@media (max-width: 620px) {\n    .vk-menu-header { padding-top: 52px; }\n    .vk-menu-actions { left: 50%; right: auto; transform: translateX(-50%); }\n    .st-key-main_tabs_v1 [data-baseweb="tab-list"],\n    div[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) [data-baseweb="tab-list"] {\n        grid-template-columns: 1fr !important;\n        padding-left: 16px !important;\n        padding-right: 16px !important;\n    }\n    .st-key-main_tabs_v1 button[role="tab"],\n    div[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"],\n    .st-key-main_tabs_v1 button[role="tab"]:nth-of-type(9),\n    div[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(9) {\n        grid-column: 1 !important;\n        min-height: 94px !important;\n    }\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(1)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(1)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Crect%20x%3D%274%27%20y%3D%274%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3Crect%20x%3D%2714%27%20y%3D%274%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3Crect%20x%3D%274%27%20y%3D%2714%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3Crect%20x%3D%2714%27%20y%3D%2714%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Crect%20x%3D%274%27%20y%3D%274%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3Crect%20x%3D%2714%27%20y%3D%274%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3Crect%20x%3D%274%27%20y%3D%2714%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3Crect%20x%3D%2714%27%20y%3D%2714%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(2)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(2)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M6%203h9l3%203v15H6z%27%2F%3E%3Cpath%20d%3D%27M15%203v4h4%27%2F%3E%3Cpath%20d%3D%27M9%2011h6M9%2015h6M9%2019h4%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M6%203h9l3%203v15H6z%27%2F%3E%3Cpath%20d%3D%27M15%203v4h4%27%2F%3E%3Cpath%20d%3D%27M9%2011h6M9%2015h6M9%2019h4%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(3)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(3)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Ccircle%20cx%3D%2712%27%20cy%3D%275%27%20r%3D%272.2%27%2F%3E%3Ccircle%20cx%3D%276%27%20cy%3D%2718%27%20r%3D%272.2%27%2F%3E%3Ccircle%20cx%3D%2718%27%20cy%3D%2718%27%20r%3D%272.2%27%2F%3E%3Cpath%20d%3D%27M12%207.3v4M6%2015.8v-3h12v3%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Ccircle%20cx%3D%2712%27%20cy%3D%275%27%20r%3D%272.2%27%2F%3E%3Ccircle%20cx%3D%276%27%20cy%3D%2718%27%20r%3D%272.2%27%2F%3E%3Ccircle%20cx%3D%2718%27%20cy%3D%2718%27%20r%3D%272.2%27%2F%3E%3Cpath%20d%3D%27M12%207.3v4M6%2015.8v-3h12v3%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(4)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(4)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M5%2020V8l7-4%207%204v12%27%2F%3E%3Cpath%20d%3D%27M9%2020v-5h6v5M8%2010h.01M12%2010h.01M16%2010h.01%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M5%2020V8l7-4%207%204v12%27%2F%3E%3Cpath%20d%3D%27M9%2020v-5h6v5M8%2010h.01M12%2010h.01M16%2010h.01%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(5)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(5)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M11%203a9%209%200%201%200%209%209h-9z%27%2F%3E%3Cpath%20d%3D%27M14%203.4A9%209%200%200%201%2020.6%2010H14z%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M11%203a9%209%200%201%200%209%209h-9z%27%2F%3E%3Cpath%20d%3D%27M14%203.4A9%209%200%200%201%2020.6%2010H14z%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(6)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(6)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M4%207.5V4h3.5L20%2016.5%2016.5%2020%204%207.5z%27%2F%3E%3Ccircle%20cx%3D%277.2%27%20cy%3D%277.2%27%20r%3D%271%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M4%207.5V4h3.5L20%2016.5%2016.5%2020%204%207.5z%27%2F%3E%3Ccircle%20cx%3D%277.2%27%20cy%3D%277.2%27%20r%3D%271%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(7)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(7)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M12%203%2020%207.5v9L12%2021l-8-4.5v-9z%27%2F%3E%3Cpath%20d%3D%27m4%207.5%208%204.5%208-4.5M12%2012v9%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M12%203%2020%207.5v9L12%2021l-8-4.5v-9z%27%2F%3E%3Cpath%20d%3D%27m4%207.5%208%204.5%208-4.5M12%2012v9%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(8)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(8)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M4%2020h16M6%2017v-5M11%2017V8M16%2017V4M20%2017v-8%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M4%2020h16M6%2017v-5M11%2017V8M16%2017V4M20%2017v-8%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(9)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(9)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Crect%20x%3D%273%27%20y%3D%275%27%20width%3D%2718%27%20height%3D%2716%27%20rx%3D%272%27%2F%3E%3Cpath%20d%3D%27M7%203v4M17%203v4M3%2010h18%27%2F%3E%3Cpath%20d%3D%27M8%2014h.01M12%2014h.01M16%2014h.01M8%2018h.01M12%2018h.01%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Crect%20x%3D%273%27%20y%3D%275%27%20width%3D%2718%27%20height%3D%2716%27%20rx%3D%272%27%2F%3E%3Cpath%20d%3D%27M7%203v4M17%203v4M3%2010h18%27%2F%3E%3Cpath%20d%3D%27M8%2014h.01M12%2014h.01M16%2014h.01M8%2018h.01M12%2018h.01%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(10)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(10)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M4%207h16M9%207V4h6v3M7%207l1%2014h8l1-14M10%2011v6M14%2011v6%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M4%207h16M9%207V4h6v3M7%207l1%2014h8l1-14M10%2011v6M14%2011v6%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(11)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(11)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Ccircle%20cx%3D%2712%27%20cy%3D%2712%27%20r%3D%278%27%2F%3E%3Ccircle%20cx%3D%2712%27%20cy%3D%2712%27%20r%3D%274%27%2F%3E%3Cpath%20d%3D%27M12%2012%2018%206M16%206h2v2%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Ccircle%20cx%3D%2712%27%20cy%3D%2712%27%20r%3D%278%27%2F%3E%3Ccircle%20cx%3D%2712%27%20cy%3D%2712%27%20r%3D%274%27%2F%3E%3Cpath%20d%3D%27M12%2012%2018%206M16%206h2v2%27%2F%3E%3C%2Fsvg%3E");\n}\n\n</style>', unsafe_allow_html=True)
 
-    def __init__(self, label: str):
-        self.label = label
+st.markdown('\n<div class="vk-menu-header">\n    <div class="vk-menu-actions" aria-hidden="true"><span>i</span><span>◐</span><span>A</span></div>\n    <div class="vk-menu-brand">\n        <svg viewBox="0 0 34 34" fill="none" aria-hidden="true">\n            <path d="M4 27V22M9 27V17M14 27V20M19 27V11M24 27V15M29 27V6" stroke="#e42f35" stroke-width="2.7" stroke-linecap="round"/>\n            <path d="M4 18L10 14L15 16L21 8L26 11L30 4" stroke="#e42f35" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>\n        </svg>\n        <span>Аналитика спроса</span>\n    </div>\n    <div class="vk-menu-subtitle">Анализируйте. Принимайте решения. Двигайте результат.</div>\n</div>\n', unsafe_allow_html=True)
 
-    @property
-    def open(self) -> bool:
-        return st.session_state.get(SECTION_STATE_KEY) == self.label
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        return False
-
-
-tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_forecast, tab_plan_check = [
-    _MainSection(label) for label, _ in MENU_ITEMS
-]
+tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_forecast = st.tabs(
+    [
+        "Дашборд", "Отчет", "Топ-3 сущности", "Сущности", "Детализация", "Детализация категории", "ABC продукции",
+        "Анализ категории", "Окно свежести", "Списания категорий", "Прогноз плана",
+    ],
+    key="main_tabs_v1",
+    on_change="rerun",
+)
 
 if tab_report.open:
     with tab_report:
@@ -6256,24 +5117,14 @@ if tab_report.open:
                     ] if column in category_compare_table.columns
                 ]
                 category_compare_table = category_compare_table[visible_category_columns]
-                category_period_1_label = (
-                    f"{report_period_1[0]:%d.%m.%Y}, шт."
-                    if report_period_1[0] == report_period_1[1]
-                    else f"{report_period_1[0]:%d.%m.%Y}–{report_period_1[1]:%d.%m.%Y}, шт."
-                )
-                category_period_2_label = (
-                    f"{report_period_2[0]:%d.%m.%Y}, шт."
-                    if report_period_2[0] == report_period_2[1]
-                    else f"{report_period_2[0]:%d.%m.%Y}–{report_period_2[1]:%d.%m.%Y}, шт."
-                )
                 st.dataframe(
                     category_compare_table,
                     use_container_width=True,
                     hide_index=True,
                     height=min(620, 38 * len(category_compare_table) + 80),
                     column_config={
-                        "Период 1, шт.": st.column_config.NumberColumn(label=category_period_1_label, format="%.0f"),
-                        "Период 2, шт.": st.column_config.NumberColumn(label=category_period_2_label, format="%.0f"),
+                        "Период 1, шт.": st.column_config.NumberColumn(format="%.0f"),
+                        "Период 2, шт.": st.column_config.NumberColumn(format="%.0f"),
                         "Разница, шт.": st.column_config.NumberColumn(format="%+.0f"),
                         "Разница, %": st.column_config.NumberColumn(format="%+.1f%%"),
                     },
@@ -10896,620 +9747,213 @@ if tab_category_writeoffs.open:
                     key="download_category_writeoffs_v62",
                 )
 
-
-if tab_plan_check.open:
-    with tab_plan_check:
-        st.subheader("Проверка готового плана")
-        st.caption(
-            "Проверка НЕ строит новый план. Базой всегда остаётся уже заполненное значение категорийщика "
-            "из текущей матрицы. Система проверяет его по SKU, фактической свежести, категории, сущности "
-            "и параметрам точки из «Авто Юнит точки ВМ», после чего предлагает только корректировку к текущему значению."
-        )
-
-        check_matrix_bytes, check_matrix_source, check_matrix_checked_at, check_matrix_error = _load_matrix_context_for_active_tab()
-        if not check_matrix_bytes:
-            st.error("Текущая матрица недоступна. Проверьте Apps Script или резервный combo_matrix.xlsx.")
-            if check_matrix_error:
-                st.caption(f"Причина: {check_matrix_error}")
-        else:
-            source_text = check_matrix_source or "текущая матрица"
-            checked_text = str(check_matrix_checked_at or "").replace("T", " ")
-            st.success(f"Готовый план подключён: {source_text}" + (f" · проверено {checked_text}" if checked_text else ""))
-            if check_matrix_error:
-                st.caption(f"Использован резервный источник. Основной источник сообщил: {check_matrix_error}")
-
-            try:
-                ready_matrix_plans = parse_analyst_plan_history(check_matrix_bytes)
-            except Exception as error:
-                st.error(f"Не удалось прочитать заполненный план из матрицы: {error}")
-                ready_matrix_plans = pd.DataFrame()
-
-            auto_unit_bytes = b""
-            auto_unit_source = ""
-            with st.expander("Авто Юнит точки ВМ · параметры точек и экономика", expanded=False):
-                st.caption(
-                    "Используются график работы, ТОП-3 аудитории, дневная выручка, чеки и средний чек. "
-                    "Если файл auto_unit_points_vm.xlsx / «Авто Юнит точки ВМ.xlsx» лежит рядом с app.py, он подключается автоматически."
-                )
-                auto_unit_upload = st.file_uploader(
-                    "Заменить источник Авто Юнит (.xlsx)",
-                    type=["xlsx"],
-                    key="ready_plan_check_auto_unit_upload_v2",
-                )
-                if auto_unit_upload is not None:
-                    auto_unit_bytes = auto_unit_upload.getvalue()
-                    auto_unit_source = auto_unit_upload.name
-                elif AUTO_UNIT_FILE.exists():
-                    try:
-                        auto_unit_bytes = AUTO_UNIT_FILE.read_bytes()
-                        auto_unit_source = AUTO_UNIT_FILE.name
-                    except OSError:
-                        auto_unit_bytes = b""
-
-            if auto_unit_bytes:
-                try:
-                    auto_unit_profiles, auto_unit_daily = parse_auto_unit_points(auto_unit_bytes)
-                except Exception as error:
-                    st.warning(f"Авто Юнит не удалось прочитать: {error}")
-                    auto_unit_profiles, auto_unit_daily = pd.DataFrame(), pd.DataFrame()
-            else:
-                auto_unit_profiles, auto_unit_daily = pd.DataFrame(), pd.DataFrame()
-
-            if not auto_unit_profiles.empty:
-                active_profiles = auto_unit_profiles[auto_unit_profiles["active"].fillna(False)].copy()
-                auto_metrics = st.columns(4)
-                auto_metrics[0].metric("Авто Юнит · точек", active_profiles["point_number"].nunique())
-                auto_metrics[1].metric("5-дневных", int(pd.to_numeric(active_profiles["work_days_per_week"], errors="coerce").eq(5).sum()))
-                auto_metrics[2].metric("Женская аудитория", int(active_profiles["female_dominant"].fillna(False).sum()))
-                latest_auto_date = pd.to_datetime(auto_unit_daily.get("business_date"), errors="coerce").max() if not auto_unit_daily.empty else pd.NaT
-                auto_metrics[3].metric("Данные по", latest_auto_date.strftime("%d.%m.%Y") if pd.notna(latest_auto_date) else "—")
-                st.caption(f"Источник Авто Юнит: {auto_unit_source}")
-            else:
-                st.warning("Авто Юнит не подключён. Базовая проверка SKU/свежести/категории/сущности продолжит работать, но правила графика, аудитории и среднего чека применены не будут.")
-
-            if ready_matrix_plans.empty:
-                st.warning("В текущей матрице не найдены заполненные основные блоки «План на день кухня».")
-            else:
-                ready_matrix_plans["plan_date"] = pd.to_datetime(ready_matrix_plans["plan_date"], errors="coerce").dt.date
-                check_dates = sorted(ready_matrix_plans["plan_date"].dropna().unique().tolist())
-                future_dates = [value for value in check_dates if value >= today]
-                default_check_date = future_dates[0] if future_dates else check_dates[-1]
-                default_index = check_dates.index(default_check_date)
-
-                check_control_columns = st.columns([1.5, 1.0, 1.0, 1.0, 1.0, 1.0])
-                with check_control_columns[0]:
-                    check_target_date = st.selectbox(
-                        "Дата готового плана",
-                        check_dates,
-                        index=default_index,
-                        format_func=lambda value: f"{value:%d.%m.%Y} · {WEEKDAY_RU.get(value.weekday(), '')}",
-                        key="ready_plan_check_date_v2",
-                    )
-                with check_control_columns[1]:
-                    check_trend_percent = st.number_input("Рост / падение, %", min_value=1.0, max_value=100.0, value=10.0, step=1.0, key="ready_plan_check_trend_v2")
-                with check_control_columns[2]:
-                    check_writeoff_percent = st.number_input("Большое списание, %", min_value=1.0, max_value=100.0, value=20.0, step=1.0, key="ready_plan_check_writeoff_v2")
-                with check_control_columns[3]:
-                    check_min_sale_days = st.number_input("Мин. дней SKU", min_value=1, max_value=30, value=3, step=1, key="ready_plan_check_min_days_v2")
-                with check_control_columns[4]:
-                    check_avg_target = st.number_input("Цель ср. чека, %", min_value=-50.0, max_value=100.0, value=5.0, step=1.0, key="ready_plan_check_avg_target_v2")
-                with check_control_columns[5]:
-                    check_revenue_target = st.number_input("Цель дохода, %", min_value=-50.0, max_value=100.0, value=5.0, step=1.0, key="ready_plan_check_revenue_target_v2")
-
-                light_keywords_text = st.text_input(
-                    "Ключи лёгких овощных блюд",
-                    value=", ".join(PLAN_CHECK_LIGHT_VEGETABLE_DEFAULT),
-                    key="ready_plan_check_light_keywords_v2",
-                    help="По этим фрагментам в категории/сущности/названии определяется лёгкое овощное блюдо для правила женской аудитории.",
-                )
-                light_keywords = tuple(
-                    value.strip() for value in light_keywords_text.split(",") if value.strip()
-                ) or PLAN_CHECK_LIGHT_VEGETABLE_DEFAULT
-
-                target_plan_preview = ready_matrix_plans[ready_matrix_plans["plan_date"].eq(check_target_date)].copy()
-                plan_preview_metrics = st.columns(4)
-                plan_preview_metrics[0].metric("Строк плана", f"{len(target_plan_preview):,}".replace(",", " "))
-                plan_preview_metrics[1].metric("Точек", target_plan_preview["point_number"].nunique())
-                plan_preview_metrics[2].metric("SKU", target_plan_preview["sku"].nunique())
-                plan_preview_metrics[3].metric("План, шт.", f"{pd.to_numeric(target_plan_preview['analyst_plan'], errors='coerce').fillna(0).sum():,.0f}".replace(",", " "))
-                st.caption("Проверка выполняется по всем точкам и категориям выбранной даты. Рекомендация всегда считается от текущего значения в матрице.")
-
-                with st.expander("Логика проверки", expanded=False):
-                    st.markdown(
-                        f"""
-**Основа**  
-1. SKU — среднее только по дням фактических продаж за 2 месяца.  
-2. Цикл — фактическая свежесть FIFO: зелёные/серые продажи и списания.  
-3. Категория — 14 дней: последние 7 против предыдущих 7.  
-4. Сущность — fallback при нехватке данных SKU и отдельный сигнал роста/падения.
-
-**Добавить к уже проставленному значению**  
-- +1: товар продаётся в зелёном периоде, у живой партии остался 1 зелёный день.  
-- +1: сущность растёт минимум на **{check_trend_percent:.0f}%**, категория не противоречит.  
-- +1: по Авто Юнит женская аудитория преобладает, а SKU определён как лёгкое овощное блюдо и нет сильного риска списаний/падения.
-
-**Убавить от уже проставленного значения**  
-- −1: SKU падает минимум на **{check_trend_percent:.0f}%** и списание ≥ **{check_writeoff_percent:.0f}%**.  
-- если серые продажи преобладают — ориентир на зелёные продажи.  
-- −2: сущность падает минимум на **{check_trend_percent:.0f}%**.
-
-**Минимумы**: вторые блюда 3 · остальные 2 · напитки 5 · Япония 1.  
-**Исключение Авто Юнит**: на 5-дневной точке в **четверг** проверяется загрузка только **1 дня**, поэтому нижний минимум категории в этот день не применяется.
-
-**Экономика точки**: последние 14 дней среднего чека и выручки/рабочий день сравниваются с предыдущими 14. Цели: ср. чек ≥ **{check_avg_target:+.1f}%**, доход ≥ **{check_revenue_target:+.1f}%**.
-
-**Цвет согласия**  
-🟢 зелёный — система согласна; 🟡 жёлтый — сомнение/рекомендация; 🔴 красный — полное несогласие.
-                        """
-                    )
-
-                check_signature = (
-                    _combo_matrix_signature(check_matrix_bytes, check_matrix_source),
-                    check_target_date,
-                    round(float(check_trend_percent), 3),
-                    round(float(check_writeoff_percent), 3),
-                    int(check_min_sale_days),
-                    round(float(check_avg_target), 3),
-                    round(float(check_revenue_target), 3),
-                    light_keywords,
-                    hashlib.sha256(auto_unit_bytes).hexdigest()[:16] if auto_unit_bytes else "NO_AUTO_UNIT",
-                    "ALL_POINTS",
-                    "ALL_CATEGORIES",
-                )
-                if st.session_state.get("ready_plan_check_signature_v2") != check_signature:
-                    st.session_state.pop("ready_plan_check_result_v2", None)
-
-                if st.button("Проверить готовый план", type="primary", use_container_width=True, key="ready_plan_check_button_v2"):
-                    analysis_date = min(today, check_target_date - timedelta(days=1))
-                    history_from = (pd.Timestamp(check_target_date) - pd.DateOffset(months=2) - pd.Timedelta(days=7)).date()
-                    check_point_mapping = {
-                        int(shop): str(label)
-                        for shop, label in st.session_state.get("point_mapping", {}).items()
-                        if str(label).startswith("Т") and str(label) != "Т11"
-                    }
-                    if not check_point_mapping:
-                        check_point_mapping = {number: f"Т{number}" for number in range(1, 30) if number != 11}
-                    try:
-                        with st.spinner("Проверяю текущие значения плана: SKU, свежесть, категория, сущность и Авто Юнит…"):
-                            check_sales = load_forecast_history(history_from, analysis_date + timedelta(days=1), tuple(sorted(check_point_mapping)))
-                            check_result = build_ready_plan_check(
-                                ready_matrix_plans,
-                                check_sales,
-                                entities,
-                                check_target_date,
-                                check_point_mapping,
-                                trend_threshold=float(check_trend_percent) / 100.0,
-                                writeoff_threshold=float(check_writeoff_percent) / 100.0,
-                                minimum_sale_days=int(check_min_sale_days),
-                                selected_points=None,
-                                selected_categories=None,
-                                auto_unit_profiles=auto_unit_profiles,
-                                auto_unit_daily=auto_unit_daily,
-                                avg_check_growth_target=float(check_avg_target) / 100.0,
-                                revenue_growth_target=float(check_revenue_target) / 100.0,
-                                light_vegetable_keywords=light_keywords,
-                            )
-                    except Exception as error:
-                        st.error(f"Не удалось выполнить проверку готового плана: {error}")
-                        check_result = pd.DataFrame()
-                    if check_result.empty:
-                        st.warning("По выбранной дате результат проверки пуст.")
-                    else:
-                        st.session_state["ready_plan_check_result_v2"] = check_result
-                        st.session_state["ready_plan_check_signature_v2"] = check_signature
-
-                check_result = st.session_state.get("ready_plan_check_result_v2", pd.DataFrame())
-                if isinstance(check_result, pd.DataFrame) and not check_result.empty:
-                    delta_values = pd.to_numeric(check_result["Изменение"], errors="coerce").fillna(0)
-                    agreement_text = check_result["Согласие системы"].astype(str)
-                    check_metrics = st.columns(7)
-                    check_metrics[0].metric("Проверено", f"{len(check_result):,}".replace(",", " "))
-                    check_metrics[1].metric("Добавить", int((delta_values > 0).sum()))
-                    check_metrics[2].metric("Убавить", int((delta_values < 0).sum()))
-                    check_metrics[3].metric("Оставить", int((delta_values == 0).sum()))
-                    check_metrics[4].metric("🟢 Согласие", int(agreement_text.str.startswith("Зелёное").sum()))
-                    check_metrics[5].metric("🟡 Сомнение", int(agreement_text.str.startswith("Жёлтое").sum()))
-                    check_metrics[6].metric("🔴 Несогласие", int(agreement_text.str.startswith("Красное").sum()))
-
-                    filter_columns = st.columns(2)
-                    with filter_columns[0]:
-                        action_filter = st.radio("Решение", ["Все", "Добавить", "Убавить", "Оставить"], horizontal=True, key="ready_plan_check_action_filter_v2")
-                    with filter_columns[1]:
-                        agreement_filter = st.radio("Согласие", ["Все", "Зелёное", "Жёлтое", "Красное"], horizontal=True, key="ready_plan_check_agreement_filter_v2")
-                    visible_check = check_result.copy()
-                    if action_filter == "Добавить":
-                        visible_check = visible_check[pd.to_numeric(visible_check["Изменение"], errors="coerce") > 0]
-                    elif action_filter == "Убавить":
-                        visible_check = visible_check[pd.to_numeric(visible_check["Изменение"], errors="coerce") < 0]
-                    elif action_filter == "Оставить":
-                        visible_check = visible_check[pd.to_numeric(visible_check["Изменение"], errors="coerce") == 0]
-                    if agreement_filter != "Все":
-                        visible_check = visible_check[visible_check["Согласие системы"].astype(str).str.startswith(agreement_filter)]
-
-                    check_display_columns = [
-                        "Дата плана", "День недели", "Точка", "Категория", "Сущность", "SKU", "Название товара", "Цена",
-                        "Текущий план", "Рекомендованный план", "Изменение", "Действие", "Согласие системы",
-                        "Минимум номинальный", "Минимум действует", "Дней покрытия проверки",
-                        "СР SKU / день продаж · 2 мес", "Дней продаж SKU · 2 мес", "Ориентир SKU × цикл",
-                        "Категория СР/день · 14д", "Тренд категории, %", "Тренд сущности, %", "Тренд SKU, %",
-                        "Зелёные продажи / партия", "Серые продажи / партия", "Списание, %", "Осталось зелёных дней",
-                        "Авто Юнит · дней/нед", "Женская доля ТОП-3, %", "Женская аудитория преобладает", "Лёгкое овощное блюдо",
-                        "Ср. чек · пред. 14д", "Ср. чек · посл. 14д", "Тренд ср. чека, %",
-                        "Выручка/раб.день · пред. 14д", "Выручка/раб.день · посл. 14д", "Тренд выручки/раб.день, %",
-                        "Экономическая рекомендация", "Причина", "Контроль", "Основа при нехватке данных",
-                    ]
-                    check_display_columns = [column for column in check_display_columns if column in visible_check.columns]
-
-                    def style_ready_plan_check_row(row: pd.Series) -> list[str]:
-                        status = str(row.get("Согласие системы", ""))
-                        if status.startswith("Красное"):
-                            style = "background-color: #F4CCCC; color: #990000;"
-                        elif status.startswith("Жёлтое"):
-                            style = "background-color: #FFF2CC; color: #7F6000;"
-                        else:
-                            style = "background-color: #D9EAD3; color: #274E13;"
-                        return [style] * len(row)
-
-                    check_screen, check_screen_limit, check_truncated = styler_safe_preview(visible_check[check_display_columns])
-                    if check_truncated:
-                        st.info(f"На экране показаны первые {check_screen_limit:,} строк; выгрузка содержит полный результат.".replace(",", " "))
-                    st.dataframe(
-                        check_screen.style.apply(style_ready_plan_check_row, axis=1),
-                        use_container_width=True,
-                        hide_index=True,
-                        height=min(760, 36 * len(check_screen) + 80),
-                        column_config={
-                            "Дата плана": st.column_config.DateColumn(format="DD.MM.YYYY"),
-                            "Цена": st.column_config.NumberColumn(format="%.2f"),
-                            "Текущий план": st.column_config.NumberColumn(format="%.0f"),
-                            "Рекомендованный план": st.column_config.NumberColumn(format="%.0f"),
-                            "Изменение": st.column_config.NumberColumn(format="%+d"),
-                            "СР SKU / день продаж · 2 мес": st.column_config.NumberColumn(format="%.2f"),
-                            "Категория СР/день · 14д": st.column_config.NumberColumn(format="%.2f"),
-                            "Тренд категории, %": st.column_config.NumberColumn(format="%+.1f%%"),
-                            "Тренд сущности, %": st.column_config.NumberColumn(format="%+.1f%%"),
-                            "Тренд SKU, %": st.column_config.NumberColumn(format="%+.1f%%"),
-                            "Зелёные продажи / партия": st.column_config.NumberColumn(format="%.2f"),
-                            "Серые продажи / партия": st.column_config.NumberColumn(format="%.2f"),
-                            "Списание, %": st.column_config.NumberColumn(format="%.1f%%"),
-                            "Женская доля ТОП-3, %": st.column_config.NumberColumn(format="%.1f%%"),
-                            "Тренд ср. чека, %": st.column_config.NumberColumn(format="%+.1f%%"),
-                            "Тренд выручки/раб.день, %": st.column_config.NumberColumn(format="%+.1f%%"),
-                        },
-                    )
-
-                    check_excel = ready_plan_check_excel(
-                        check_result,
-                        check_target_date,
-                        float(check_trend_percent) / 100.0,
-                        float(check_writeoff_percent) / 100.0,
-                        int(check_min_sale_days),
-                        avg_check_growth_target=float(check_avg_target) / 100.0,
-                        revenue_growth_target=float(check_revenue_target) / 100.0,
-                        light_vegetable_keywords=light_keywords,
-                    )
-                    st.download_button(
-                        "Скачать проверку плана (Excel)",
-                        data=check_excel,
-                        file_name=f"проверка_готового_плана_{check_target_date:%Y-%m-%d}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
-                        key="ready_plan_check_download_v2",
-                    )
-
-
 if tab_forecast.open:
     with tab_forecast:
-        st.subheader("Прогноз плана по меню из текущей матрицы")
+        st.subheader("Прогноз плана по средним продажам SKU")
         st.caption(
-            "Меню и даты плана загружаются автоматически из текущей матрицы. "
-            "Сначала выберите нужные даты из тех, которые найдены в матрице; затем приложение "
-            "рассчитает только выбранные дни и заполнит Т1–Т29 только в соответствующих блоках меню. "
-            "Для каждого SKU и каждой точки используется два календарных месяца продаж до даты плана. "
-            "Среднее считается только по дням, когда SKU действительно продавался. "
-            "Множитель загрузки зависит от категории: Япония — ×1, вторые блюда — ×3, "
-            "напитки — ×4, остальные категории — ×2. Т11 остаётся пустой."
+            "Загрузите только пустое меню — приложение обработает все даты и все блоки на листе. "
+            "Для каждого SKU и каждой точки приложение берёт два календарных "
+            "месяца до даты плана и считает среднее только по дням, когда SKU действительно продавался. "
+            "Множитель загрузки зависит от текущей категории SKU: Япония — ×1 от среднего, "
+            "вторые блюда — ×3, напитки — ×4, остальные категории — ×2. "
+            "Если SKU на точке не продавался, среднее принимается равным 1 шт./день. "
+            "Если за 2 месяца продажи были только в 1–2 дня, итоговый прогноз в Excel "
+            "подсвечивается светло-красным как значение с недостаточной выборкой. "
+            "Ф-столбцы не изменяются, Т11 пустая."
         )
-
-        matrix_bytes, matrix_source, matrix_checked_at, matrix_error = _load_matrix_context_for_active_tab()
-        if not matrix_bytes:
-            st.error("Текущая матрица недоступна. Проверьте подключение Apps Script или резервный combo_matrix.xlsx.")
-            if matrix_error:
-                st.caption(f"Причина: {matrix_error}")
-        else:
-            forecast_matrix_signature = _combo_matrix_signature(matrix_bytes, matrix_source)
-            forecast_signature_key = "forecast_matrix_signature_v760"
-            if st.session_state.get(forecast_signature_key) != forecast_matrix_signature:
-                for stale_key in [
-                    "forecast_result",
-                    "forecast_menu",
-                    "forecast_history_from",
-                    "forecast_target_date",
-                    "forecast_first_target_date",
-                    "forecast_matrix_bytes",
-                    "forecast_selected_matrix_dates_v760",
-                    "forecast_preview_block_v760",
-                    "forecast_calculated_dates_v760",
-                ]:
-                    st.session_state.pop(stale_key, None)
-                st.session_state[forecast_signature_key] = forecast_matrix_signature
-
-            source_text = matrix_source or "текущая матрица"
-            checked_text = str(matrix_checked_at or "").replace("T", " ")
-            st.success(
-                f"Матрица подключена: {source_text}"
-                + (f" · проверено {checked_text}" if checked_text else "")
-            )
-            if matrix_error:
-                st.caption(f"Использован резервный источник. Основной источник сообщил: {matrix_error}")
-
+        matrix_file = st.file_uploader("Меню (.xlsx)", type=["xlsx"], key="forecast_matrix")
+        if matrix_file is not None:
             try:
-                matrix_menu, matrix_capacity = parse_menu_matrix(matrix_bytes)
+                matrix_menu, matrix_capacity = parse_menu_matrix(matrix_file.getvalue())
             except Exception as error:
-                st.error(f"Не удалось прочитать меню из текущей матрицы: {error}")
+                st.error(f"Не удалось прочитать матрицу: {error}")
                 matrix_menu = pd.DataFrame()
                 matrix_capacity = pd.DataFrame()
 
             if matrix_menu.empty:
-                st.warning("В текущей матрице не найдено меню с датой, SKU и колонками точек Т.")
+                st.warning("В файле не найдено меню с датой, SKU и колонками точек.")
             else:
-                all_target_dates = sorted(matrix_menu["target_date"].dropna().unique().tolist())
-                date_key = "forecast_selected_matrix_dates_v760"
-                if date_key in st.session_state:
-                    clean_dates = [
-                        value for value in st.session_state[date_key]
-                        if value in all_target_dates
-                    ]
-                    if clean_dates != st.session_state[date_key]:
-                        st.session_state[date_key] = clean_dates
-                else:
-                    st.session_state[date_key] = list(all_target_dates)
-
-                selected_target_dates = st.multiselect(
-                    "Дни плана из матрицы — выбрать для расчёта и заполнения",
-                    all_target_dates,
-                    format_func=lambda value: (
-                        f"{value:%d.%m.%Y} · {WEEKDAY_RU.get(value.weekday(), '')}"
-                    ),
-                    key=date_key,
-                    help=(
-                        "В расчёт и в готовую выгрузку попадут только выбранные даты. "
-                        "Меню каждой даты берётся непосредственно из соответствующего блока текущей матрицы."
-                    ),
+                block_options = (
+                    matrix_menu[["target_date", "sheet", "day_label"]]
+                    .drop_duplicates()
+                    .sort_values(["target_date", "sheet"])
                 )
-
-                if not selected_target_dates:
-                    st.info("Выберите хотя бы одну дату плана из матрицы.")
-                else:
-                    selected_target_dates = sorted(selected_target_dates)
-                    selected_matrix_menu = matrix_menu[
-                        matrix_menu["target_date"].isin(selected_target_dates)
-                    ].copy()
-
-                    selected_blocks = (
-                        selected_matrix_menu[["target_date", "sheet", "day_label"]]
-                        .drop_duplicates()
-                        .sort_values(["target_date", "sheet"])
-                    )
-                    block_records = selected_blocks.to_dict("records")
-                    preview_key = "forecast_preview_block_v760"
-                    if (
-                        preview_key in st.session_state
-                        and st.session_state[preview_key] not in block_records
-                    ):
-                        st.session_state.pop(preview_key, None)
-                    selected_block = st.selectbox(
-                        "Предпросмотр меню выбранного дня",
-                        block_records,
-                        format_func=lambda item: (
-                            f"{item['target_date']:%d.%m.%Y} · "
-                            f"{WEEKDAY_RU.get(item['target_date'].weekday(), '')}"
-                        ),
-                        key=preview_key,
-                    )
-                    selected_menu = selected_matrix_menu[
-                        (selected_matrix_menu["target_date"] == selected_block["target_date"])
-                        & (selected_matrix_menu["sheet"] == selected_block["sheet"])
-                    ].copy()
-                    preview_menu = selected_menu.merge(
-                        entities[["sku", "category", "entity"]], on="sku", how="left"
-                    )
-                    preview_menu["category"] = preview_menu["category"].fillna(
-                        preview_menu["matrix_category"]
-                    )
-                    preview_menu["entity"] = preview_menu["entity"].fillna("Не сопоставлено")
-
-                    forecast_metrics = st.columns(4)
-                    forecast_metrics[0].metric("Выбрано дат", len(selected_target_dates))
-                    forecast_metrics[1].metric("SKU в дне", preview_menu["sku"].nunique())
-                    forecast_metrics[2].metric("Категорий", preview_menu["category"].nunique())
-                    forecast_metrics[3].metric("Сущностей", preview_menu["entity"].nunique())
-
-                    with st.expander("Показать меню выбранного дня"):
-                        st.dataframe(
-                            preview_menu[["sku", "product_name", "category", "entity", "price"]].rename(
-                                columns={
-                                    "sku": "SKU",
-                                    "product_name": "Название товара",
-                                    "category": "Категория",
-                                    "entity": "Сущность",
-                                    "price": "Цена",
-                                }
-                            ),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-
-                    first_target_date = selected_target_dates[0]
-                    last_target_date = selected_target_dates[-1]
-                    history_from = (
-                        pd.Timestamp(first_target_date) - pd.DateOffset(months=2)
-                    ).date()
-                    st.info(
-                        f"К расчёту выбрано {len(selected_target_dates)} дат: "
-                        f"{', '.join(value.strftime('%d.%m.%Y') for value in selected_target_dates)}. "
-                        "Для каждой даты будет использовано меню именно её блока в матрице и своё "
-                        "окно предыдущих двух календарных месяцев."
-                    )
-
-                    forecast_button = st.button(
-                        "Рассчитать план для выбранных дат",
-                        type="primary",
-                        key="calculate_forecast",
-                        use_container_width=True,
-                    )
-                    if forecast_button:
-                        forecast_points = {
-                            int(number): label
-                            for number, label in st.session_state.get("point_mapping", {}).items()
-                            if str(label).startswith("Т")
-                            and 1 <= int(str(label)[1:]) <= 29
-                            and int(str(label)[1:]) != 11
-                        }
-                        if not forecast_points:
-                            forecast_points = {
-                                number: f"Т{number}"
-                                for number in range(1, 30)
-                                if number != 11
+                block_records = block_options.to_dict("records")
+                selected_block = st.selectbox(
+                    "Предпросмотр даты и листа (расчёт выполнится по всему файлу)",
+                    block_records,
+                    format_func=lambda item: f"{item['target_date']:%d.%m.%Y} · {item['sheet']} · {item['day_label']}",
+                )
+                selected_menu = matrix_menu[
+                    (matrix_menu["target_date"] == selected_block["target_date"])
+                    & (matrix_menu["sheet"] == selected_block["sheet"])
+                ].copy()
+                preview_menu = selected_menu.merge(
+                    entities[["sku", "category", "entity"]], on="sku", how="left"
+                )
+                preview_menu["category"] = preview_menu["category"].fillna(preview_menu["matrix_category"])
+                preview_menu["entity"] = preview_menu["entity"].fillna("Не сопоставлено")
+                forecast_metrics = st.columns(4)
+                forecast_metrics[0].metric("SKU в меню", preview_menu["sku"].nunique())
+                forecast_metrics[1].metric("Категорий", preview_menu["category"].nunique())
+                forecast_metrics[2].metric("Сущностей", preview_menu["entity"].nunique())
+                forecast_metrics[3].metric(
+                    "Без сущности", preview_menu.loc[preview_menu["entity"] == "Не сопоставлено", "sku"].nunique()
+                )
+                with st.expander("Показать распознанное меню"):
+                    st.dataframe(
+                        preview_menu[["sku", "product_name", "category", "entity", "price"]].rename(
+                            columns={
+                                "sku": "SKU",
+                                "product_name": "Название товара",
+                                "category": "Категория",
+                                "entity": "Сущность",
+                                "price": "Цена",
                             }
-                        try:
-                            forecast_history = load_forecast_history(
-                                history_from,
-                                last_target_date,
-                                tuple(sorted(forecast_points)),
-                            )
-                        except Exception as error:
-                            st.error(f"Не удалось загрузить историю продаж: {error}")
-                            forecast_history = pd.DataFrame()
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
-                        if forecast_history.empty:
-                            st.warning("За исторический период продажи не найдены.")
-                        else:
-                            forecast_parts: list[pd.DataFrame] = []
-                            for (target_date, sheet_name), menu_block in selected_matrix_menu.groupby(
-                                ["target_date", "sheet"], sort=True
-                            ):
-                                block_history_from = (
-                                    pd.Timestamp(target_date) - pd.DateOffset(months=2)
-                                ).date()
-                                block_history = forecast_history[
-                                    pd.to_datetime(
-                                        forecast_history["business_date"], errors="coerce"
-                                    ).dt.date.between(
-                                        block_history_from,
-                                        target_date - timedelta(days=1),
-                                        inclusive="both",
-                                    )
-                                ].copy()
-                                block_result = calculate_sku_daily_forecast(
-                                    menu_block,
-                                    block_history,
-                                    entities,
-                                    target_date,
-                                    forecast_points,
+                all_target_dates = sorted(matrix_menu["target_date"].dropna().unique().tolist())
+                first_target_date = all_target_dates[0]
+                last_target_date = all_target_dates[-1]
+                history_from = (pd.Timestamp(first_target_date) - pd.DateOffset(months=2)).date()
+                st.info(
+                    f"Будут рассчитаны все {len(all_target_dates)} дат меню: "
+                    f"{first_target_date:%d.%m.%Y}–{last_target_date:%d.%m.%Y}. "
+                    "Для каждой даты используется своё окно предыдущих двух календарных месяцев."
+                )
+                forecast_button = st.button("Рассчитать рекомендуемый план", type="primary", key="calculate_forecast")
+                if forecast_button:
+                    forecast_points = {
+                        int(number): label
+                        for number, label in st.session_state.get("point_mapping", {}).items()
+                        if str(label).startswith("Т")
+                        and 1 <= int(str(label)[1:]) <= 29
+                        and int(str(label)[1:]) != 11
+                    }
+                    if not forecast_points:
+                        forecast_points = {
+                            number: f"Т{number}" for number in range(1, 30) if number != 11
+                        }
+                    try:
+                        forecast_history = load_forecast_history(
+                            history_from,
+                            last_target_date,
+                            tuple(sorted(forecast_points)),
+                        )
+                    except Exception as error:
+                        st.error(f"Не удалось загрузить историю продаж: {error}")
+                        forecast_history = pd.DataFrame()
+                    if forecast_history.empty:
+                        st.warning("За исторический период продажи не найдены.")
+                    else:
+                        forecast_parts: list[pd.DataFrame] = []
+                        for (target_date, sheet_name), menu_block in matrix_menu.groupby(
+                            ["target_date", "sheet"], sort=True
+                        ):
+                            block_history_from = (
+                                pd.Timestamp(target_date) - pd.DateOffset(months=2)
+                            ).date()
+                            block_history = forecast_history[
+                                pd.to_datetime(
+                                    forecast_history["business_date"], errors="coerce"
+                                ).dt.date.between(
+                                    block_history_from,
+                                    target_date - timedelta(days=1),
+                                    inclusive="both",
                                 )
-                                if not block_result.empty:
-                                    forecast_parts.append(block_result)
-
-                            forecast_result = (
-                                pd.concat(forecast_parts, ignore_index=True)
-                                if forecast_parts else pd.DataFrame()
+                            ].copy()
+                            block_result = calculate_sku_daily_forecast(
+                                menu_block,
+                                block_history,
+                                entities,
+                                target_date,
+                                forecast_points,
                             )
-                            if forecast_result.empty:
-                                st.warning("Не удалось сформировать расчёт для выбранных дат меню.")
-                                st.stop()
+                            if not block_result.empty:
+                                forecast_parts.append(block_result)
+                        forecast_result = (
+                            pd.concat(forecast_parts, ignore_index=True)
+                            if forecast_parts else pd.DataFrame()
+                        )
+                        if forecast_result.empty:
+                            st.warning("Не удалось сформировать расчёт ни для одного блока меню.")
+                            st.stop()
+                        st.session_state["forecast_result"] = forecast_result
+                        st.session_state["forecast_menu"] = matrix_menu
+                        st.session_state["forecast_history_from"] = history_from
+                        st.session_state["forecast_target_date"] = last_target_date
+                        st.session_state["forecast_first_target_date"] = first_target_date
+                        st.session_state["forecast_matrix_bytes"] = matrix_file.getvalue()
 
-                            st.session_state["forecast_result"] = forecast_result
-                            st.session_state["forecast_menu"] = selected_matrix_menu
-                            st.session_state["forecast_history_from"] = history_from
-                            st.session_state["forecast_target_date"] = last_target_date
-                            st.session_state["forecast_first_target_date"] = first_target_date
-                            st.session_state["forecast_matrix_bytes"] = matrix_bytes
-                            st.session_state["forecast_calculated_dates_v760"] = list(
-                                selected_target_dates
-                            )
-
-                    if "forecast_result" in st.session_state:
-                        forecast_result = st.session_state["forecast_result"]
-                        calculated_dates = st.session_state.get(
-                            "forecast_calculated_dates_v760", []
-                        )
-                        if calculated_dates and list(selected_target_dates) != list(calculated_dates):
-                            st.warning(
-                                "Выбор дат изменён после последнего расчёта. "
-                                "Нажмите «Рассчитать план для выбранных дат», чтобы обновить готовый план."
-                            )
-
-                        st.markdown("#### Рекомендованный план")
-                        result_metrics = st.columns(5)
-                        result_metrics[0].metric("Дат в готовом плане", forecast_result["Дата плана"].nunique())
-                        result_metrics[1].metric("Точек", forecast_result["Точка"].nunique())
-                        result_metrics[2].metric("SKU", forecast_result["SKU"].nunique())
-                        result_metrics[3].metric(
-                            "План, шт.",
-                            f"{forecast_result['Рекомендованный план'].sum(skipna=True):,.0f}".replace(",", " "),
-                        )
-                        result_metrics[4].metric(
-                            "Пустых ячеек без данных",
-                            int(forecast_result["Рекомендованный план"].isna().sum()),
-                        )
-
-                        result_point_options = sorted(
-                            forecast_result["Точка"].unique(),
-                            key=lambda value: int(str(value)[1:]),
-                        )
-                        result_points = st.multiselect(
-                            "Показать точки прогноза",
-                            result_point_options,
-                            default=result_point_options[:1],
-                            key="forecast_result_points",
-                        )
-                        visible_forecast = forecast_result[
-                            forecast_result["Точка"].isin(result_points)
-                        ]
-                        st.dataframe(
-                            visible_forecast,
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-
-                        hide_average_values = st.checkbox(
-                            "Убрать числовые значения СР из выгрузки",
-                            value=False,
-                            key="forecast_hide_average_values_export",
-                            help=(
-                                "Синяя строка СР, подпись и цикл загрузки останутся. "
-                                "Будут очищены только числовые средние по точкам и итог СР в колонке ПЛАН."
-                            ),
-                        )
-                        export_period_label = _forecast_export_date_label(forecast_result)
-                        st.success(f"Выгрузка плана меню: {export_period_label}")
-                        st.caption(
-                            "В скачанный Excel попадут только выбранные даты меню. Остальные дни и недели "
-                            "исходной матрицы полностью исключаются из выгрузки. Столбцы Ф удаляются только "
-                            "из скачанной копии; исходная матрица не изменяется."
-                        )
-
-                        if calculated_dates and list(selected_target_dates) == list(calculated_dates):
-                            filled_matrix = fill_forecast_into_matrix(
-                                st.session_state["forecast_matrix_bytes"],
-                                forecast_result,
-                                st.session_state["forecast_history_from"],
-                                st.session_state["forecast_target_date"],
-                                hide_average_values=hide_average_values,
-                            )
-                            st.download_button(
-                                "Скачать готовый план по выбранным датам",
-                                data=filled_matrix,
-                                file_name=(
-                                    f"план_меню_"
-                                    f"{st.session_state['forecast_first_target_date']:%Y-%m-%d}_"
-                                    f"{st.session_state['forecast_target_date']:%Y-%m-%d}.xlsx"
-                                ),
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                key="forecast_download_selected_dates_v760",
-                                use_container_width=True,
-                            )
+                if "forecast_result" in st.session_state:
+                    forecast_result = st.session_state["forecast_result"]
+                    st.markdown("#### Рекомендованный план")
+                    result_metrics = st.columns(5)
+                    result_metrics[0].metric("Дат меню", forecast_result["Дата плана"].nunique())
+                    result_metrics[1].metric("Точек", forecast_result["Точка"].nunique())
+                    result_metrics[2].metric("SKU", forecast_result["SKU"].nunique())
+                    result_metrics[3].metric(
+                        "План, шт.",
+                        f"{forecast_result['Рекомендованный план'].sum(skipna=True):,.0f}".replace(",", " "),
+                    )
+                    result_metrics[4].metric(
+                        "Пустых ячеек без данных",
+                        int(forecast_result["Рекомендованный план"].isna().sum()),
+                    )
+                    result_point_options = sorted(
+                        forecast_result["Точка"].unique(), key=lambda value: int(str(value)[1:])
+                    )
+                    result_points = st.multiselect(
+                        "Показать точки прогноза",
+                        result_point_options,
+                        default=result_point_options[:1],
+                        key="forecast_result_points",
+                    )
+                    visible_forecast = forecast_result[forecast_result["Точка"].isin(result_points)]
+                    result_dates = st.multiselect(
+                        "Показать даты меню",
+                        sorted(forecast_result["Дата плана"].unique()),
+                        default=sorted(forecast_result["Дата плана"].unique()),
+                        format_func=lambda value: value.strftime("%d.%m.%Y"),
+                        key="forecast_result_dates_v66",
+                    )
+                    visible_forecast = visible_forecast[
+                        visible_forecast["Дата плана"].isin(result_dates)
+                    ]
+                    st.dataframe(visible_forecast, use_container_width=True, hide_index=True)
+                    hide_average_values = st.checkbox(
+                        "Убрать числовые значения СР из выгрузки",
+                        value=False,
+                        key="forecast_hide_average_values_export",
+                        help=(
+                            "Синяя строка СР, подпись и цикл загрузки останутся. "
+                            "Будут очищены только числовые средние по точкам и итог СР в колонке ПЛАН."
+                        ),
+                    )
+                    st.caption(
+                        "В скачанном меню столбцы Ф удаляются полностью. "
+                        "Исходный загруженный файл не изменяется."
+                    )
+                    filled_matrix = fill_forecast_into_matrix(
+                        st.session_state["forecast_matrix_bytes"],
+                        forecast_result,
+                        st.session_state["forecast_history_from"],
+                        st.session_state["forecast_target_date"],
+                        hide_average_values=hide_average_values,
+                    )
+                    st.download_button(
+                        "Скачать меню с заполненными Т1–Т29",
+                        data=filled_matrix,
+                        file_name=(
+                            f"матрица_с_прогнозом_"
+                            f"{st.session_state['forecast_first_target_date']:%Y-%m-%d}_"
+                            f"{st.session_state['forecast_target_date']:%Y-%m-%d}.xlsx"
+                        ),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
 
     excel_bytes = export_excel(filtered_sku, filtered_category, filtered_entity, filtered_detail)
     st.download_button(
