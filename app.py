@@ -28,7 +28,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.9.0-SEPARATE-MENU"
+BUILD_ID = "75.11.0-PLAN-CHECK-AUTOUNIT"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -94,6 +94,7 @@ def resolve_app_file(filename: str, *name_fragments: str) -> Path:
 ENTITY_FILE = resolve_app_file("entities.xlsx", "сущност", "entit")
 ANALYST_LOGIC_FILE = resolve_app_file("analyst_logic.xlsx", "логика", "аналит", "analyst")
 COMBO_MATRIX_FILE = resolve_app_file("combo_matrix.xlsx", "матрица", "комбо", "combo")
+AUTO_UNIT_FILE = resolve_app_file("auto_unit_points_vm.xlsx", "авто юнит", "auto_unit", "точки вм")
 MATRIX_APPS_SCRIPT_URL = os.getenv(
     "MATRIX_APPS_SCRIPT_URL",
     "https://script.google.com/macros/s/AKfycbxzpVJGvkHTn8YogBOLO4PtvdQqmkoMx-chNCZ2ijmMIRc_-kcd2WUQ283PNyo5hCo/exec",
@@ -3956,6 +3957,757 @@ def prepare_analysis(
     return sku_point, category_profile, entity_profile, daily_detail
 
 
+
+def plan_check_minimum(category: object) -> int:
+    """Business minimum for one SKU in one point when validating a ready plan."""
+    normalized = normalize_matrix_category(category)
+    if normalized == "Вторые блюда":
+        return 3
+    if normalized == "Напитки":
+        return 5
+    if normalized == "Япония":
+        return 1
+    return 2
+
+
+PLAN_CHECK_LIGHT_VEGETABLE_DEFAULT = (
+    "овощ", "винегрет", "свекл", "морков", "капуст", "брокколи", "огур",
+    "томат", "помидор", "зелень", "редис", "баклаж", "кабач", "тыкв",
+)
+
+
+def _plan_check_trend(recent_value: float, previous_value: float) -> float:
+    recent = max(0.0, float(recent_value or 0.0))
+    previous = max(0.0, float(previous_value or 0.0))
+    if previous <= 0:
+        return 1.0 if recent > 0 else 0.0
+    return (recent - previous) / previous
+
+
+def _auto_unit_number(value: object) -> float | None:
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return None if pd.isna(number) else float(number)
+
+
+@st.cache_data(show_spinner=False)
+def parse_auto_unit_points(file_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Read point parameters and daily economics from «Авто Юнит точки ВМ»."""
+    if not file_bytes:
+        return pd.DataFrame(), pd.DataFrame()
+    workbook = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=False)
+    profile_rows: list[dict[str, object]] = []
+    daily_rows: list[dict[str, object]] = []
+
+    for sheet_name in workbook.sheetnames:
+        if not re.fullmatch(r"\d+", str(sheet_name).strip()):
+            continue
+        fallback_point = int(str(sheet_name).strip())
+        if not 1 <= fallback_point <= 29:
+            continue
+        sheet = workbook[sheet_name]
+        point_number_value = _auto_unit_number(sheet["B1"].value)
+        point_number = int(point_number_value) if point_number_value is not None else fallback_point
+        if not 1 <= point_number <= 29:
+            continue
+
+        point_type = str(sheet["F1"].value or "").strip()
+        active_text = str(sheet["H1"].value or "").strip()
+        work_days: float | None = None
+        work_hours = ""
+        audience_start_row: int | None = None
+        audience_label_col: int | None = None
+
+        scan_max_row = min(sheet.max_row, 120)
+        scan_max_col = min(sheet.max_column, 20)
+        for row_number in range(1, scan_max_row + 1):
+            for column_number in range(1, scan_max_col + 1):
+                value = str(sheet.cell(row_number, column_number).value or "").strip().casefold()
+                if "топ-3 целевой аудитории" in value:
+                    audience_start_row = row_number + 2
+                    audience_label_col = column_number
+                if "график работы" in value:
+                    days_value = _auto_unit_number(sheet.cell(row_number + 1, column_number + 1).value)
+                    if days_value is not None:
+                        work_days = days_value
+                    work_hours = str(sheet.cell(row_number + 1, column_number + 2).value or "").strip()
+
+        female_share = 0.0
+        male_share = 0.0
+        audience_parts: list[str] = []
+        if audience_start_row is not None and audience_label_col is not None:
+            for row_number in range(audience_start_row, audience_start_row + 3):
+                sex = str(sheet.cell(row_number, audience_label_col).value or "").strip()
+                age = str(sheet.cell(row_number, audience_label_col + 1).value or "").strip()
+                share = _auto_unit_number(sheet.cell(row_number, audience_label_col + 2).value) or 0.0
+                sex_low = sex.casefold()
+                if "жен" in sex_low:
+                    female_share += share
+                elif sex_low:
+                    # В рабочем файле встречаются опечатки «мудчины»/«муччины».
+                    male_share += share
+                if sex or age or share:
+                    audience_parts.append(
+                        f"{sex or '—'} {age or ''} {share * 100:.0f}%".strip()
+                    )
+
+        female_dominant = female_share > male_share and female_share > 0
+        profile_rows.append(
+            {
+                "point_number": point_number,
+                "point": f"Т{point_number}",
+                "point_type": point_type,
+                "active": active_text.casefold() in {"да", "yes", "true", "1"},
+                "work_days_per_week": int(round(work_days)) if work_days is not None else pd.NA,
+                "work_hours": work_hours,
+                "female_top3_share": round(female_share, 4),
+                "male_top3_share": round(male_share, 4),
+                "female_dominant": bool(female_dominant),
+                "audience_top3": " · ".join(audience_parts),
+            }
+        )
+
+        header_row: int | None = None
+        header_map: dict[str, int] = {}
+        for row_number in range(1, min(sheet.max_row, 12) + 1):
+            row_headers = {
+                str(sheet.cell(row_number, column_number).value or "").strip(): column_number
+                for column_number in range(1, min(sheet.max_column, 15) + 1)
+                if sheet.cell(row_number, column_number).value is not None
+            }
+            if "Дата" in row_headers and ("$ Итог" in row_headers or "Ср.-й чек" in row_headers):
+                header_row = row_number
+                header_map = row_headers
+                break
+        if header_row is None:
+            continue
+
+        date_col = header_map.get("Дата", 1)
+        revenue_col = header_map.get("$ Итог")
+        checks_col = header_map.get("Чеки Итог")
+        average_check_col = header_map.get("Ср.-й чек")
+        writeoff_col = header_map.get("Списания")
+        for row_number in range(header_row + 1, sheet.max_row + 1):
+            raw_date = sheet.cell(row_number, date_col).value
+            parsed_date = parse_excel_date(raw_date)
+            if parsed_date is None:
+                continue
+            revenue = _auto_unit_number(sheet.cell(row_number, revenue_col).value) if revenue_col else None
+            checks = _auto_unit_number(sheet.cell(row_number, checks_col).value) if checks_col else None
+            avg_check = _auto_unit_number(sheet.cell(row_number, average_check_col).value) if average_check_col else None
+            writeoff = _auto_unit_number(sheet.cell(row_number, writeoff_col).value) if writeoff_col else None
+            if revenue is None and checks is None and avg_check is None and writeoff is None:
+                continue
+            daily_rows.append(
+                {
+                    "point_number": point_number,
+                    "business_date": parsed_date,
+                    "revenue": max(0.0, revenue or 0.0),
+                    "checks": max(0.0, checks or 0.0),
+                    "average_check": max(0.0, avg_check or 0.0),
+                    "writeoff_rub": max(0.0, writeoff or 0.0),
+                }
+            )
+
+    profiles = pd.DataFrame(profile_rows)
+    if not profiles.empty:
+        profiles = profiles.drop_duplicates("point_number", keep="last").sort_values("point_number").reset_index(drop=True)
+    daily = pd.DataFrame(daily_rows)
+    if not daily.empty:
+        daily["business_date"] = pd.to_datetime(daily["business_date"], errors="coerce").dt.date
+        daily = daily[daily["business_date"].notna()].sort_values(["point_number", "business_date"]).reset_index(drop=True)
+    return profiles, daily
+
+
+def build_auto_unit_period_metrics(
+    daily: pd.DataFrame,
+    analysis_date: date,
+    window_days: int = 14,
+) -> dict[int, dict[str, object]]:
+    """Compare recent and previous equal periods for average check and daily revenue."""
+    if daily is None or daily.empty:
+        return {}
+    source = daily.copy()
+    source["business_date"] = pd.to_datetime(source["business_date"], errors="coerce").dt.date
+    source["point_number"] = pd.to_numeric(source["point_number"], errors="coerce")
+    source = source[source["business_date"].notna() & source["point_number"].notna()].copy()
+    source["point_number"] = source["point_number"].astype(int)
+    result: dict[int, dict[str, object]] = {}
+
+    def summarize(period: pd.DataFrame) -> dict[str, float]:
+        if period.empty:
+            return {"revenue": 0.0, "checks": 0.0, "avg_check": 0.0, "revenue_day": 0.0, "days": 0.0}
+        revenue = float(pd.to_numeric(period["revenue"], errors="coerce").fillna(0).clip(lower=0).sum())
+        checks = float(pd.to_numeric(period["checks"], errors="coerce").fillna(0).clip(lower=0).sum())
+        trading = period[(pd.to_numeric(period["revenue"], errors="coerce").fillna(0) > 0) | (pd.to_numeric(period["checks"], errors="coerce").fillna(0) > 0)]
+        days = int(trading["business_date"].nunique())
+        if checks > 0:
+            avg_check = revenue / checks
+        else:
+            avg_check = float(pd.to_numeric(period["average_check"], errors="coerce").dropna().mean() or 0.0)
+        return {
+            "revenue": revenue,
+            "checks": checks,
+            "avg_check": avg_check,
+            "revenue_day": revenue / max(1, days),
+            "days": float(days),
+        }
+
+    for point_number, group in source.groupby("point_number"):
+        eligible = group[group["business_date"] <= analysis_date].copy()
+        if eligible.empty:
+            continue
+        point_as_of = min(analysis_date, max(eligible["business_date"]))
+        recent_start = point_as_of - timedelta(days=window_days - 1)
+        previous_end = recent_start - timedelta(days=1)
+        previous_start = previous_end - timedelta(days=window_days - 1)
+        recent = summarize(eligible[eligible["business_date"].between(recent_start, point_as_of, inclusive="both")])
+        previous = summarize(eligible[eligible["business_date"].between(previous_start, previous_end, inclusive="both")])
+        result[int(point_number)] = {
+            "as_of": point_as_of,
+            "recent_start": recent_start,
+            "previous_start": previous_start,
+            "previous_end": previous_end,
+            "avg_check_recent": recent["avg_check"],
+            "avg_check_previous": previous["avg_check"],
+            "avg_check_trend": _plan_check_trend(recent["avg_check"], previous["avg_check"]),
+            "revenue_day_recent": recent["revenue_day"],
+            "revenue_day_previous": previous["revenue_day"],
+            "revenue_day_trend": _plan_check_trend(recent["revenue_day"], previous["revenue_day"]),
+            "recent_days": int(recent["days"]),
+            "previous_days": int(previous["days"]),
+        }
+    return result
+
+
+def _plan_check_light_vegetable(
+    category: object,
+    entity: object,
+    product_name: object,
+    keywords: tuple[str, ...] | list[str],
+) -> bool:
+    text = " ".join(
+        [
+            str(normalize_matrix_category(category) or ""),
+            str(entity or ""),
+            str(product_name or ""),
+        ]
+    ).casefold().replace("ё", "е")
+    for keyword in keywords:
+        normalized_keyword = str(keyword or "").strip().casefold().replace("ё", "е")
+        if normalized_keyword and normalized_keyword in text:
+            return True
+    return False
+
+
+def build_ready_plan_check(
+    matrix_plans: pd.DataFrame,
+    sales: pd.DataFrame,
+    entities: pd.DataFrame,
+    target_date: date,
+    point_mapping: dict[int, str],
+    trend_threshold: float = 0.10,
+    writeoff_threshold: float = 0.20,
+    minimum_sale_days: int = 3,
+    selected_points: tuple[str, ...] | list[str] | None = None,
+    selected_categories: tuple[str, ...] | list[str] | None = None,
+    auto_unit_profiles: pd.DataFrame | None = None,
+    auto_unit_daily: pd.DataFrame | None = None,
+    avg_check_growth_target: float = 0.05,
+    revenue_growth_target: float = 0.05,
+    light_vegetable_keywords: tuple[str, ...] | list[str] = PLAN_CHECK_LIGHT_VEGETABLE_DEFAULT,
+) -> pd.DataFrame:
+    """Validate an already-filled matrix plan and only adjust the existing values."""
+    if matrix_plans is None or matrix_plans.empty:
+        return pd.DataFrame()
+
+    plans = matrix_plans.copy()
+    plans["plan_date"] = pd.to_datetime(plans["plan_date"], errors="coerce").dt.date
+    plans["point_number"] = pd.to_numeric(plans["point_number"], errors="coerce")
+    plans["analyst_plan"] = pd.to_numeric(plans["analyst_plan"], errors="coerce").fillna(0.0).clip(lower=0)
+    plans["unit_price"] = pd.to_numeric(plans.get("unit_price", 0), errors="coerce").fillna(0.0).clip(lower=0)
+    plans["sku"] = plans["sku"].map(normalize_sku)
+    plans = plans[plans["plan_date"].notna() & plans["point_number"].notna() & plans["sku"].notna()].copy()
+    plans["point_number"] = plans["point_number"].astype(int)
+    plans = plans[plans["point_number"].ne(11)].copy()
+
+    plans = plans.merge(entities[["sku", "category", "entity"]], on="sku", how="left")
+    plans["category"] = plans["category"].fillna(plans["matrix_category"]).map(normalize_matrix_category)
+    plans["entity"] = plans["entity"].fillna("Не сопоставлено")
+
+    target = plans[plans["plan_date"].eq(target_date)].copy()
+    if target.empty:
+        return pd.DataFrame()
+
+    point_to_shop = {
+        int(str(label).lstrip("Тт")): int(shop)
+        for shop, label in point_mapping.items()
+        if str(label).strip().startswith("Т")
+        and str(label).strip().lstrip("Тт").isdigit()
+        and int(str(label).strip().lstrip("Тт")) != 11
+    }
+    target["point"] = target["point_number"].map(lambda number: f"Т{int(number)}")
+    target["shop_number"] = target["point_number"].map(point_to_shop)
+    target["shop_number"] = target["shop_number"].fillna(target["point_number"]).astype(int)
+
+    if selected_points:
+        allowed_points = {normalize_point_label(value) for value in selected_points}
+        target = target[target["point"].isin(allowed_points)].copy()
+    if selected_categories:
+        allowed_categories = {normalize_matrix_category(value) for value in selected_categories}
+        target = target[target["category"].isin(allowed_categories)].copy()
+    if target.empty:
+        return pd.DataFrame()
+
+    analysis_date = min(date.today(), target_date - timedelta(days=1))
+    two_month_start = (pd.Timestamp(target_date) - pd.DateOffset(months=2)).date()
+    trend_start = analysis_date - timedelta(days=13)
+    previous_end = analysis_date - timedelta(days=7)
+    recent_start = analysis_date - timedelta(days=6)
+
+    sold = sales.copy() if sales is not None else pd.DataFrame()
+    if sold.empty:
+        sold = pd.DataFrame(columns=["business_date", "shop_number", "sku", "sold_quantity"])
+    sold["business_date"] = pd.to_datetime(sold.get("business_date"), errors="coerce").dt.date
+    sold["shop_number"] = pd.to_numeric(sold.get("shop_number"), errors="coerce")
+    sold["sku"] = sold.get("sku", pd.Series(index=sold.index, dtype=object)).map(normalize_sku)
+    sold["sold_quantity"] = pd.to_numeric(sold.get("sold_quantity"), errors="coerce").fillna(0.0).clip(lower=0)
+    sold = sold[
+        sold["business_date"].notna()
+        & sold["shop_number"].notna()
+        & sold["sku"].notna()
+        & sold["business_date"].between(two_month_start - timedelta(days=7), analysis_date, inclusive="both")
+    ].copy()
+    sold["shop_number"] = sold["shop_number"].astype(int)
+
+    matrix_sku_category = plans[["sku", "category"]].dropna().drop_duplicates("sku", keep="last").set_index("sku")["category"].to_dict()
+    matrix_sku_entity = plans[["sku", "entity"]].dropna().drop_duplicates("sku", keep="last").set_index("sku")["entity"].to_dict()
+    sold = sold.merge(entities[["sku", "category", "entity"]], on="sku", how="left")
+    sold["category"] = sold["category"].fillna(sold["sku"].map(matrix_sku_category)).map(normalize_matrix_category)
+    sold["entity"] = sold["entity"].fillna(sold["sku"].map(matrix_sku_entity)).fillna("Не сопоставлено")
+
+    sku_window = sold[sold["business_date"].between(two_month_start, analysis_date, inclusive="both")].copy()
+    sku_daily = (
+        sku_window.groupby(["shop_number", "sku", "business_date"], as_index=False)["sold_quantity"].sum()
+        if not sku_window.empty
+        else pd.DataFrame(columns=["shop_number", "sku", "business_date", "sold_quantity"])
+    )
+    sku_daily = sku_daily[sku_daily["sold_quantity"] > 0].copy()
+    sku_stats: dict[tuple[int, str], dict[str, float]] = {}
+    if not sku_daily.empty:
+        for (shop_number, sku), group in sku_daily.groupby(["shop_number", "sku"]):
+            sku_stats[(int(shop_number), str(sku))] = {
+                "sale_days": float(group["business_date"].nunique()),
+                "sold_total": float(group["sold_quantity"].sum()),
+                "avg_sale_day": float(group["sold_quantity"].sum() / max(1, group["business_date"].nunique())),
+            }
+
+    trend_sales = sold[sold["business_date"].between(trend_start, analysis_date, inclusive="both")].copy()
+
+    def build_trend_lookup(group_columns: list[str]) -> dict[tuple, dict[str, float]]:
+        lookup: dict[tuple, dict[str, float]] = {}
+        if trend_sales.empty:
+            return lookup
+        grouped = trend_sales.groupby([*group_columns, "business_date"], as_index=False)["sold_quantity"].sum()
+        for keys, group in grouped.groupby(group_columns):
+            if not isinstance(keys, tuple):
+                keys = (keys,)
+            previous_sum = float(group.loc[group["business_date"].between(trend_start, previous_end, inclusive="both"), "sold_quantity"].sum())
+            recent_sum = float(group.loc[group["business_date"].between(recent_start, analysis_date, inclusive="both"), "sold_quantity"].sum())
+            total_14 = previous_sum + recent_sum
+            lookup[tuple(keys)] = {
+                "previous_avg": previous_sum / 7.0,
+                "recent_avg": recent_sum / 7.0,
+                "avg_14": total_14 / 14.0,
+                "trend": _plan_check_trend(recent_sum / 7.0, previous_sum / 7.0),
+            }
+        return lookup
+
+    sku_trends = build_trend_lookup(["shop_number", "sku"])
+    category_trends = build_trend_lookup(["shop_number", "category"])
+    entity_trends = build_trend_lookup(["shop_number", "category", "entity"])
+
+    freshness_lookup: dict[tuple[int, str], dict[str, float | int | str]] = {}
+    point_numbers = sorted(target["point_number"].unique().tolist())
+    freshness_start = two_month_start - timedelta(days=7)
+    historical_plans = plans[plans["plan_date"].between(freshness_start, analysis_date, inclusive="both")].copy()
+    for point_number in point_numbers:
+        shop_number = int(point_to_shop.get(int(point_number), int(point_number)))
+        point_plans = historical_plans[historical_plans["point_number"].eq(int(point_number))].copy()
+        if point_plans.empty:
+            continue
+        point_sales = sold[sold["shop_number"].eq(shop_number)].copy()
+        try:
+            freshness = build_sales_time_period(point_plans, point_sales, entities, two_month_start, analysis_date, as_of_date=analysis_date)
+        except Exception:
+            freshness = pd.DataFrame()
+        if freshness.empty:
+            continue
+        freshness["Дата отгрузки"] = pd.to_datetime(freshness["Дата отгрузки"], errors="coerce").dt.date
+        for sku, group in freshness.groupby("SKU", dropna=False):
+            sku_key = normalize_sku(sku)
+            if sku_key is None:
+                continue
+            completed_mask = group["Статус партии"].astype(str).str.startswith("Срок завершён") | group["Статус партии"].astype(str).eq("Реализована")
+            completed = group[completed_mask].copy()
+            expired = group[group["Статус партии"].astype(str).str.startswith("Срок завершён")].copy()
+            green_avg = float(pd.to_numeric(completed.get("Продано в зелёный период"), errors="coerce").fillna(0).mean()) if not completed.empty else 0.0
+            grey_avg = float(pd.to_numeric(completed.get("Продано в серый период"), errors="coerce").fillna(0).mean()) if not completed.empty else 0.0
+            expired_plan = float(pd.to_numeric(expired.get("Отгружено по плану"), errors="coerce").fillna(0).sum()) if not expired.empty else 0.0
+            expired_writeoff = float(pd.to_numeric(expired.get("Списания"), errors="coerce").fillna(0).sum()) if not expired.empty else 0.0
+            writeoff_rate = expired_writeoff / expired_plan if expired_plan > 0 else 0.0
+            green_remaining = 0
+            live_green_sales = 0.0
+            live = group[group["Статус партии"].astype(str).eq("В жизненном цикле")].sort_values("Дата отгрузки")
+            if not live.empty:
+                latest = live.iloc[-1]
+                shipment_date = latest["Дата отгрузки"]
+                green_days = int(pd.to_numeric(pd.Series([latest.get("Зелёный период, дней")]), errors="coerce").fillna(0).iloc[0])
+                if pd.notna(shipment_date):
+                    elapsed = max(0, (analysis_date - shipment_date).days)
+                    green_remaining = max(0, green_days - elapsed)
+                live_green_sales = float(pd.to_numeric(pd.Series([latest.get("Продано в зелёный период")]), errors="coerce").fillna(0).iloc[0])
+            freshness_lookup[(int(point_number), sku_key)] = {
+                "completed_batches": int(len(completed)),
+                "green_avg": green_avg,
+                "grey_avg": grey_avg,
+                "writeoff_rate": writeoff_rate,
+                "writeoff_qty": expired_writeoff,
+                "green_remaining": int(green_remaining),
+                "live_green_sales": live_green_sales,
+            }
+
+    profile_lookup: dict[int, dict[str, object]] = {}
+    if auto_unit_profiles is not None and not auto_unit_profiles.empty:
+        for _, profile in auto_unit_profiles.iterrows():
+            point_value = pd.to_numeric(pd.Series([profile.get("point_number")]), errors="coerce").iloc[0]
+            if pd.notna(point_value):
+                profile_lookup[int(point_value)] = profile.to_dict()
+    economics_lookup = build_auto_unit_period_metrics(auto_unit_daily, analysis_date, window_days=14)
+    point_price_median = (
+        target[target["unit_price"] > 0].groupby("point_number")["unit_price"].median().to_dict()
+        if "unit_price" in target.columns else {}
+    )
+
+    rows: list[dict[str, object]] = []
+    for _, item in target.iterrows():
+        point_number = int(item["point_number"])
+        shop_number = int(item["shop_number"])
+        sku = str(item["sku"])
+        category = normalize_matrix_category(item["category"])
+        entity = str(item.get("entity") or "Не сопоставлено")
+        product_name = str(item.get("product_name") or "")
+        unit_price = float(pd.to_numeric(pd.Series([item.get("unit_price", 0)]), errors="coerce").fillna(0).iloc[0])
+        current_plan = int(round(float(item["analyst_plan"])))
+        nominal_minimum = plan_check_minimum(category)
+        nominal_coverage_days = forecast_coverage_days(category)
+
+        profile = profile_lookup.get(point_number, {})
+        work_days_value = pd.to_numeric(pd.Series([profile.get("work_days_per_week")]), errors="coerce").iloc[0]
+        work_days = int(work_days_value) if pd.notna(work_days_value) else 0
+        five_day_thursday = work_days == 5 and target_date.weekday() == 3
+        minimum_applies = not five_day_thursday
+        effective_minimum = nominal_minimum if minimum_applies else 0
+        effective_coverage_days = 1 if five_day_thursday else nominal_coverage_days
+        female_dominant = bool(profile.get("female_dominant", False))
+        female_share = float(profile.get("female_top3_share", 0.0) or 0.0)
+        male_share = float(profile.get("male_top3_share", 0.0) or 0.0)
+        light_vegetable = _plan_check_light_vegetable(category, entity, product_name, light_vegetable_keywords)
+
+        stats = sku_stats.get((shop_number, sku), {})
+        sale_days = int(stats.get("sale_days", 0))
+        avg_sale_day = float(stats.get("avg_sale_day", 0.0))
+        sku_orientation = (
+            max(effective_minimum, int(math.ceil(avg_sale_day * effective_coverage_days)))
+            if avg_sale_day > 0 else effective_minimum
+        )
+
+        sku_trend = sku_trends.get((shop_number, sku), {"previous_avg": 0.0, "recent_avg": 0.0, "avg_14": 0.0, "trend": 0.0})
+        cat_trend = category_trends.get((shop_number, category), {"previous_avg": 0.0, "recent_avg": 0.0, "avg_14": 0.0, "trend": 0.0})
+        ent_trend = entity_trends.get((shop_number, category, entity), {"previous_avg": 0.0, "recent_avg": 0.0, "avg_14": 0.0, "trend": 0.0})
+        fresh = freshness_lookup.get((point_number, sku), {
+            "completed_batches": 0, "green_avg": 0.0, "grey_avg": 0.0,
+            "writeoff_rate": 0.0, "writeoff_qty": 0.0, "green_remaining": 0,
+            "live_green_sales": 0.0,
+        })
+        economics = economics_lookup.get(point_number, {})
+        avg_check_trend = float(economics.get("avg_check_trend", 0.0) or 0.0)
+        revenue_day_trend = float(economics.get("revenue_day_trend", 0.0) or 0.0)
+        avg_check_below_goal = bool(economics) and avg_check_trend < float(avg_check_growth_target)
+        revenue_below_goal = bool(economics) and revenue_day_trend < float(revenue_growth_target)
+        price_median = float(point_price_median.get(point_number, 0.0) or 0.0)
+        high_value_item = unit_price > 0 and price_median > 0 and unit_price >= price_median
+
+        # Важно: обновление идёт ОТ уже заполненного значения категорийщика.
+        recommended = current_plan
+        reasons: list[str] = []
+        checks: list[str] = []
+        if minimum_applies and current_plan < nominal_minimum:
+            recommended = nominal_minimum
+            reasons.append(f"минимум категории {nominal_minimum} шт.")
+        elif five_day_thursday:
+            checks.append("Авто Юнит: 5-дневная точка, четверг = загрузка 1 дня; нижний минимум категории отключён")
+
+        sparse_sku = sale_days < int(minimum_sale_days)
+        if sparse_sku:
+            checks.append(f"SKU: только {sale_days} дн. продаж — опора на категорию/сущность")
+
+        if int(fresh["green_remaining"]) == 1 and float(fresh["live_green_sales"]) > 0:
+            recommended += 1
+            reasons.append("+1: живая партия продаётся в зелёный период, остался 1 зелёный день")
+
+        if float(ent_trend["trend"]) >= float(trend_threshold):
+            if float(cat_trend["trend"]) > -float(trend_threshold):
+                recommended += 1
+                reasons.append(f"+1: сущность растёт {float(ent_trend['trend']) * 100:+.1f}% за 7д к предыдущим 7д")
+            else:
+                checks.append("рост сущности не подтверждён категорией")
+
+        # Авто Юнит: женская аудитория -> поддержка лёгких овощных блюд, но только без сильного встречного риска.
+        if female_dominant and light_vegetable:
+            if (
+                float(fresh["writeoff_rate"]) < float(writeoff_threshold)
+                and float(ent_trend["trend"]) > -float(trend_threshold)
+                and (avg_sale_day > 0 or float(ent_trend["recent_avg"]) > 0)
+            ):
+                recommended += 1
+                reasons.append(
+                    f"+1: Авто Юнит — в ТОП-3 аудитории преобладают женщины ({female_share * 100:.0f}% против {male_share * 100:.0f}%), лёгкое овощное блюдо"
+                )
+            else:
+                checks.append("женская аудитория поддерживает лёгкое блюдо, но падение/списания не дают автоматически увеличить")
+
+        if (
+            not sparse_sku
+            and float(sku_trend["trend"]) <= -float(trend_threshold)
+            and float(fresh["writeoff_rate"]) >= float(writeoff_threshold)
+        ):
+            recommended -= 1
+            reasons.append(f"−1: SKU падает {float(sku_trend['trend']) * 100:+.1f}% и списание {float(fresh['writeoff_rate']) * 100:.1f}%")
+
+        green_avg = float(fresh["green_avg"])
+        grey_avg = float(fresh["grey_avg"])
+        if int(fresh["completed_batches"]) > 0 and grey_avg > green_avg and green_avg > 0:
+            if five_day_thursday:
+                green_anchor_raw = green_avg / max(1, product_green_days(category))
+            else:
+                green_anchor_raw = green_avg
+            green_anchor = max(effective_minimum, int(math.ceil(green_anchor_raw)))
+            if recommended > green_anchor:
+                recommended = green_anchor
+                reasons.append(f"ориентир по зелёным продажам: серый период преобладает ({grey_avg:.1f} > {green_avg:.1f})")
+
+        if float(ent_trend["trend"]) <= -float(trend_threshold):
+            recommended -= 2
+            reasons.append(f"−2: сущность падает {float(ent_trend['trend']) * 100:+.1f}% за 7д к предыдущим 7д")
+
+        recommended = max(effective_minimum, int(round(recommended)))
+        delta = int(recommended - current_plan)
+        if delta > 0:
+            action = f"Добавить +{delta}"
+        elif delta < 0:
+            action = f"Убавить {delta}"
+        else:
+            action = "Оставить"
+
+        if current_plan >= sku_orientation + 2:
+            checks.append(f"текущий план выше SKU-ориентира {sku_orientation} шт.")
+        elif current_plan + 2 <= sku_orientation:
+            checks.append(f"текущий план ниже SKU-ориентира {sku_orientation} шт.")
+
+        economic_recommendation = "Нет данных Авто Юнит за сравнимые периоды"
+        if economics:
+            avg_check_recent = float(economics.get("avg_check_recent", 0.0) or 0.0)
+            avg_check_previous = float(economics.get("avg_check_previous", 0.0) or 0.0)
+            revenue_recent = float(economics.get("revenue_day_recent", 0.0) or 0.0)
+            revenue_previous = float(economics.get("revenue_day_previous", 0.0) or 0.0)
+            gaps: list[str] = []
+            if avg_check_below_goal:
+                gaps.append(f"ср. чек {avg_check_trend * 100:+.1f}% при цели ≥ {avg_check_growth_target * 100:+.1f}%")
+            if revenue_below_goal:
+                gaps.append(f"выручка/раб.день {revenue_day_trend * 100:+.1f}% при цели ≥ {revenue_growth_target * 100:+.1f}%")
+            if gaps:
+                if high_value_item and max(float(sku_trend["trend"]), float(ent_trend["trend"]), float(cat_trend["trend"])) >= 0 and float(fresh["writeoff_rate"]) < float(writeoff_threshold):
+                    economic_recommendation = "Поддерживать позицию: цена не ниже медианы меню, спрос не падает; может помогать росту среднего чека/дохода"
+                else:
+                    economic_recommendation = "Цель среднего чека/дохода не достигнута: увеличить стоит прежде всего растущие позиции с ценой не ниже медианы и без высокого списания"
+                checks.append("Авто Юнит: " + "; ".join(gaps))
+            else:
+                economic_recommendation = "Средний чек и выручка/раб.день соответствуют заданной цели роста"
+        else:
+            avg_check_recent = avg_check_previous = revenue_recent = revenue_previous = 0.0
+
+        strong_conflict = (
+            abs(delta) >= 2
+            or (
+                float(sku_trend["trend"]) <= -float(trend_threshold)
+                and float(fresh["writeoff_rate"]) >= float(writeoff_threshold)
+                and float(ent_trend["trend"]) <= -float(trend_threshold)
+            )
+        )
+        if strong_conflict:
+            agreement = "Красное · полное несогласие"
+        elif delta != 0 or sparse_sku or avg_check_below_goal or revenue_below_goal or (female_dominant and light_vegetable):
+            agreement = "Жёлтое · сомнение / рекомендация"
+        else:
+            agreement = "Зелёное · согласие"
+
+        if not reasons:
+            reasons.append("сигналов для изменения количества нет")
+
+        rows.append(
+            {
+                "Дата плана": target_date,
+                "День недели": WEEKDAY_RU.get(target_date.weekday(), ""),
+                "Точка": item["point"],
+                "Номер магазина": shop_number,
+                "Категория": category,
+                "Сущность": entity,
+                "SKU": sku,
+                "Название товара": product_name,
+                "Цена": round(unit_price, 2),
+                "Текущий план": current_plan,
+                "Рекомендованный план": recommended,
+                "Изменение": delta,
+                "Действие": action,
+                "Согласие системы": agreement,
+                "Минимум номинальный": nominal_minimum,
+                "Минимум действует": "Нет · четверг 5-дневной точки" if five_day_thursday else "Да",
+                "Дней покрытия проверки": effective_coverage_days,
+                "СР SKU / день продаж · 2 мес": round(avg_sale_day, 2),
+                "Дней продаж SKU · 2 мес": sale_days,
+                "Ориентир SKU × цикл": sku_orientation,
+                "Категория СР/день · 14д": round(float(cat_trend["avg_14"]), 2),
+                "Категория предыдущие 7д": round(float(cat_trend["previous_avg"]), 2),
+                "Категория последние 7д": round(float(cat_trend["recent_avg"]), 2),
+                "Тренд категории, %": round(float(cat_trend["trend"]) * 100, 1),
+                "Сущность предыдущие 7д": round(float(ent_trend["previous_avg"]), 2),
+                "Сущность последние 7д": round(float(ent_trend["recent_avg"]), 2),
+                "Тренд сущности, %": round(float(ent_trend["trend"]) * 100, 1),
+                "Тренд SKU, %": round(float(sku_trend["trend"]) * 100, 1),
+                "Зелёные продажи / партия": round(green_avg, 2),
+                "Серые продажи / партия": round(grey_avg, 2),
+                "Завершённых партий": int(fresh["completed_batches"]),
+                "Списание, %": round(float(fresh["writeoff_rate"]) * 100, 1),
+                "Списание, шт.": round(float(fresh["writeoff_qty"]), 2),
+                "Осталось зелёных дней": int(fresh["green_remaining"]),
+                "Продано в зелёном у живой партии": round(float(fresh["live_green_sales"]), 2),
+                "Авто Юнит · дней/нед": work_days if work_days else pd.NA,
+                "Авто Юнит · тип точки": str(profile.get("point_type", "")),
+                "Женская доля ТОП-3, %": round(female_share * 100, 1),
+                "Мужская доля ТОП-3, %": round(male_share * 100, 1),
+                "Женская аудитория преобладает": "Да" if female_dominant else "Нет",
+                "Лёгкое овощное блюдо": "Да" if light_vegetable else "Нет",
+                "Авто Юнит · данные по": economics.get("as_of") if economics else pd.NaT,
+                "Ср. чек · пред. 14д": round(avg_check_previous, 2),
+                "Ср. чек · посл. 14д": round(avg_check_recent, 2),
+                "Тренд ср. чека, %": round(avg_check_trend * 100, 1) if economics else pd.NA,
+                "Выручка/раб.день · пред. 14д": round(revenue_previous, 2),
+                "Выручка/раб.день · посл. 14д": round(revenue_recent, 2),
+                "Тренд выручки/раб.день, %": round(revenue_day_trend * 100, 1) if economics else pd.NA,
+                "Экономическая рекомендация": economic_recommendation,
+                "Причина": "; ".join(reasons),
+                "Контроль": "; ".join(checks),
+                "Основа при нехватке данных": "Сущность + категория" if sparse_sku else "SKU + свежесть + категория + сущность",
+                "Факт по состоянию на": analysis_date,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+    result = pd.DataFrame(rows)
+    result["_point_sort"] = pd.to_numeric(result["Точка"].astype(str).str.extract(r"(\d+)", expand=False), errors="coerce")
+    return result.sort_values(["_point_sort", "Категория", "Сущность", "Название товара"], kind="stable").drop(columns="_point_sort").reset_index(drop=True)
+
+
+def ready_plan_check_excel(
+    result: pd.DataFrame,
+    target_date: date,
+    trend_threshold: float,
+    writeoff_threshold: float,
+    minimum_sale_days: int,
+    avg_check_growth_target: float = 0.05,
+    revenue_growth_target: float = 0.05,
+    light_vegetable_keywords: tuple[str, ...] | list[str] = PLAN_CHECK_LIGHT_VEGETABLE_DEFAULT,
+) -> bytes:
+    buffer = io.BytesIO()
+    rules = pd.DataFrame(
+        [
+            ["База", "Текущее значение матрицы", "Все изменения считаются только от уже заполненного плана категорийщика"],
+            ["SKU", "Среднее за 2 календарных месяца", "Среднее только по фактическим дням продаж SKU"],
+            ["Свежесть", "FIFO по факту продаж", "Зелёные/серые продажи и списание завершённых партий"],
+            ["Категория", "14 дней", "Последние 7 дней сравниваются с предыдущими 7 днями"],
+            ["Сущность", "Fallback / контроль", "Используется при нехватке данных SKU и как сигнал роста/падения"],
+            ["Добавить", "+1", "Продажи в зелёном + у живой партии остался 1 зелёный день"],
+            ["Добавить", "+1", f"Рост сущности не менее {trend_threshold * 100:.0f}% и категория не падает"],
+            ["Авто Юнит", "+1", "Если в ТОП-3 преобладает женская аудитория и SKU — лёгкое овощное блюдо без встречного риска"],
+            ["Убавить", "−1", f"Падение SKU не менее {trend_threshold * 100:.0f}% + списание не менее {writeoff_threshold * 100:.0f}%"],
+            ["Убавить", "Ориентир зелёных продаж", "Если продажи серого периода преобладают"],
+            ["Убавить", "−2", f"Падение сущности не менее {trend_threshold * 100:.0f}%"],
+            ["Минимум", "3", "Вторые блюда"],
+            ["Минимум", "5", "Напитки"],
+            ["Минимум", "1", "Япония"],
+            ["Минимум", "2", "Остальные категории"],
+            ["Авто Юнит · 5 дней", "Четверг = 1 день", "В четверг нижний минимум категории не применяется; цикл проверки = 1 день"],
+            ["Экономика", f"Ср. чек цель ≥ {avg_check_growth_target * 100:+.1f}%", "Сравниваются последние 14 дней с предыдущими 14 днями"],
+            ["Экономика", f"Выручка/раб.день цель ≥ {revenue_growth_target * 100:+.1f}%", "При недостижении цели система выделяет позиции, способные поддержать чек/доход"],
+            ["Цвет", "Зелёный", "Система согласна с текущим значением"],
+            ["Цвет", "Жёлтый", "Есть сомнение, нехватка данных или рекомендация ±1"],
+            ["Цвет", "Красный", "Полное несогласие: сильный конфликт или изменение минимум на 2 шт."],
+            ["Недостаточно данных SKU", f"< {minimum_sale_days} дней", "Основной fallback — сущность + категория"],
+        ],
+        columns=["Блок", "Правило", "Описание"],
+    )
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        result.to_excel(writer, index=False, sheet_name="Проверка")
+        rules.to_excel(writer, index=False, sheet_name="Логика")
+        pd.DataFrame(
+            {
+                "Параметр": [
+                    "Дата плана", "Порог тренда", "Большое списание", "Минимум дней продаж SKU",
+                    "Цель роста среднего чека", "Цель роста выручки/раб.день", "Ключи лёгких овощных блюд",
+                ],
+                "Значение": [
+                    target_date.strftime("%d.%m.%Y"),
+                    f"{trend_threshold * 100:.0f}%",
+                    f"{writeoff_threshold * 100:.0f}%",
+                    int(minimum_sale_days),
+                    f"{avg_check_growth_target * 100:+.1f}%",
+                    f"{revenue_growth_target * 100:+.1f}%",
+                    ", ".join(light_vegetable_keywords),
+                ],
+            }
+        ).to_excel(writer, index=False, sheet_name="Параметры")
+        auto_columns = [
+            "Точка", "Авто Юнит · дней/нед", "Авто Юнит · тип точки", "Женская доля ТОП-3, %",
+            "Мужская доля ТОП-3, %", "Женская аудитория преобладает", "Авто Юнит · данные по",
+            "Ср. чек · пред. 14д", "Ср. чек · посл. 14д", "Тренд ср. чека, %",
+            "Выручка/раб.день · пред. 14д", "Выручка/раб.день · посл. 14д", "Тренд выручки/раб.день, %",
+        ]
+        auto_columns = [column for column in auto_columns if column in result.columns]
+        if auto_columns:
+            result[auto_columns].drop_duplicates("Точка").to_excel(writer, index=False, sheet_name="Авто Юнит точки")
+
+        green_fill = PatternFill("solid", fgColor="D9EAD3")
+        yellow_fill = PatternFill("solid", fgColor="FFF2CC")
+        red_fill = PatternFill("solid", fgColor="F4CCCC")
+        for sheet in writer.book.worksheets:
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            for cells in sheet.columns:
+                width = min(max(len(str(cell.value or "")) for cell in cells) + 2, 52)
+                sheet.column_dimensions[cells[0].column_letter].width = width
+        check_sheet = writer.book["Проверка"]
+        header_map = {str(cell.value): cell.column for cell in check_sheet[1] if cell.value is not None}
+        agreement_col = header_map.get("Согласие системы")
+        if agreement_col:
+            for row_number in range(2, check_sheet.max_row + 1):
+                status = str(check_sheet.cell(row_number, agreement_col).value or "")
+                fill = red_fill if status.startswith("Красное") else yellow_fill if status.startswith("Жёлтое") else green_fill
+                for cell in check_sheet[row_number]:
+                    cell.fill = fill
+    return buffer.getvalue()
+
+
 def export_excel(
     sku_point: pd.DataFrame,
     category_profile: pd.DataFrame,
@@ -4524,7 +5276,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.9.0")
+    st.caption("Аналитика спроса · версия 75.11.0 · PLAN-CHECK + AUTO UNIT")
     st.caption("Автозагрузка данных · SEPARATE-MENU")
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
         pg_host = st.text_input(
@@ -4693,6 +5445,7 @@ MENU_ITEMS = [
     ("Окно свежести", ":material/calendar_month:"),
     ("Списания категорий", ":material/delete:"),
     ("Прогноз плана", ":material/track_changes:"),
+    ("Проверка", ":material/fact_check:"),
 ]
 SECTION_STATE_KEY = "main_section_v759"
 MENU_LABELS = [label for label, _ in MENU_ITEMS]
@@ -4872,8 +5625,8 @@ if selected_main_section is None:
                     on_click=_open_main_section,
                     args=(label,),
                 )
-        third_row = st.columns([0.5, 1, 1, 1, 0.5])
-        for column, (label, icon) in zip(third_row[1:4], MENU_ITEMS[8:]):
+        third_row = st.columns(4)
+        for column, (label, icon) in zip(third_row, MENU_ITEMS[8:12]):
             with column:
                 st.button(
                     label,
@@ -5073,7 +5826,7 @@ class _MainSection:
         return False
 
 
-tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_forecast = [
+tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_forecast, tab_plan_check = [
     _MainSection(label) for label, _ in MENU_ITEMS
 ]
 
@@ -9977,6 +10730,308 @@ if tab_category_writeoffs.open:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     key="download_category_writeoffs_v62",
                 )
+
+
+if tab_plan_check.open:
+    with tab_plan_check:
+        st.subheader("Проверка готового плана")
+        st.caption(
+            "Проверка НЕ строит новый план. Базой всегда остаётся уже заполненное значение категорийщика "
+            "из текущей матрицы. Система проверяет его по SKU, фактической свежести, категории, сущности "
+            "и параметрам точки из «Авто Юнит точки ВМ», после чего предлагает только корректировку к текущему значению."
+        )
+
+        check_matrix_bytes, check_matrix_source, check_matrix_checked_at, check_matrix_error = _load_matrix_context_for_active_tab()
+        if not check_matrix_bytes:
+            st.error("Текущая матрица недоступна. Проверьте Apps Script или резервный combo_matrix.xlsx.")
+            if check_matrix_error:
+                st.caption(f"Причина: {check_matrix_error}")
+        else:
+            source_text = check_matrix_source or "текущая матрица"
+            checked_text = str(check_matrix_checked_at or "").replace("T", " ")
+            st.success(f"Готовый план подключён: {source_text}" + (f" · проверено {checked_text}" if checked_text else ""))
+            if check_matrix_error:
+                st.caption(f"Использован резервный источник. Основной источник сообщил: {check_matrix_error}")
+
+            try:
+                ready_matrix_plans = parse_analyst_plan_history(check_matrix_bytes)
+            except Exception as error:
+                st.error(f"Не удалось прочитать заполненный план из матрицы: {error}")
+                ready_matrix_plans = pd.DataFrame()
+
+            auto_unit_bytes = b""
+            auto_unit_source = ""
+            with st.expander("Авто Юнит точки ВМ · параметры точек и экономика", expanded=False):
+                st.caption(
+                    "Используются график работы, ТОП-3 аудитории, дневная выручка, чеки и средний чек. "
+                    "Если файл auto_unit_points_vm.xlsx / «Авто Юнит точки ВМ.xlsx» лежит рядом с app.py, он подключается автоматически."
+                )
+                auto_unit_upload = st.file_uploader(
+                    "Заменить источник Авто Юнит (.xlsx)",
+                    type=["xlsx"],
+                    key="ready_plan_check_auto_unit_upload_v2",
+                )
+                if auto_unit_upload is not None:
+                    auto_unit_bytes = auto_unit_upload.getvalue()
+                    auto_unit_source = auto_unit_upload.name
+                elif AUTO_UNIT_FILE.exists():
+                    try:
+                        auto_unit_bytes = AUTO_UNIT_FILE.read_bytes()
+                        auto_unit_source = AUTO_UNIT_FILE.name
+                    except OSError:
+                        auto_unit_bytes = b""
+
+            if auto_unit_bytes:
+                try:
+                    auto_unit_profiles, auto_unit_daily = parse_auto_unit_points(auto_unit_bytes)
+                except Exception as error:
+                    st.warning(f"Авто Юнит не удалось прочитать: {error}")
+                    auto_unit_profiles, auto_unit_daily = pd.DataFrame(), pd.DataFrame()
+            else:
+                auto_unit_profiles, auto_unit_daily = pd.DataFrame(), pd.DataFrame()
+
+            if not auto_unit_profiles.empty:
+                active_profiles = auto_unit_profiles[auto_unit_profiles["active"].fillna(False)].copy()
+                auto_metrics = st.columns(4)
+                auto_metrics[0].metric("Авто Юнит · точек", active_profiles["point_number"].nunique())
+                auto_metrics[1].metric("5-дневных", int(pd.to_numeric(active_profiles["work_days_per_week"], errors="coerce").eq(5).sum()))
+                auto_metrics[2].metric("Женская аудитория", int(active_profiles["female_dominant"].fillna(False).sum()))
+                latest_auto_date = pd.to_datetime(auto_unit_daily.get("business_date"), errors="coerce").max() if not auto_unit_daily.empty else pd.NaT
+                auto_metrics[3].metric("Данные по", latest_auto_date.strftime("%d.%m.%Y") if pd.notna(latest_auto_date) else "—")
+                st.caption(f"Источник Авто Юнит: {auto_unit_source}")
+            else:
+                st.warning("Авто Юнит не подключён. Базовая проверка SKU/свежести/категории/сущности продолжит работать, но правила графика, аудитории и среднего чека применены не будут.")
+
+            if ready_matrix_plans.empty:
+                st.warning("В текущей матрице не найдены заполненные основные блоки «План на день кухня».")
+            else:
+                ready_matrix_plans["plan_date"] = pd.to_datetime(ready_matrix_plans["plan_date"], errors="coerce").dt.date
+                check_dates = sorted(ready_matrix_plans["plan_date"].dropna().unique().tolist())
+                future_dates = [value for value in check_dates if value >= today]
+                default_check_date = future_dates[0] if future_dates else check_dates[-1]
+                default_index = check_dates.index(default_check_date)
+
+                check_control_columns = st.columns([1.5, 1.0, 1.0, 1.0, 1.0, 1.0])
+                with check_control_columns[0]:
+                    check_target_date = st.selectbox(
+                        "Дата готового плана",
+                        check_dates,
+                        index=default_index,
+                        format_func=lambda value: f"{value:%d.%m.%Y} · {WEEKDAY_RU.get(value.weekday(), '')}",
+                        key="ready_plan_check_date_v2",
+                    )
+                with check_control_columns[1]:
+                    check_trend_percent = st.number_input("Рост / падение, %", min_value=1.0, max_value=100.0, value=10.0, step=1.0, key="ready_plan_check_trend_v2")
+                with check_control_columns[2]:
+                    check_writeoff_percent = st.number_input("Большое списание, %", min_value=1.0, max_value=100.0, value=20.0, step=1.0, key="ready_plan_check_writeoff_v2")
+                with check_control_columns[3]:
+                    check_min_sale_days = st.number_input("Мин. дней SKU", min_value=1, max_value=30, value=3, step=1, key="ready_plan_check_min_days_v2")
+                with check_control_columns[4]:
+                    check_avg_target = st.number_input("Цель ср. чека, %", min_value=-50.0, max_value=100.0, value=5.0, step=1.0, key="ready_plan_check_avg_target_v2")
+                with check_control_columns[5]:
+                    check_revenue_target = st.number_input("Цель дохода, %", min_value=-50.0, max_value=100.0, value=5.0, step=1.0, key="ready_plan_check_revenue_target_v2")
+
+                light_keywords_text = st.text_input(
+                    "Ключи лёгких овощных блюд",
+                    value=", ".join(PLAN_CHECK_LIGHT_VEGETABLE_DEFAULT),
+                    key="ready_plan_check_light_keywords_v2",
+                    help="По этим фрагментам в категории/сущности/названии определяется лёгкое овощное блюдо для правила женской аудитории.",
+                )
+                light_keywords = tuple(
+                    value.strip() for value in light_keywords_text.split(",") if value.strip()
+                ) or PLAN_CHECK_LIGHT_VEGETABLE_DEFAULT
+
+                target_plan_preview = ready_matrix_plans[ready_matrix_plans["plan_date"].eq(check_target_date)].copy()
+                plan_preview_metrics = st.columns(4)
+                plan_preview_metrics[0].metric("Строк плана", f"{len(target_plan_preview):,}".replace(",", " "))
+                plan_preview_metrics[1].metric("Точек", target_plan_preview["point_number"].nunique())
+                plan_preview_metrics[2].metric("SKU", target_plan_preview["sku"].nunique())
+                plan_preview_metrics[3].metric("План, шт.", f"{pd.to_numeric(target_plan_preview['analyst_plan'], errors='coerce').fillna(0).sum():,.0f}".replace(",", " "))
+                st.caption("Проверка выполняется по всем точкам и категориям выбранной даты. Рекомендация всегда считается от текущего значения в матрице.")
+
+                with st.expander("Логика проверки", expanded=False):
+                    st.markdown(
+                        f"""
+**Основа**  
+1. SKU — среднее только по дням фактических продаж за 2 месяца.  
+2. Цикл — фактическая свежесть FIFO: зелёные/серые продажи и списания.  
+3. Категория — 14 дней: последние 7 против предыдущих 7.  
+4. Сущность — fallback при нехватке данных SKU и отдельный сигнал роста/падения.
+
+**Добавить к уже проставленному значению**  
+- +1: товар продаётся в зелёном периоде, у живой партии остался 1 зелёный день.  
+- +1: сущность растёт минимум на **{check_trend_percent:.0f}%**, категория не противоречит.  
+- +1: по Авто Юнит женская аудитория преобладает, а SKU определён как лёгкое овощное блюдо и нет сильного риска списаний/падения.
+
+**Убавить от уже проставленного значения**  
+- −1: SKU падает минимум на **{check_trend_percent:.0f}%** и списание ≥ **{check_writeoff_percent:.0f}%**.  
+- если серые продажи преобладают — ориентир на зелёные продажи.  
+- −2: сущность падает минимум на **{check_trend_percent:.0f}%**.
+
+**Минимумы**: вторые блюда 3 · остальные 2 · напитки 5 · Япония 1.  
+**Исключение Авто Юнит**: на 5-дневной точке в **четверг** проверяется загрузка только **1 дня**, поэтому нижний минимум категории в этот день не применяется.
+
+**Экономика точки**: последние 14 дней среднего чека и выручки/рабочий день сравниваются с предыдущими 14. Цели: ср. чек ≥ **{check_avg_target:+.1f}%**, доход ≥ **{check_revenue_target:+.1f}%**.
+
+**Цвет согласия**  
+🟢 зелёный — система согласна; 🟡 жёлтый — сомнение/рекомендация; 🔴 красный — полное несогласие.
+                        """
+                    )
+
+                check_signature = (
+                    _combo_matrix_signature(check_matrix_bytes, check_matrix_source),
+                    check_target_date,
+                    round(float(check_trend_percent), 3),
+                    round(float(check_writeoff_percent), 3),
+                    int(check_min_sale_days),
+                    round(float(check_avg_target), 3),
+                    round(float(check_revenue_target), 3),
+                    light_keywords,
+                    hashlib.sha256(auto_unit_bytes).hexdigest()[:16] if auto_unit_bytes else "NO_AUTO_UNIT",
+                    "ALL_POINTS",
+                    "ALL_CATEGORIES",
+                )
+                if st.session_state.get("ready_plan_check_signature_v2") != check_signature:
+                    st.session_state.pop("ready_plan_check_result_v2", None)
+
+                if st.button("Проверить готовый план", type="primary", use_container_width=True, key="ready_plan_check_button_v2"):
+                    analysis_date = min(today, check_target_date - timedelta(days=1))
+                    history_from = (pd.Timestamp(check_target_date) - pd.DateOffset(months=2) - pd.Timedelta(days=7)).date()
+                    check_point_mapping = {
+                        int(shop): str(label)
+                        for shop, label in st.session_state.get("point_mapping", {}).items()
+                        if str(label).startswith("Т") and str(label) != "Т11"
+                    }
+                    if not check_point_mapping:
+                        check_point_mapping = {number: f"Т{number}" for number in range(1, 30) if number != 11}
+                    try:
+                        with st.spinner("Проверяю текущие значения плана: SKU, свежесть, категория, сущность и Авто Юнит…"):
+                            check_sales = load_forecast_history(history_from, analysis_date + timedelta(days=1), tuple(sorted(check_point_mapping)))
+                            check_result = build_ready_plan_check(
+                                ready_matrix_plans,
+                                check_sales,
+                                entities,
+                                check_target_date,
+                                check_point_mapping,
+                                trend_threshold=float(check_trend_percent) / 100.0,
+                                writeoff_threshold=float(check_writeoff_percent) / 100.0,
+                                minimum_sale_days=int(check_min_sale_days),
+                                selected_points=None,
+                                selected_categories=None,
+                                auto_unit_profiles=auto_unit_profiles,
+                                auto_unit_daily=auto_unit_daily,
+                                avg_check_growth_target=float(check_avg_target) / 100.0,
+                                revenue_growth_target=float(check_revenue_target) / 100.0,
+                                light_vegetable_keywords=light_keywords,
+                            )
+                    except Exception as error:
+                        st.error(f"Не удалось выполнить проверку готового плана: {error}")
+                        check_result = pd.DataFrame()
+                    if check_result.empty:
+                        st.warning("По выбранной дате результат проверки пуст.")
+                    else:
+                        st.session_state["ready_plan_check_result_v2"] = check_result
+                        st.session_state["ready_plan_check_signature_v2"] = check_signature
+
+                check_result = st.session_state.get("ready_plan_check_result_v2", pd.DataFrame())
+                if isinstance(check_result, pd.DataFrame) and not check_result.empty:
+                    delta_values = pd.to_numeric(check_result["Изменение"], errors="coerce").fillna(0)
+                    agreement_text = check_result["Согласие системы"].astype(str)
+                    check_metrics = st.columns(7)
+                    check_metrics[0].metric("Проверено", f"{len(check_result):,}".replace(",", " "))
+                    check_metrics[1].metric("Добавить", int((delta_values > 0).sum()))
+                    check_metrics[2].metric("Убавить", int((delta_values < 0).sum()))
+                    check_metrics[3].metric("Оставить", int((delta_values == 0).sum()))
+                    check_metrics[4].metric("🟢 Согласие", int(agreement_text.str.startswith("Зелёное").sum()))
+                    check_metrics[5].metric("🟡 Сомнение", int(agreement_text.str.startswith("Жёлтое").sum()))
+                    check_metrics[6].metric("🔴 Несогласие", int(agreement_text.str.startswith("Красное").sum()))
+
+                    filter_columns = st.columns(2)
+                    with filter_columns[0]:
+                        action_filter = st.radio("Решение", ["Все", "Добавить", "Убавить", "Оставить"], horizontal=True, key="ready_plan_check_action_filter_v2")
+                    with filter_columns[1]:
+                        agreement_filter = st.radio("Согласие", ["Все", "Зелёное", "Жёлтое", "Красное"], horizontal=True, key="ready_plan_check_agreement_filter_v2")
+                    visible_check = check_result.copy()
+                    if action_filter == "Добавить":
+                        visible_check = visible_check[pd.to_numeric(visible_check["Изменение"], errors="coerce") > 0]
+                    elif action_filter == "Убавить":
+                        visible_check = visible_check[pd.to_numeric(visible_check["Изменение"], errors="coerce") < 0]
+                    elif action_filter == "Оставить":
+                        visible_check = visible_check[pd.to_numeric(visible_check["Изменение"], errors="coerce") == 0]
+                    if agreement_filter != "Все":
+                        visible_check = visible_check[visible_check["Согласие системы"].astype(str).str.startswith(agreement_filter)]
+
+                    check_display_columns = [
+                        "Дата плана", "День недели", "Точка", "Категория", "Сущность", "SKU", "Название товара", "Цена",
+                        "Текущий план", "Рекомендованный план", "Изменение", "Действие", "Согласие системы",
+                        "Минимум номинальный", "Минимум действует", "Дней покрытия проверки",
+                        "СР SKU / день продаж · 2 мес", "Дней продаж SKU · 2 мес", "Ориентир SKU × цикл",
+                        "Категория СР/день · 14д", "Тренд категории, %", "Тренд сущности, %", "Тренд SKU, %",
+                        "Зелёные продажи / партия", "Серые продажи / партия", "Списание, %", "Осталось зелёных дней",
+                        "Авто Юнит · дней/нед", "Женская доля ТОП-3, %", "Женская аудитория преобладает", "Лёгкое овощное блюдо",
+                        "Ср. чек · пред. 14д", "Ср. чек · посл. 14д", "Тренд ср. чека, %",
+                        "Выручка/раб.день · пред. 14д", "Выручка/раб.день · посл. 14д", "Тренд выручки/раб.день, %",
+                        "Экономическая рекомендация", "Причина", "Контроль", "Основа при нехватке данных",
+                    ]
+                    check_display_columns = [column for column in check_display_columns if column in visible_check.columns]
+
+                    def style_ready_plan_check_row(row: pd.Series) -> list[str]:
+                        status = str(row.get("Согласие системы", ""))
+                        if status.startswith("Красное"):
+                            style = "background-color: #F4CCCC; color: #990000;"
+                        elif status.startswith("Жёлтое"):
+                            style = "background-color: #FFF2CC; color: #7F6000;"
+                        else:
+                            style = "background-color: #D9EAD3; color: #274E13;"
+                        return [style] * len(row)
+
+                    check_screen, check_screen_limit, check_truncated = styler_safe_preview(visible_check[check_display_columns])
+                    if check_truncated:
+                        st.info(f"На экране показаны первые {check_screen_limit:,} строк; выгрузка содержит полный результат.".replace(",", " "))
+                    st.dataframe(
+                        check_screen.style.apply(style_ready_plan_check_row, axis=1),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(760, 36 * len(check_screen) + 80),
+                        column_config={
+                            "Дата плана": st.column_config.DateColumn(format="DD.MM.YYYY"),
+                            "Цена": st.column_config.NumberColumn(format="%.2f"),
+                            "Текущий план": st.column_config.NumberColumn(format="%.0f"),
+                            "Рекомендованный план": st.column_config.NumberColumn(format="%.0f"),
+                            "Изменение": st.column_config.NumberColumn(format="%+d"),
+                            "СР SKU / день продаж · 2 мес": st.column_config.NumberColumn(format="%.2f"),
+                            "Категория СР/день · 14д": st.column_config.NumberColumn(format="%.2f"),
+                            "Тренд категории, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                            "Тренд сущности, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                            "Тренд SKU, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                            "Зелёные продажи / партия": st.column_config.NumberColumn(format="%.2f"),
+                            "Серые продажи / партия": st.column_config.NumberColumn(format="%.2f"),
+                            "Списание, %": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Женская доля ТОП-3, %": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Тренд ср. чека, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                            "Тренд выручки/раб.день, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                        },
+                    )
+
+                    check_excel = ready_plan_check_excel(
+                        check_result,
+                        check_target_date,
+                        float(check_trend_percent) / 100.0,
+                        float(check_writeoff_percent) / 100.0,
+                        int(check_min_sale_days),
+                        avg_check_growth_target=float(check_avg_target) / 100.0,
+                        revenue_growth_target=float(check_revenue_target) / 100.0,
+                        light_vegetable_keywords=light_keywords,
+                    )
+                    st.download_button(
+                        "Скачать проверку плана (Excel)",
+                        data=check_excel,
+                        file_name=f"проверка_готового_плана_{check_target_date:%Y-%m-%d}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="ready_plan_check_download_v2",
+                    )
+
 
 if tab_forecast.open:
     with tab_forecast:
