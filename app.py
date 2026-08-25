@@ -9982,211 +9982,311 @@ if tab_category_writeoffs.open:
 
 if tab_forecast.open:
     with tab_forecast:
-        st.subheader("Прогноз плана по средним продажам SKU")
+        st.subheader("Прогноз плана по меню из текущей матрицы")
         st.caption(
-            "Загрузите только пустое меню — приложение обработает все даты и все блоки на листе. "
-            "Для каждого SKU и каждой точки приложение берёт два календарных "
-            "месяца до даты плана и считает среднее только по дням, когда SKU действительно продавался. "
-            "Множитель загрузки зависит от текущей категории SKU: Япония — ×1 от среднего, "
-            "вторые блюда — ×3, напитки — ×4, остальные категории — ×2. "
-            "Если SKU на точке не продавался, среднее принимается равным 1 шт./день. "
-            "Если за 2 месяца продажи были только в 1–2 дня, итоговый прогноз в Excel "
-            "подсвечивается светло-красным как значение с недостаточной выборкой. "
-            "Ф-столбцы не изменяются, Т11 пустая."
+            "Меню и даты плана загружаются автоматически из текущей матрицы. "
+            "Сначала выберите нужные даты из тех, которые найдены в матрице; затем приложение "
+            "рассчитает только выбранные дни и заполнит Т1–Т29 только в соответствующих блоках меню. "
+            "Для каждого SKU и каждой точки используется два календарных месяца продаж до даты плана. "
+            "Среднее считается только по дням, когда SKU действительно продавался. "
+            "Множитель загрузки зависит от категории: Япония — ×1, вторые блюда — ×3, "
+            "напитки — ×4, остальные категории — ×2. Т11 остаётся пустой."
         )
-        matrix_file = st.file_uploader("Меню (.xlsx)", type=["xlsx"], key="forecast_matrix")
-        if matrix_file is not None:
+
+        matrix_bytes, matrix_source, matrix_checked_at, matrix_error = _load_matrix_context_for_active_tab()
+        if not matrix_bytes:
+            st.error("Текущая матрица недоступна. Проверьте подключение Apps Script или резервный combo_matrix.xlsx.")
+            if matrix_error:
+                st.caption(f"Причина: {matrix_error}")
+        else:
+            forecast_matrix_signature = _combo_matrix_signature(matrix_bytes, matrix_source)
+            forecast_signature_key = "forecast_matrix_signature_v760"
+            if st.session_state.get(forecast_signature_key) != forecast_matrix_signature:
+                for stale_key in [
+                    "forecast_result",
+                    "forecast_menu",
+                    "forecast_history_from",
+                    "forecast_target_date",
+                    "forecast_first_target_date",
+                    "forecast_matrix_bytes",
+                    "forecast_selected_matrix_dates_v760",
+                    "forecast_preview_block_v760",
+                    "forecast_calculated_dates_v760",
+                ]:
+                    st.session_state.pop(stale_key, None)
+                st.session_state[forecast_signature_key] = forecast_matrix_signature
+
+            source_text = matrix_source or "текущая матрица"
+            checked_text = str(matrix_checked_at or "").replace("T", " ")
+            st.success(
+                f"Матрица подключена: {source_text}"
+                + (f" · проверено {checked_text}" if checked_text else "")
+            )
+            if matrix_error:
+                st.caption(f"Использован резервный источник. Основной источник сообщил: {matrix_error}")
+
             try:
-                matrix_menu, matrix_capacity = parse_menu_matrix(matrix_file.getvalue())
+                matrix_menu, matrix_capacity = parse_menu_matrix(matrix_bytes)
             except Exception as error:
-                st.error(f"Не удалось прочитать матрицу: {error}")
+                st.error(f"Не удалось прочитать меню из текущей матрицы: {error}")
                 matrix_menu = pd.DataFrame()
                 matrix_capacity = pd.DataFrame()
 
             if matrix_menu.empty:
-                st.warning("В файле не найдено меню с датой, SKU и колонками точек.")
+                st.warning("В текущей матрице не найдено меню с датой, SKU и колонками точек Т.")
             else:
-                block_options = (
-                    matrix_menu[["target_date", "sheet", "day_label"]]
-                    .drop_duplicates()
-                    .sort_values(["target_date", "sheet"])
-                )
-                block_records = block_options.to_dict("records")
-                selected_block = st.selectbox(
-                    "Предпросмотр даты и листа (расчёт выполнится по всему файлу)",
-                    block_records,
-                    format_func=lambda item: f"{item['target_date']:%d.%m.%Y} · {item['sheet']} · {item['day_label']}",
-                )
-                selected_menu = matrix_menu[
-                    (matrix_menu["target_date"] == selected_block["target_date"])
-                    & (matrix_menu["sheet"] == selected_block["sheet"])
-                ].copy()
-                preview_menu = selected_menu.merge(
-                    entities[["sku", "category", "entity"]], on="sku", how="left"
-                )
-                preview_menu["category"] = preview_menu["category"].fillna(preview_menu["matrix_category"])
-                preview_menu["entity"] = preview_menu["entity"].fillna("Не сопоставлено")
-                forecast_metrics = st.columns(4)
-                forecast_metrics[0].metric("SKU в меню", preview_menu["sku"].nunique())
-                forecast_metrics[1].metric("Категорий", preview_menu["category"].nunique())
-                forecast_metrics[2].metric("Сущностей", preview_menu["entity"].nunique())
-                forecast_metrics[3].metric(
-                    "Без сущности", preview_menu.loc[preview_menu["entity"] == "Не сопоставлено", "sku"].nunique()
-                )
-                with st.expander("Показать распознанное меню"):
-                    st.dataframe(
-                        preview_menu[["sku", "product_name", "category", "entity", "price"]].rename(
-                            columns={
-                                "sku": "SKU",
-                                "product_name": "Название товара",
-                                "category": "Категория",
-                                "entity": "Сущность",
-                                "price": "Цена",
-                            }
-                        ),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
                 all_target_dates = sorted(matrix_menu["target_date"].dropna().unique().tolist())
-                first_target_date = all_target_dates[0]
-                last_target_date = all_target_dates[-1]
-                history_from = (pd.Timestamp(first_target_date) - pd.DateOffset(months=2)).date()
-                st.info(
-                    f"Будут рассчитаны все {len(all_target_dates)} дат меню: "
-                    f"{first_target_date:%d.%m.%Y}–{last_target_date:%d.%m.%Y}. "
-                    "Для каждой даты используется своё окно предыдущих двух календарных месяцев."
-                )
-                forecast_button = st.button("Рассчитать рекомендуемый план", type="primary", key="calculate_forecast")
-                if forecast_button:
-                    forecast_points = {
-                        int(number): label
-                        for number, label in st.session_state.get("point_mapping", {}).items()
-                        if str(label).startswith("Т")
-                        and 1 <= int(str(label)[1:]) <= 29
-                        and int(str(label)[1:]) != 11
-                    }
-                    if not forecast_points:
-                        forecast_points = {
-                            number: f"Т{number}" for number in range(1, 30) if number != 11
-                        }
-                    try:
-                        forecast_history = load_forecast_history(
-                            history_from,
-                            last_target_date,
-                            tuple(sorted(forecast_points)),
-                        )
-                    except Exception as error:
-                        st.error(f"Не удалось загрузить историю продаж: {error}")
-                        forecast_history = pd.DataFrame()
-                    if forecast_history.empty:
-                        st.warning("За исторический период продажи не найдены.")
-                    else:
-                        forecast_parts: list[pd.DataFrame] = []
-                        for (target_date, sheet_name), menu_block in matrix_menu.groupby(
-                            ["target_date", "sheet"], sort=True
-                        ):
-                            block_history_from = (
-                                pd.Timestamp(target_date) - pd.DateOffset(months=2)
-                            ).date()
-                            block_history = forecast_history[
-                                pd.to_datetime(
-                                    forecast_history["business_date"], errors="coerce"
-                                ).dt.date.between(
-                                    block_history_from,
-                                    target_date - timedelta(days=1),
-                                    inclusive="both",
-                                )
-                            ].copy()
-                            block_result = calculate_sku_daily_forecast(
-                                menu_block,
-                                block_history,
-                                entities,
-                                target_date,
-                                forecast_points,
-                            )
-                            if not block_result.empty:
-                                forecast_parts.append(block_result)
-                        forecast_result = (
-                            pd.concat(forecast_parts, ignore_index=True)
-                            if forecast_parts else pd.DataFrame()
-                        )
-                        if forecast_result.empty:
-                            st.warning("Не удалось сформировать расчёт ни для одного блока меню.")
-                            st.stop()
-                        st.session_state["forecast_result"] = forecast_result
-                        st.session_state["forecast_menu"] = matrix_menu
-                        st.session_state["forecast_history_from"] = history_from
-                        st.session_state["forecast_target_date"] = last_target_date
-                        st.session_state["forecast_first_target_date"] = first_target_date
-                        st.session_state["forecast_matrix_bytes"] = matrix_file.getvalue()
-
-                if "forecast_result" in st.session_state:
-                    forecast_result = st.session_state["forecast_result"]
-                    st.markdown("#### Рекомендованный план")
-                    result_metrics = st.columns(5)
-                    result_metrics[0].metric("Дат меню", forecast_result["Дата плана"].nunique())
-                    result_metrics[1].metric("Точек", forecast_result["Точка"].nunique())
-                    result_metrics[2].metric("SKU", forecast_result["SKU"].nunique())
-                    result_metrics[3].metric(
-                        "План, шт.",
-                        f"{forecast_result['Рекомендованный план'].sum(skipna=True):,.0f}".replace(",", " "),
-                    )
-                    result_metrics[4].metric(
-                        "Пустых ячеек без данных",
-                        int(forecast_result["Рекомендованный план"].isna().sum()),
-                    )
-                    result_point_options = sorted(
-                        forecast_result["Точка"].unique(), key=lambda value: int(str(value)[1:])
-                    )
-                    result_points = st.multiselect(
-                        "Показать точки прогноза",
-                        result_point_options,
-                        default=result_point_options[:1],
-                        key="forecast_result_points",
-                    )
-                    visible_forecast = forecast_result[forecast_result["Точка"].isin(result_points)]
-                    result_dates = st.multiselect(
-                        "Показать даты меню",
-                        sorted(forecast_result["Дата плана"].unique()),
-                        default=sorted(forecast_result["Дата плана"].unique()),
-                        format_func=lambda value: value.strftime("%d.%m.%Y"),
-                        key="forecast_result_dates_v66",
-                    )
-                    visible_forecast = visible_forecast[
-                        visible_forecast["Дата плана"].isin(result_dates)
+                date_key = "forecast_selected_matrix_dates_v760"
+                if date_key in st.session_state:
+                    clean_dates = [
+                        value for value in st.session_state[date_key]
+                        if value in all_target_dates
                     ]
-                    st.dataframe(visible_forecast, use_container_width=True, hide_index=True)
-                    hide_average_values = st.checkbox(
-                        "Убрать числовые значения СР из выгрузки",
-                        value=False,
-                        key="forecast_hide_average_values_export",
-                        help=(
-                            "Синяя строка СР, подпись и цикл загрузки останутся. "
-                            "Будут очищены только числовые средние по точкам и итог СР в колонке ПЛАН."
+                    if clean_dates != st.session_state[date_key]:
+                        st.session_state[date_key] = clean_dates
+                else:
+                    st.session_state[date_key] = list(all_target_dates)
+
+                selected_target_dates = st.multiselect(
+                    "Дни плана из матрицы — выбрать для расчёта и заполнения",
+                    all_target_dates,
+                    format_func=lambda value: value.strftime("%d.%m.%Y"),
+                    key=date_key,
+                    help=(
+                        "В расчёт и в готовую выгрузку попадут только выбранные даты. "
+                        "Меню каждой даты берётся непосредственно из соответствующего блока текущей матрицы."
+                    ),
+                )
+
+                if not selected_target_dates:
+                    st.info("Выберите хотя бы одну дату плана из матрицы.")
+                else:
+                    selected_target_dates = sorted(selected_target_dates)
+                    selected_matrix_menu = matrix_menu[
+                        matrix_menu["target_date"].isin(selected_target_dates)
+                    ].copy()
+
+                    selected_blocks = (
+                        selected_matrix_menu[["target_date", "sheet", "day_label"]]
+                        .drop_duplicates()
+                        .sort_values(["target_date", "sheet"])
+                    )
+                    block_records = selected_blocks.to_dict("records")
+                    preview_key = "forecast_preview_block_v760"
+                    if (
+                        preview_key in st.session_state
+                        and st.session_state[preview_key] not in block_records
+                    ):
+                        st.session_state.pop(preview_key, None)
+                    selected_block = st.selectbox(
+                        "Предпросмотр меню выбранного дня",
+                        block_records,
+                        format_func=lambda item: (
+                            f"{item['target_date']:%d.%m.%Y} · {item['sheet']} · {item['day_label']}"
                         ),
+                        key=preview_key,
                     )
-                    st.caption(
-                        "В скачанном меню столбцы Ф удаляются полностью. "
-                        "Исходный загруженный файл не изменяется."
+                    selected_menu = selected_matrix_menu[
+                        (selected_matrix_menu["target_date"] == selected_block["target_date"])
+                        & (selected_matrix_menu["sheet"] == selected_block["sheet"])
+                    ].copy()
+                    preview_menu = selected_menu.merge(
+                        entities[["sku", "category", "entity"]], on="sku", how="left"
                     )
-                    filled_matrix = fill_forecast_into_matrix(
-                        st.session_state["forecast_matrix_bytes"],
-                        forecast_result,
-                        st.session_state["forecast_history_from"],
-                        st.session_state["forecast_target_date"],
-                        hide_average_values=hide_average_values,
+                    preview_menu["category"] = preview_menu["category"].fillna(
+                        preview_menu["matrix_category"]
                     )
-                    st.download_button(
-                        "Скачать меню с заполненными Т1–Т29",
-                        data=filled_matrix,
-                        file_name=(
-                            f"матрица_с_прогнозом_"
-                            f"{st.session_state['forecast_first_target_date']:%Y-%m-%d}_"
-                            f"{st.session_state['forecast_target_date']:%Y-%m-%d}.xlsx"
-                        ),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    preview_menu["entity"] = preview_menu["entity"].fillna("Не сопоставлено")
+
+                    forecast_metrics = st.columns(4)
+                    forecast_metrics[0].metric("Выбрано дат", len(selected_target_dates))
+                    forecast_metrics[1].metric("SKU в дне", preview_menu["sku"].nunique())
+                    forecast_metrics[2].metric("Категорий", preview_menu["category"].nunique())
+                    forecast_metrics[3].metric("Сущностей", preview_menu["entity"].nunique())
+
+                    with st.expander("Показать меню выбранного дня"):
+                        st.dataframe(
+                            preview_menu[["sku", "product_name", "category", "entity", "price"]].rename(
+                                columns={
+                                    "sku": "SKU",
+                                    "product_name": "Название товара",
+                                    "category": "Категория",
+                                    "entity": "Сущность",
+                                    "price": "Цена",
+                                }
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                    first_target_date = selected_target_dates[0]
+                    last_target_date = selected_target_dates[-1]
+                    history_from = (
+                        pd.Timestamp(first_target_date) - pd.DateOffset(months=2)
+                    ).date()
+                    st.info(
+                        f"К расчёту выбрано {len(selected_target_dates)} дат: "
+                        f"{', '.join(value.strftime('%d.%m.%Y') for value in selected_target_dates)}. "
+                        "Для каждой даты будет использовано меню именно её блока в матрице и своё "
+                        "окно предыдущих двух календарных месяцев."
                     )
+
+                    forecast_button = st.button(
+                        "Рассчитать план для выбранных дат",
+                        type="primary",
+                        key="calculate_forecast",
+                        use_container_width=True,
+                    )
+                    if forecast_button:
+                        forecast_points = {
+                            int(number): label
+                            for number, label in st.session_state.get("point_mapping", {}).items()
+                            if str(label).startswith("Т")
+                            and 1 <= int(str(label)[1:]) <= 29
+                            and int(str(label)[1:]) != 11
+                        }
+                        if not forecast_points:
+                            forecast_points = {
+                                number: f"Т{number}"
+                                for number in range(1, 30)
+                                if number != 11
+                            }
+                        try:
+                            forecast_history = load_forecast_history(
+                                history_from,
+                                last_target_date,
+                                tuple(sorted(forecast_points)),
+                            )
+                        except Exception as error:
+                            st.error(f"Не удалось загрузить историю продаж: {error}")
+                            forecast_history = pd.DataFrame()
+
+                        if forecast_history.empty:
+                            st.warning("За исторический период продажи не найдены.")
+                        else:
+                            forecast_parts: list[pd.DataFrame] = []
+                            for (target_date, sheet_name), menu_block in selected_matrix_menu.groupby(
+                                ["target_date", "sheet"], sort=True
+                            ):
+                                block_history_from = (
+                                    pd.Timestamp(target_date) - pd.DateOffset(months=2)
+                                ).date()
+                                block_history = forecast_history[
+                                    pd.to_datetime(
+                                        forecast_history["business_date"], errors="coerce"
+                                    ).dt.date.between(
+                                        block_history_from,
+                                        target_date - timedelta(days=1),
+                                        inclusive="both",
+                                    )
+                                ].copy()
+                                block_result = calculate_sku_daily_forecast(
+                                    menu_block,
+                                    block_history,
+                                    entities,
+                                    target_date,
+                                    forecast_points,
+                                )
+                                if not block_result.empty:
+                                    forecast_parts.append(block_result)
+
+                            forecast_result = (
+                                pd.concat(forecast_parts, ignore_index=True)
+                                if forecast_parts else pd.DataFrame()
+                            )
+                            if forecast_result.empty:
+                                st.warning("Не удалось сформировать расчёт для выбранных дат меню.")
+                                st.stop()
+
+                            st.session_state["forecast_result"] = forecast_result
+                            st.session_state["forecast_menu"] = selected_matrix_menu
+                            st.session_state["forecast_history_from"] = history_from
+                            st.session_state["forecast_target_date"] = last_target_date
+                            st.session_state["forecast_first_target_date"] = first_target_date
+                            st.session_state["forecast_matrix_bytes"] = matrix_bytes
+                            st.session_state["forecast_calculated_dates_v760"] = list(
+                                selected_target_dates
+                            )
+
+                    if "forecast_result" in st.session_state:
+                        forecast_result = st.session_state["forecast_result"]
+                        calculated_dates = st.session_state.get(
+                            "forecast_calculated_dates_v760", []
+                        )
+                        if calculated_dates and list(selected_target_dates) != list(calculated_dates):
+                            st.warning(
+                                "Выбор дат изменён после последнего расчёта. "
+                                "Нажмите «Рассчитать план для выбранных дат», чтобы обновить готовый план."
+                            )
+
+                        st.markdown("#### Рекомендованный план")
+                        result_metrics = st.columns(5)
+                        result_metrics[0].metric("Дат в готовом плане", forecast_result["Дата плана"].nunique())
+                        result_metrics[1].metric("Точек", forecast_result["Точка"].nunique())
+                        result_metrics[2].metric("SKU", forecast_result["SKU"].nunique())
+                        result_metrics[3].metric(
+                            "План, шт.",
+                            f"{forecast_result['Рекомендованный план'].sum(skipna=True):,.0f}".replace(",", " "),
+                        )
+                        result_metrics[4].metric(
+                            "Пустых ячеек без данных",
+                            int(forecast_result["Рекомендованный план"].isna().sum()),
+                        )
+
+                        result_point_options = sorted(
+                            forecast_result["Точка"].unique(),
+                            key=lambda value: int(str(value)[1:]),
+                        )
+                        result_points = st.multiselect(
+                            "Показать точки прогноза",
+                            result_point_options,
+                            default=result_point_options[:1],
+                            key="forecast_result_points",
+                        )
+                        visible_forecast = forecast_result[
+                            forecast_result["Точка"].isin(result_points)
+                        ]
+                        st.dataframe(
+                            visible_forecast,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                        hide_average_values = st.checkbox(
+                            "Убрать числовые значения СР из выгрузки",
+                            value=False,
+                            key="forecast_hide_average_values_export",
+                            help=(
+                                "Синяя строка СР, подпись и цикл загрузки останутся. "
+                                "Будут очищены только числовые средние по точкам и итог СР в колонке ПЛАН."
+                            ),
+                        )
+                        st.caption(
+                            "В готовой матрице будут заполнены только даты, участвовавшие в последнем расчёте. "
+                            "Остальные блоки меню не получают прогнозных значений. Столбцы Ф удаляются только "
+                            "из скачанной копии; исходная матрица не изменяется."
+                        )
+
+                        if calculated_dates and list(selected_target_dates) == list(calculated_dates):
+                            filled_matrix = fill_forecast_into_matrix(
+                                st.session_state["forecast_matrix_bytes"],
+                                forecast_result,
+                                st.session_state["forecast_history_from"],
+                                st.session_state["forecast_target_date"],
+                                hide_average_values=hide_average_values,
+                            )
+                            st.download_button(
+                                "Скачать готовый план по выбранным датам",
+                                data=filled_matrix,
+                                file_name=(
+                                    f"матрица_с_прогнозом_"
+                                    f"{st.session_state['forecast_first_target_date']:%Y-%m-%d}_"
+                                    f"{st.session_state['forecast_target_date']:%Y-%m-%d}.xlsx"
+                                ),
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="forecast_download_selected_dates_v760",
+                                use_container_width=True,
+                            )
 
     excel_bytes = export_excel(filtered_sku, filtered_category, filtered_entity, filtered_detail)
     st.download_button(
