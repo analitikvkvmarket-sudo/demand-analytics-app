@@ -29,7 +29,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.2-PLAN-CHECK-MATRIX"
+BUILD_ID = "75.11.3-PLAN-CHECK-DETAILED-NOTES"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -4749,6 +4749,8 @@ def build_ready_plan_check(
                 "Сущность предыдущие 7д": round(float(ent_trend["previous_avg"]), 2),
                 "Сущность последние 7д": round(float(ent_trend["recent_avg"]), 2),
                 "Тренд сущности, %": round(float(ent_trend["trend"]) * 100, 1),
+                "SKU предыдущие 7д": round(float(sku_trend["previous_avg"]), 2),
+                "SKU последние 7д": round(float(sku_trend["recent_avg"]), 2),
                 "Тренд SKU, %": round(float(sku_trend["trend"]) * 100, 1),
                 "Зелёные продажи / партия": round(green_avg, 2),
                 "Серые продажи / партия": round(grey_avg, 2),
@@ -4770,6 +4772,13 @@ def build_ready_plan_check(
                 "Выручка/раб.день · пред. 14д": round(revenue_previous, 2),
                 "Выручка/раб.день · посл. 14д": round(revenue_recent, 2),
                 "Тренд выручки/раб.день, %": round(revenue_day_trend * 100, 1) if economics else pd.NA,
+                "Медиана цены меню точки": round(price_median, 2),
+                "Цена ≥ медианы точки": "Да" if high_value_item else "Нет",
+                "Порог тренда, %": round(float(trend_threshold) * 100, 1),
+                "Порог большого списания, %": round(float(writeoff_threshold) * 100, 1),
+                "Мин. дней SKU для достаточности": int(minimum_sale_days),
+                "Цель роста ср. чека, %": round(float(avg_check_growth_target) * 100, 1),
+                "Цель роста дохода, %": round(float(revenue_growth_target) * 100, 1),
                 "Экономическая рекомендация": economic_recommendation,
                 "Причина": "; ".join(reasons),
                 "Контроль": "; ".join(checks),
@@ -4796,57 +4805,199 @@ def _ready_plan_check_status_color(status: object) -> tuple[str, str]:
 
 
 def _ready_plan_check_note(record: dict[str, object]) -> str:
-    """Compact audit trail attached to one ready-plan matrix cell."""
-    def num(name: str, digits: int = 1) -> str:
+    """Detailed audit trail attached to one ready-plan matrix cell."""
+    def num(name: str, digits: int = 1, suffix: str = "") -> str:
         value = pd.to_numeric(pd.Series([record.get(name)]), errors="coerce").iloc[0]
         if pd.isna(value):
             return "—"
-        return f"{float(value):.{digits}f}"
+        return f"{float(value):.{digits}f}{suffix}"
+
+    def integer(name: str) -> str:
+        value = pd.to_numeric(pd.Series([record.get(name)]), errors="coerce").iloc[0]
+        if pd.isna(value):
+            return "—"
+        return str(int(round(float(value))))
+
+    def date_text(value: object) -> str:
+        parsed = pd.to_datetime(value, errors="coerce")
+        return "—" if pd.isna(parsed) else parsed.strftime("%d.%m.%Y")
+
+    def bullet_lines(text: str) -> list[str]:
+        items = [item.strip() for item in str(text or "").split(";") if item.strip()]
+        return [f"• {item}" for item in items]
 
     current_value = pd.to_numeric(pd.Series([record.get("Текущий план")]), errors="coerce").fillna(0).iloc[0]
     recommended_value = pd.to_numeric(pd.Series([record.get("Рекомендованный план")]), errors="coerce").fillna(current_value).iloc[0]
     delta_value = int(round(float(recommended_value - current_value)))
+    status = str(record.get("Согласие системы") or "").strip()
+    action = str(record.get("Действие") or "Оставить").strip()
     control = str(record.get("Контроль") or "").strip()
     reason = str(record.get("Причина") or "").strip()
     economics = str(record.get("Экономическая рекомендация") or "").strip()
     minimum_text = str(record.get("Минимум действует") or "")
-    point_days = record.get("Авто Юнит · дней/нед")
+    point_days = pd.to_numeric(pd.Series([record.get("Авто Юнит · дней/нед")]), errors="coerce").iloc[0]
     point_days_text = "—" if pd.isna(point_days) else str(int(float(point_days)))
 
-    lines = [
-        f"{record.get('Согласие системы', '')}",
-        f"Текущее значение категорийщика: {int(round(float(current_value)))}",
-        f"Рекомендация системы: {int(round(float(recommended_value)))} ({delta_value:+d})",
-        "",
-        "1. SKU · 2 месяца:",
-        f"среднее по дням фактических продаж {num('СР SKU / день продаж · 2 мес', 2)}; дней продаж {num('Дней продаж SKU · 2 мес', 0)}; тренд {num('Тренд SKU, %', 1)}%.",
-        "",
-        "2. Свежесть по факту:",
-        "день отгрузки НЕ входит в свежесть; День 1 начинается на следующий календарный день после даты плана/отгрузки.",
-        f"зелёные продажи {num('Зелёные продажи / партия', 2)}; серые {num('Серые продажи / партия', 2)}; списание {num('Списание, %', 1)}%; осталось зелёных дней {num('Осталось зелёных дней', 0)}.",
-        "",
-        "3. Категория · 14 дней:",
-        f"среднее/день {num('Категория СР/день · 14д', 2)}; тренд последних 7 дней к предыдущим 7: {num('Тренд категории, %', 1)}%.",
-        "",
-        "4. Сущность:",
-        f"тренд {num('Тренд сущности, %', 1)}%; основа: {record.get('Основа при нехватке данных', '—')}.",
-        "",
-        "Авто Юнит точки:",
-        f"график {point_days_text} дн./нед.; женская доля ТОП-3 {num('Женская доля ТОП-3, %', 1)}%; лёгкое овощное блюдо: {record.get('Лёгкое овощное блюдо', 'Нет')}.",
-        f"минимум: {minimum_text}; дней покрытия проверки: {num('Дней покрытия проверки', 0)}.",
-        "",
-        "Экономика точки:",
-        f"ср. чек: {num('Ср. чек · пред. 14д', 2)} → {num('Ср. чек · посл. 14д', 2)} ({num('Тренд ср. чека, %', 1)}%);",
-        f"выручка/раб.день: {num('Выручка/раб.день · пред. 14д', 2)} → {num('Выручка/раб.день · посл. 14д', 2)} ({num('Тренд выручки/раб.день, %', 1)}%).",
-    ]
-    if economics:
-        lines.extend(["", "Экономическая оценка:", economics])
-    if reason:
-        lines.extend(["", "Почему система дала эту оценку:", reason])
-    if control:
-        lines.extend(["", "Дополнительный контроль:", control])
-    return "\n".join(lines)
+    target_date = pd.to_datetime(record.get("Дата плана"), errors="coerce")
+    fact_date = pd.to_datetime(record.get("Факт по состоянию на"), errors="coerce")
+    if pd.notna(target_date):
+        sku_start = target_date - pd.DateOffset(months=2)
+    else:
+        sku_start = pd.NaT
+    if pd.notna(fact_date):
+        trend_start = fact_date - pd.Timedelta(days=13)
+        previous_end = fact_date - pd.Timedelta(days=7)
+        recent_start = fact_date - pd.Timedelta(days=6)
+    else:
+        trend_start = previous_end = recent_start = pd.NaT
 
+    trend_threshold = pd.to_numeric(pd.Series([record.get("Порог тренда, %")]), errors="coerce").iloc[0]
+    writeoff_threshold = pd.to_numeric(pd.Series([record.get("Порог большого списания, %")]), errors="coerce").iloc[0]
+    min_sale_days = pd.to_numeric(pd.Series([record.get("Мин. дней SKU для достаточности")]), errors="coerce").iloc[0]
+    avg_target = pd.to_numeric(pd.Series([record.get("Цель роста ср. чека, %")]), errors="coerce").iloc[0]
+    revenue_target = pd.to_numeric(pd.Series([record.get("Цель роста дохода, %")]), errors="coerce").iloc[0]
+    trend_threshold_text = "—" if pd.isna(trend_threshold) else f"{float(trend_threshold):.1f}%"
+    writeoff_threshold_text = "—" if pd.isna(writeoff_threshold) else f"{float(writeoff_threshold):.1f}%"
+    min_sale_days_text = "—" if pd.isna(min_sale_days) else str(int(float(min_sale_days)))
+    avg_target_text = "—" if pd.isna(avg_target) else f"{float(avg_target):+.1f}%"
+    revenue_target_text = "—" if pd.isna(revenue_target) else f"{float(revenue_target):+.1f}%"
+
+    sale_days_value = pd.to_numeric(pd.Series([record.get("Дней продаж SKU · 2 мес")]), errors="coerce").iloc[0]
+    sparse_sku = pd.notna(sale_days_value) and pd.notna(min_sale_days) and float(sale_days_value) < float(min_sale_days)
+    sku_trend_value = pd.to_numeric(pd.Series([record.get("Тренд SKU, %")]), errors="coerce").iloc[0]
+    entity_trend_value = pd.to_numeric(pd.Series([record.get("Тренд сущности, %")]), errors="coerce").iloc[0]
+    category_trend_value = pd.to_numeric(pd.Series([record.get("Тренд категории, %")]), errors="coerce").iloc[0]
+    writeoff_value = pd.to_numeric(pd.Series([record.get("Списание, %")]), errors="coerce").iloc[0]
+    green_remaining = pd.to_numeric(pd.Series([record.get("Осталось зелёных дней")]), errors="coerce").iloc[0]
+    live_green_sales = pd.to_numeric(pd.Series([record.get("Продано в зелёном у живой партии")]), errors="coerce").iloc[0]
+    green_avg = pd.to_numeric(pd.Series([record.get("Зелёные продажи / партия")]), errors="coerce").iloc[0]
+    grey_avg = pd.to_numeric(pd.Series([record.get("Серые продажи / партия")]), errors="coerce").iloc[0]
+
+    sku_add_rule = pd.notna(green_remaining) and int(green_remaining) == 1 and pd.notna(live_green_sales) and float(live_green_sales) > 0
+    entity_growth_rule = (
+        pd.notna(entity_trend_value) and pd.notna(trend_threshold)
+        and float(entity_trend_value) >= float(trend_threshold)
+        and (pd.isna(category_trend_value) or float(category_trend_value) > -float(trend_threshold))
+    )
+    sku_cut_rule = (
+        not sparse_sku
+        and pd.notna(sku_trend_value) and pd.notna(trend_threshold)
+        and float(sku_trend_value) <= -float(trend_threshold)
+        and pd.notna(writeoff_value) and pd.notna(writeoff_threshold)
+        and float(writeoff_value) >= float(writeoff_threshold)
+    )
+    grey_anchor_rule = (
+        pd.notna(green_avg) and pd.notna(grey_avg)
+        and float(green_avg) > 0 and float(grey_avg) > float(green_avg)
+    )
+    entity_cut_rule = (
+        pd.notna(entity_trend_value) and pd.notna(trend_threshold)
+        and float(entity_trend_value) <= -float(trend_threshold)
+    )
+
+    if status.startswith("Красное"):
+        color_explanation = (
+            "КРАСНЫЙ: система существенно не согласна с текущим количеством. "
+            "Это ставится, когда итоговая корректировка составляет 2 шт. и более либо одновременно подтверждены "
+            "падение SKU, большое списание и падение сущности."
+        )
+    elif status.startswith("Жёлтое"):
+        color_explanation = (
+            "ЖЁЛТЫЙ: есть риск или рекомендация к изменению. Это может быть изменение на 1 шт., недостаток истории SKU, "
+            "недостижение цели среднего чека/дохода либо дополнительный сигнал Auto Unit."
+        )
+    else:
+        color_explanation = (
+            "ЗЕЛЁНЫЙ: система согласна с текущим значением. Существенных сигналов для изменения количества не найдено, "
+            "данные не противоречат установленному плану."
+        )
+
+    lines = [
+        "ПРОВЕРКА ГОТОВОГО МЕНЮ",
+        "=" * 34,
+        f"Статус: {status}",
+        f"Действие: {action}",
+        f"Дата плана / отгрузки: {date_text(record.get('Дата плана'))} · {record.get('День недели', '')}",
+        f"Факт учтён по: {date_text(record.get('Факт по состоянию на'))}",
+        f"Точка: {record.get('Точка', '—')} · магазин {record.get('Номер магазина', '—')}",
+        f"Категория: {record.get('Категория', '—')}",
+        f"Сущность: {record.get('Сущность', '—')}",
+        f"SKU: {record.get('SKU', '—')} · {record.get('Название товара', '—')}",
+        "",
+        "ИТОГ ПО ЯЧЕЙКЕ",
+        f"Категорийщик поставил: {int(round(float(current_value)))} шт.",
+        f"Система рекомендует: {int(round(float(recommended_value)))} шт.",
+        f"Разница: {delta_value:+d} шт.",
+        f"Цена SKU: {num('Цена', 2)}; медиана цены меню этой точки: {num('Медиана цены меню точки', 2)}; цена не ниже медианы: {record.get('Цена ≥ медианы точки', '—')}.",
+        "",
+        "1. SKU · СРЕДНЕЕ ПО ДНЯМ ФАКТИЧЕСКИХ ПРОДАЖ ЗА 2 МЕСЯЦА",
+        f"Период: {date_text(sku_start)}–{date_text(fact_date)}.",
+        f"Продажи были в {integer('Дней продаж SKU · 2 мес')} днях; среднее считается только по этим дням и равно {num('СР SKU / день продаж · 2 мес', 2)} шт./день продаж.",
+        f"Среднее последних 7 дней: {num('SKU последние 7д', 2)}; предыдущих 7 дней: {num('SKU предыдущие 7д', 2)}; изменение: {num('Тренд SKU, %', 1)}%.",
+        f"Порог значимого роста/падения: ±{trend_threshold_text}. Минимум наблюдений для самостоятельной опоры на SKU: {min_sale_days_text} дней.",
+        f"Дней покрытия для этой проверки: {integer('Дней покрытия проверки')}; ориентир SKU × цикл: {integer('Ориентир SKU × цикл')} шт.",
+        ("Вывод по данным SKU: данных недостаточно — окончательная проверка сильнее опирается на сущность и категорию."
+         if sparse_sku else "Вывод по данным SKU: наблюдений достаточно для использования динамики SKU в правилах изменения."),
+        "",
+        "2. СВЕЖЕСТЬ · ФАКТ ПО ПАРТИЯМ",
+        "День отгрузки — День 0 и в свежесть НЕ входит. День 1 начинается на следующий календарный день после даты плана/отгрузки.",
+        f"Завершённых партий в анализе: {integer('Завершённых партий')}.",
+        f"Средние продажи на одну завершённую партию: зелёный период {num('Зелёные продажи / партия', 2)} шт.; серый период {num('Серые продажи / партия', 2)} шт.",
+        f"Списано: {num('Списание, шт.', 2)} шт.; доля списания {num('Списание, %', 1)}%; порог большого списания {writeoff_threshold_text}.",
+        f"По последней живой партии продано в зелёном периоде {num('Продано в зелёном у живой партии', 2)} шт.; осталось зелёных дней {integer('Осталось зелёных дней')}.",
+        f"Правило +1 «продался в зелёном и остался 1 зелёный день»: {'СРАБОТАЛО' if sku_add_rule else 'не сработало'}.",
+        f"Правило ориентира по зелёным продажам при преобладании серого периода: {'СРАБОТАЛО/АКТУАЛЬНО' if grey_anchor_rule else 'не сработало'}.",
+        "",
+        "3. КАТЕГОРИЯ · 14 ДНЕЙ",
+        f"Период сверки: {date_text(trend_start)}–{date_text(fact_date)}.",
+        f"Среднее категории за 14 дней: {num('Категория СР/день · 14д', 2)} шт./день.",
+        f"Предыдущие 7 дней: {num('Категория предыдущие 7д', 2)} шт./день; последние 7 дней: {num('Категория последние 7д', 2)} шт./день; изменение {num('Тренд категории, %', 1)}%.",
+        "Категория используется как контроль: рост сущности не повышает план автоматически, если категория одновременно показывает сильное встречное падение.",
+        "",
+        "4. СУЩНОСТЬ · ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА",
+        f"Предыдущие 7 дней: {num('Сущность предыдущие 7д', 2)} шт./день; последние 7 дней: {num('Сущность последние 7д', 2)} шт./день; изменение {num('Тренд сущности, %', 1)}%.",
+        f"Основа расчёта при текущем объёме данных: {record.get('Основа при нехватке данных', '—')}.",
+        f"Правило +1 при росте сущности и отсутствии встречного падения категории: {'СРАБОТАЛО' if entity_growth_rule else 'не сработало'}.",
+        f"Правило −2 при падении сущности: {'СРАБОТАЛО' if entity_cut_rule else 'не сработало'}.",
+        f"Правило −1 при одновременном падении SKU и большом списании: {'СРАБОТАЛО' if sku_cut_rule else 'не сработало'}.",
+        "",
+        "5. МИНИМАЛЬНОЕ ЗНАЧЕНИЕ И ЦИКЛ",
+        f"Номинальный минимум категории: {integer('Минимум номинальный')} шт. (вторые блюда 3; напитки 5; Япония 1; остальные 2).",
+        f"Минимум применяется: {minimum_text}.",
+        f"График точки по Auto Unit: {point_days_text} дн./нед.; покрытие проверки {integer('Дней покрытия проверки')} дн.",
+        ("Особое правило четверга: точка работает 5 дней, поэтому четверг считается загрузкой на 1 день и категорийный минимум отключён."
+         if "четверг" in minimum_text.casefold() else "Особое правило четверга для 5-дневной точки к этой ячейке не применяется."),
+        "",
+        "6. AUTO UNIT · АУДИТОРИЯ ТОЧКИ",
+        f"Тип точки: {record.get('Авто Юнит · тип точки', '—') or '—'}.",
+        f"Женская доля в ТОП-3 аудитории: {num('Женская доля ТОП-3, %', 1)}%; мужская: {num('Мужская доля ТОП-3, %', 1)}%; женская аудитория преобладает: {record.get('Женская аудитория преобладает', '—')}.",
+        f"Позиция распознана как лёгкое овощное блюдо: {record.get('Лёгкое овощное блюдо', '—')}.",
+        "Если женская аудитория преобладает, лёгкая овощная позиция получает сигнал +1 только при отсутствии большого списания и сильного падения спроса.",
+        "",
+        "7. ЭКОНОМИКА ТОЧКИ · СРЕДНИЙ ЧЕК И ДОХОД",
+        f"Средний чек: {num('Ср. чек · пред. 14д', 2)} → {num('Ср. чек · посл. 14д', 2)}; изменение {num('Тренд ср. чека, %', 1)}%; цель не ниже {avg_target_text}.",
+        f"Выручка на рабочий день: {num('Выручка/раб.день · пред. 14д', 2)} → {num('Выручка/раб.день · посл. 14д', 2)}; изменение {num('Тренд выручки/раб.день, %', 1)}%; цель не ниже {revenue_target_text}.",
+        f"Экономическая оценка позиции: {economics or '—'}.",
+        "",
+        "8. КАКИЕ ПРАВИЛА ФАКТИЧЕСКИ ПОВЛИЯЛИ НА РЕКОМЕНДАЦИЮ",
+    ]
+    reason_bullets = bullet_lines(reason)
+    lines.extend(reason_bullets or ["• Автоматические правила количества не изменили текущее значение."])
+
+    lines.extend(["", "9. ДОПОЛНИТЕЛЬНЫЕ СИГНАЛЫ / ОГРАНИЧЕНИЯ"])
+    control_bullets = bullet_lines(control)
+    lines.extend(control_bullets or ["• Дополнительных ограничений или сомнений не найдено."])
+
+    lines.extend([
+        "",
+        "10. ПОЧЕМУ ТАКОЙ ЦВЕТ",
+        color_explanation,
+        "",
+        "ФИНАЛЬНЫЙ ВЫВОД",
+        f"Для ячейки {record.get('Точка', '—')} / SKU {record.get('SKU', '—')} система сравнила текущее значение {int(round(float(current_value)))} шт. со всеми доступными уровнями контроля и получила рекомендацию {int(round(float(recommended_value)))} шт. ({delta_value:+d}).",
+        "Текущее значение в исходном меню не переписывается автоматически: цвет и эта сноска служат проверкой решения категорийщика.",
+    ])
+    return "\n".join(lines)
 
 def _ready_plan_check_result_lookup(result: pd.DataFrame) -> dict[tuple[str, str], dict[str, object]]:
     lookup: dict[tuple[str, str], dict[str, object]] = {}
@@ -5038,7 +5189,10 @@ def ready_plan_check_excel(
                     note = _ready_plan_check_note(record)
                     if cell.comment is not None and cell.comment.text.strip():
                         note += "\n\nИсходное обоснование значения из плана:\n" + cell.comment.text.strip()
-                    cell.comment = Comment(note, "Проверка системы")
+                    detailed_comment = Comment(note, "Проверка системы")
+                    detailed_comment.width = 620
+                    detailed_comment.height = 720
+                    cell.comment = detailed_comment
 
         # If Apps Script reconstructed a style-free sheet, keep the familiar SR rows visible.
         for row_number in range(1, sheet.max_row + 1):
@@ -5623,7 +5777,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.11.2 · PLAN CHECK MATRIX")
+    st.caption("Аналитика спроса · версия 75.11.3 · PLAN CHECK DETAILED NOTES")
     st.caption("Автозагрузка данных · SEPARATE-MENU")
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
         pg_host = st.text_input(
