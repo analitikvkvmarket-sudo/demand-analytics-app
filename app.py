@@ -29,7 +29,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.3-PLAN-CHECK-DETAILED-NOTES"
+BUILD_ID = "75.11.4-REPORT-DEPARTMENT-EXCEL"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -6431,6 +6431,7 @@ if tab_report.open:
                             "report_graph_category_v770",
                             "report_graph_entity_v770",
                             "report_graph_point_v770",
+                            "report_department_export_v771",
                         ]:
                             st.session_state.pop(stale_key, None)
                         st.session_state["period_comparison_report_v770"] = {
@@ -6870,6 +6871,84 @@ if tab_report.open:
                 "Столбцы — фактическое количество продаж за день. Линии СР — скользящее среднее; "
                 "его окно можно менять ползунком сверху."
             )
+
+            st.markdown("#### Выгрузка по отделам в Excel")
+            st.caption(
+                "Выберите отдел (категорию) — приложение сформирует отдельный Excel только по нему. "
+                "Выгрузка учитывает текущие периоды, выбранные точки и сущности отчёта."
+            )
+            department_export_options = sorted(
+                set(filtered_report_1["category"].dropna().astype(str))
+                | set(filtered_report_2["category"].dropna().astype(str))
+            )
+            if department_export_options:
+                department_export_cols = st.columns([2.2, 1.3])
+                with department_export_cols[0]:
+                    selected_report_department = st.selectbox(
+                        "Отдел / категория для выгрузки",
+                        department_export_options,
+                        key="report_department_export_v771",
+                    )
+
+                department_frame_1 = filtered_report_1[
+                    filtered_report_1["category"].eq(selected_report_department)
+                ].copy()
+                department_frame_2 = filtered_report_2[
+                    filtered_report_2["category"].eq(selected_report_department)
+                ].copy()
+                department_tables = build_report_tables(
+                    department_frame_1,
+                    department_frame_2,
+                    report_dates_1,
+                    report_dates_2,
+                    selected_report_points,
+                )
+                department_dynamic = build_report_dynamic_data(
+                    department_frame_1,
+                    department_frame_2,
+                    report_dates_1,
+                    report_dates_2,
+                    report_pairs,
+                    report_match_weekdays_state,
+                    rolling_window,
+                )
+                department_excel = build_period_comparison_excel(
+                    department_tables,
+                    department_dynamic,
+                    report_period_1,
+                    report_period_2,
+                    report_match_weekdays_state,
+                    report_dates_1,
+                    report_dates_2,
+                    rolling_window,
+                    f"Отдел: {selected_report_department}",
+                )
+                department_filename = re.sub(
+                    r"[^0-9A-Za-zА-Яа-яЁё_-]+",
+                    "_",
+                    selected_report_department,
+                ).strip("_") or "department"
+                with department_export_cols[1]:
+                    st.write("")
+                    st.write("")
+                    st.download_button(
+                        "Скачать отдел Excel",
+                        data=department_excel,
+                        file_name=(
+                            f"report_{department_filename}_"
+                            f"{report_period_1[0]:%Y%m%d}_{report_period_1[1]:%Y%m%d}__"
+                            f"{report_period_2[0]:%Y%m%d}_{report_period_2[1]:%Y%m%d}.xlsx"
+                        ),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="report_department_excel_download_v771",
+                    )
+                st.caption(
+                    f"В Excel попадёт только отдел «{selected_report_department}»: итог, сущности, точки, "
+                    "матрицы двух периодов, изменение, дни недели и динамика."
+                )
+            else:
+                st.info("Для текущих фильтров нет отделов для отдельной выгрузки.")
 
             report_excel = build_period_comparison_excel(
                 report_tables,
