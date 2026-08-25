@@ -28,7 +28,6 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.9.0-SEPARATE-MENU"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -111,12 +110,7 @@ MATRIX_PLAN_SHEETS = [
     "План 4-я неделя",
 ]
 
-st.set_page_config(
-    page_title="Аналитика спроса",
-    page_icon="📊",
-    layout="wide",
-    initial_sidebar_state="collapsed",
-)
+st.set_page_config(page_title="Структура спроса", page_icon="📊", layout="wide")
 load_dotenv(APP_DIR / ".env", override=True)
 
 REMEMBERED_PG_FILE = APP_DIR / ".remembered_pg.json"
@@ -4526,8 +4520,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.9.0")
-    st.caption("Автозагрузка данных · SEPARATE-MENU")
+    st.caption("Аналитика спроса · версия 75.7.5")
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
         pg_host = st.text_input(
             "Сервер",
@@ -4555,7 +4548,6 @@ with st.sidebar:
             forget_remembered_pg_credentials()
             os.environ.pop("PGPASSWORD", None)
             st.session_state.pop("analysis", None)
-            st.session_state.pop("analysis_auto_signature_v7590", None)
             st.success("Сохранённый пароль удалён. При следующем подключении введите его снова.")
             st.rerun()
     date_range = st.date_input(
@@ -4563,10 +4555,9 @@ with st.sidebar:
         value=(previous_month_start, previous_month_end),
         max_value=today,
         format="DD.MM.YYYY",
-        key="main_period_v7590",
     )
-    auto_status = st.empty()
-    auto_status.caption("Точки и продажи загружаются автоматически.")
+    find_button = st.button("1. Найти магазины в базе", use_container_width=True)
+    load_button = st.button("2. Загрузить продажи", type="primary", use_container_width=True)
 
 os.environ["PGHOST"] = pg_host.strip()
 os.environ["PGPORT"] = str(int(pg_port))
@@ -4575,337 +4566,131 @@ os.environ["PGUSER"] = pg_user.strip()
 os.environ["PGPASSWORD"] = pg_password
 
 valid_period = isinstance(date_range, tuple) and len(date_range) == 2
-if not valid_period:
-    auto_status.warning("Выберите дату начала и дату окончания.")
-    st.info("Укажите полный период — после этого точки и продажи загрузятся автоматически.")
-    st.stop()
-
-start_date, end_date = date_range
-if start_date > end_date:
-    auto_status.warning("Дата начала позже даты окончания.")
-    st.error("Дата начала периода не может быть позже даты окончания.")
-    st.stop()
-
-# Автозагрузка выполняется только при изменении периода/подключения либо раз в 15 минут.
-# Обычные переходы по разделам используют уже подготовленный analysis из session_state.
-password_signature = (
-    hashlib.sha256(pg_password.encode("utf-8")).hexdigest()[:12]
-    if pg_password else "no-password"
-)
-refresh_bucket = int(datetime.now().timestamp() // (15 * 60))
-auto_signature = (
-    start_date.isoformat(),
-    end_date.isoformat(),
-    pg_host.strip(),
-    int(pg_port),
-    pg_database.strip(),
-    pg_user.strip(),
-    password_signature,
-    refresh_bucket,
-)
-
-analysis_needs_refresh = (
-    "analysis" not in st.session_state
-    or st.session_state.get("analysis_auto_signature_v7590") != auto_signature
-)
-
-if analysis_needs_refresh:
+if find_button:
+    if not valid_period:
+        st.error("Выберите дату начала и дату окончания.")
+        st.stop()
+    start_date, end_date = date_range
     try:
-        with st.spinner("Автоматически загружаю точки и продажи из PostgreSQL…"):
-            available_shops = ensure_required_shops(
-                load_available_shops(start_date, end_date + timedelta(days=1))
-            )
-            if available_shops.empty:
-                raise RuntimeError("за выбранный период база не вернула магазины")
-
-            # Рабочая сетка: Т1–Т29, Т11 исключена. Т25 добавляется обязательным правилом выше.
-            selected = available_shops.copy()
-            selected["shop_number"] = pd.to_numeric(selected["shop_number"], errors="coerce")
-            selected = selected[
-                selected["shop_number"].notna()
-                & selected["shop_number"].between(1, 29)
-                & selected["shop_number"].ne(11)
-            ].copy()
-            selected["shop_number"] = selected["shop_number"].astype(int)
-            selected = selected.drop_duplicates("shop_number").sort_values("shop_number")
-
-            if selected.empty:
-                raise RuntimeError("не найдены рабочие точки Т1–Т29")
-
-            selected_shop_numbers = tuple(selected["shop_number"].tolist())
-            point_mapping = {number: f"Т{number}" for number in selected_shop_numbers}
-            sales = load_sales(
-                start_date,
-                end_date + timedelta(days=1),
-                selected_shop_numbers,
-            )
-            if sales.empty:
-                raise RuntimeError("за выбранный период продаж не найдено")
-
-            st.session_state["analysis"] = prepare_analysis(sales, entities, point_mapping)
-            st.session_state["period"] = (start_date, end_date)
-            st.session_state["point_mapping"] = point_mapping
-            st.session_state["analysis_auto_signature_v7590"] = auto_signature
-            st.session_state["auto_loaded_shops_v7590"] = selected_shop_numbers
-            # Старое ручное сопоставление больше не управляет новой навигацией/автозагрузкой.
-            st.session_state.pop("shop_mapping", None)
-
-        if remember_connection:
-            try:
-                remembered_until = save_remembered_pg_credentials(
-                    pg_host, int(pg_port), pg_database, pg_user, pg_password
-                )
-                st.toast(f"Пароль запомнен до {remembered_until:%d.%m.%Y}", icon="🔐")
-            except Exception as error:
-                st.warning(f"Данные загружены, но пароль не удалось запомнить: {error}")
-        elif REMEMBERED_PG_FILE.exists():
-            forget_remembered_pg_credentials()
-
-        auto_status.success(
-            f"Автозагрузка завершена: {len(selected_shop_numbers)} точек · "
-            f"{start_date:%d.%m.%Y}–{end_date:%d.%m.%Y}"
+        available_shops = ensure_required_shops(
+            load_available_shops(start_date, end_date + timedelta(days=1))
         )
     except Exception as error:
-        auto_status.error("Автозагрузка не выполнена.")
-        st.error(f"Не удалось автоматически загрузить данные: {error}")
+        st.error(f"Не удалось получить список магазинов: {error}")
         st.stop()
-else:
-    cached_points = tuple(st.session_state.get("auto_loaded_shops_v7590", ()))
-    auto_status.success(
-        f"Данные готовы: {len(cached_points)} точек · "
-        f"{start_date:%d.%m.%Y}–{end_date:%d.%m.%Y}"
+    if remember_connection:
+        try:
+            remembered_until = save_remembered_pg_credentials(
+                pg_host, int(pg_port), pg_database, pg_user, pg_password
+            )
+            st.toast(f"Пароль запомнен до {remembered_until:%d.%m.%Y}", icon="🔐")
+        except Exception as error:
+            st.warning(f"Подключение работает, но пароль не удалось запомнить: {error}")
+    elif REMEMBERED_PG_FILE.exists():
+        forget_remembered_pg_credentials()
+    if available_shops.empty:
+        st.warning("За выбранный период база не вернула ни одного магазина. Проверьте даты.")
+    else:
+        mapping = available_shops.copy()
+        mapping.insert(0, "Использовать", True)
+        mapping.insert(2, "Название точки", mapping["shop_number"].map(lambda value: f"Т{int(value)}"))
+        st.session_state["shop_mapping"] = mapping
+
+edited_mapping = None
+if "shop_mapping" in st.session_state:
+    required_mapping = ensure_required_shops(st.session_state["shop_mapping"])
+    for shop_number, point_name in REQUIRED_POINT_SHOPS.items():
+        required_mask = pd.to_numeric(
+            required_mapping["shop_number"], errors="coerce"
+        ).eq(shop_number)
+        required_mapping.loc[required_mask, "Использовать"] = True
+        required_mapping.loc[required_mask, "Название точки"] = point_name
+    st.session_state["shop_mapping"] = required_mapping
+    st.subheader("Соответствие магазинов и точек")
+    st.caption("Проверьте столбец «Название точки». Оставьте галочку только у точек Т; столовые, ФСПК и точки Ф отключите.")
+    edited_mapping = st.data_editor(
+        st.session_state["shop_mapping"],
+        hide_index=True,
+        use_container_width=True,
+        disabled=["shop_number", "receipts", "sold_quantity", "first_sale_date", "last_sale_date"],
+        column_config={
+            "Использовать": st.column_config.CheckboxColumn("Использовать"),
+            "shop_number": st.column_config.NumberColumn("Номер магазина", format="%d"),
+            "Название точки": st.column_config.TextColumn("Название точки"),
+            "receipts": st.column_config.NumberColumn("Количество чеков", format="%d"),
+            "sold_quantity": st.column_config.NumberColumn("Продано, шт.", format="%.0f"),
+            "first_sale_date": st.column_config.DateColumn("Первая продажа", format="DD.MM.YYYY"),
+            "last_sale_date": st.column_config.DateColumn("Последняя продажа", format="DD.MM.YYYY"),
+        },
+        key="mapping_editor",
     )
 
+if load_button:
+    if not valid_period:
+        st.error("Выберите дату начала и дату окончания.")
+        st.stop()
+    if edited_mapping is None:
+        st.error("Сначала нажмите «1. Найти магазины в базе».")
+        st.stop()
+    selected = edited_mapping[edited_mapping["Использовать"]].copy()
+    if selected.empty:
+        st.error("Отметьте хотя бы одну точку.")
+        st.stop()
+    selected["Название точки"] = selected["Название точки"].astype(str).str.strip()
+    selected = selected[selected["Название точки"].str.match(r"^Т\d+$", na=False)]
+    if selected.empty:
+        st.error("Для выбранных строк задайте названия в формате Т1, Т2 … Т29.")
+        st.stop()
+    start_date, end_date = date_range
+    for shop_number, point_name in REQUIRED_POINT_SHOPS.items():
+        if shop_number not in selected["shop_number"].astype(int).tolist():
+            selected = pd.concat(
+                [
+                    selected,
+                    pd.DataFrame(
+                        [{
+                            "Использовать": True,
+                            "shop_number": shop_number,
+                            "Название точки": point_name,
+                            "receipts": 0,
+                            "sold_quantity": 0.0,
+                            "first_sale_date": pd.NaT,
+                            "last_sale_date": pd.NaT,
+                        }]
+                    ),
+                ],
+                ignore_index=True,
+            )
+    selected_shop_numbers = tuple(selected["shop_number"].astype(int).tolist())
+    point_mapping = dict(zip(selected["shop_number"].astype(int), selected["Название точки"]))
+    try:
+        sales = load_sales(start_date, end_date + timedelta(days=1), selected_shop_numbers)
+    except Exception as error:
+        st.error(f"Не удалось получить данные: {error}")
+        st.stop()
+    if sales.empty:
+        st.warning("За выбранный период продаж не найдено.")
+        st.stop()
+    st.session_state["analysis"] = prepare_analysis(sales, entities, point_mapping)
+    st.session_state["period"] = (start_date, end_date)
+    st.session_state["point_mapping"] = point_mapping
+    if remember_connection:
+        try:
+            remembered_until = save_remembered_pg_credentials(
+                pg_host, int(pg_port), pg_database, pg_user, pg_password
+            )
+            st.toast(f"Пароль запомнен до {remembered_until:%d.%m.%Y}", icon="🔐")
+        except Exception as error:
+            st.warning(f"Продажи загружены, но пароль не удалось запомнить: {error}")
+    elif REMEMBERED_PG_FILE.exists():
+        forget_remembered_pg_credentials()
+
 if "analysis" not in st.session_state:
-    st.info("Данные ещё не подготовлены.")
+    st.info("Сначала найдите магазины, сопоставьте их с Т1–Т29, затем загрузите продажи.")
     st.stop()
 
 sku_point, category_profile, entity_profile, daily_detail = st.session_state["analysis"]
 period = st.session_state["period"]
-
-MENU_ITEMS = [
-    ("Дашборд", ":material/dashboard:"),
-    ("Отчет", ":material/description:"),
-    ("Топ-3 сущности", ":material/account_tree:"),
-    ("Сущности", ":material/storefront:"),
-    ("Детализация", ":material/pie_chart:"),
-    ("Детализация категории", ":material/sell:"),
-    ("ABC продукции", ":material/inventory_2:"),
-    ("Анализ категории", ":material/bar_chart:"),
-    ("Окно свежести", ":material/calendar_month:"),
-    ("Списания категорий", ":material/delete:"),
-    ("Прогноз плана", ":material/track_changes:"),
-]
-SECTION_STATE_KEY = "main_section_v759"
-MENU_LABELS = [label for label, _ in MENU_ITEMS]
-
-
-def _open_main_section(label: str) -> None:
-    if label in MENU_LABELS:
-        st.session_state[SECTION_STATE_KEY] = label
-        # Оставляем старый ключ только как совместимость для уже существующих session_state.
-        st.session_state["main_tabs_v1"] = label
-
-
-def _return_to_main_menu() -> None:
-    st.session_state[SECTION_STATE_KEY] = None
-
-
-selected_main_section = st.session_state.get(SECTION_STATE_KEY)
-if selected_main_section not in MENU_LABELS:
-    selected_main_section = None
-    st.session_state[SECTION_STATE_KEY] = None
-
-st.markdown(
-    """
-<style>
-:root {
-    --vk-red: #e42f35;
-    --vk-ink: #222327;
-    --vk-muted: #7b7d84;
-    --vk-shell: #f1f1f3;
-    --vk-card: #ffffff;
-    --vk-line: #e3e3e7;
-}
-.vk-menu-header {
-    position: relative;
-    margin: 18px 0 0 0;
-    padding: 28px 24px 18px 24px;
-    background: var(--vk-shell);
-    border-radius: 28px 28px 0 0;
-    text-align: center;
-}
-.vk-menu-brand {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-    color: var(--vk-ink);
-    font-size: clamp(23px, 2.15vw, 34px);
-    line-height: 1.1;
-    font-weight: 760;
-    letter-spacing: -0.035em;
-}
-.vk-menu-brand svg { width: 34px; height: 34px; flex: 0 0 auto; }
-.vk-menu-subtitle {
-    margin-top: 8px;
-    color: #8a8c92;
-    font-size: 13px;
-    font-weight: 450;
-    letter-spacing: .01em;
-}
-.vk-menu-actions {
-    position: absolute;
-    top: 15px;
-    right: 18px;
-    display: flex;
-    gap: 7px;
-}
-.vk-menu-actions span {
-    width: 25px;
-    height: 25px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid #d6d7db;
-    border-radius: 999px;
-    color: #666970;
-    background: rgba(255,255,255,.55);
-    font-size: 11px;
-    font-weight: 700;
-    user-select: none;
-}
-.st-key-main_menu_cards_v759 {
-    padding: 10px 26px 30px 26px;
-    background: var(--vk-shell);
-    border-radius: 0 0 28px 28px;
-}
-.st-key-main_menu_cards_v759 div[data-testid="stButton"] > button {
-    width: 100%;
-    min-height: 112px;
-    margin: 0;
-    padding: 16px 12px 14px 12px;
-    border: 1px solid var(--vk-line);
-    border-radius: 12px;
-    background: var(--vk-card);
-    box-shadow: 0 5px 13px rgba(25, 27, 34, .10);
-    color: var(--vk-ink);
-    font-size: 14px;
-    font-weight: 650;
-    transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease;
-    white-space: normal;
-}
-.st-key-main_menu_cards_v759 div[data-testid="stButton"] > button:hover {
-    transform: translateY(-2px);
-    border-color: #d0d1d5;
-    box-shadow: 0 8px 19px rgba(25, 27, 34, .13);
-    color: #b72228;
-}
-.st-key-section_header_v759 {
-    padding: 8px 0 4px 0;
-    border-bottom: 1px solid #ececef;
-    margin-bottom: 12px;
-}
-.vk-current-section {
-    min-height: 40px;
-    display: flex;
-    align-items: center;
-    font-size: 21px;
-    font-weight: 760;
-    color: var(--vk-ink);
-}
-.vk-footer-brand {
-    margin: 42px 0 16px 0;
-    text-align: center;
-    color: var(--vk-red);
-    font-weight: 900;
-    font-size: clamp(30px, 4vw, 58px);
-    line-height: 1;
-    letter-spacing: -.04em;
-}
-@media (max-width: 620px) {
-    .vk-menu-header { padding-top: 52px; }
-    .vk-menu-actions { left: 50%; right: auto; transform: translateX(-50%); }
-    .st-key-main_menu_cards_v759 { padding-left: 16px; padding-right: 16px; }
-    .st-key-main_menu_cards_v759 div[data-testid="stButton"] > button { min-height: 90px; }
-}
-</style>
-    """,
-    unsafe_allow_html=True,
-)
-
-if selected_main_section is None:
-    st.markdown(
-        """
-<div class="vk-menu-header">
-    <div class="vk-menu-actions" aria-hidden="true"><span>i</span><span>◐</span><span>A</span></div>
-    <div class="vk-menu-brand">
-        <svg viewBox="0 0 34 34" fill="none" aria-hidden="true">
-            <path d="M4 27V22M9 27V17M14 27V20M19 27V11M24 27V15M29 27V6" stroke="#e42f35" stroke-width="2.7" stroke-linecap="round"/>
-            <path d="M4 18L10 14L15 16L21 8L26 11L30 4" stroke="#e42f35" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
-        <span>Аналитика спроса</span>
-    </div>
-    <div class="vk-menu-subtitle">Анализируйте. Принимайте решения. Достигайте результата.</div>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
-    with st.container(key="main_menu_cards_v759"):
-        first_row = st.columns(4)
-        for column, (label, icon) in zip(first_row, MENU_ITEMS[:4]):
-            with column:
-                st.button(
-                    label,
-                    key=f"main_menu_card_v759_{MENU_LABELS.index(label)}",
-                    icon=icon,
-                    use_container_width=True,
-                    on_click=_open_main_section,
-                    args=(label,),
-                )
-        second_row = st.columns(4)
-        for column, (label, icon) in zip(second_row, MENU_ITEMS[4:8]):
-            with column:
-                st.button(
-                    label,
-                    key=f"main_menu_card_v759_{MENU_LABELS.index(label)}",
-                    icon=icon,
-                    use_container_width=True,
-                    on_click=_open_main_section,
-                    args=(label,),
-                )
-        third_row = st.columns([0.5, 1, 1, 1, 0.5])
-        for column, (label, icon) in zip(third_row[1:4], MENU_ITEMS[8:]):
-            with column:
-                st.button(
-                    label,
-                    key=f"main_menu_card_v759_{MENU_LABELS.index(label)}",
-                    icon=icon,
-                    use_container_width=True,
-                    on_click=_open_main_section,
-                    args=(label,),
-                )
-    st.markdown('<div class="vk-footer-brand">ВКУСНО МАРКЕТ</div>', unsafe_allow_html=True)
-    st.stop()
-
-with st.container(key="section_header_v759"):
-    section_header_columns = st.columns([1.15, 4.85])
-    with section_header_columns[0]:
-        st.button(
-            "В главное меню",
-            key="return_to_main_menu_v759",
-            icon=":material/arrow_back:",
-            use_container_width=True,
-            on_click=_return_to_main_menu,
-        )
-    with section_header_columns[1]:
-        st.markdown(
-            f'<div class="vk-current-section">{selected_main_section}</div>',
-            unsafe_allow_html=True,
-        )
-
-# Совместимость с внутренними участками, которые могут читать прежний ключ навигации.
-st.session_state["main_tabs_v1"] = selected_main_section
 
 categories = sorted(category_profile["category"].unique())
 filter_columns = st.columns(2)
@@ -5058,26 +4843,18 @@ def _load_detail_plan_for_active_tab() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-class _MainSection:
-    """Совместимый контекст раздела без создания нативной полосы st.tabs."""
+st.markdown('\n<style>\n:root {\n    --vk-red: #e42f35;\n    --vk-ink: #222327;\n    --vk-muted: #7b7d84;\n    --vk-shell: #f1f1f3;\n    --vk-card: #ffffff;\n    --vk-line: #e3e3e7;\n}\n.vk-menu-header {\n    position: relative;\n    margin: 18px 0 0 0;\n    padding: 24px 24px 13px 24px;\n    background: var(--vk-shell);\n    border-radius: 28px 28px 0 0;\n    text-align: center;\n}\n.vk-menu-brand {\n    display: inline-flex;\n    align-items: center;\n    justify-content: center;\n    gap: 10px;\n    color: var(--vk-ink);\n    font-size: clamp(23px, 2.15vw, 34px);\n    line-height: 1.1;\n    font-weight: 760;\n    letter-spacing: -0.035em;\n}\n.vk-menu-brand svg { width: 34px; height: 34px; flex: 0 0 auto; }\n.vk-menu-subtitle {\n    margin-top: 8px;\n    color: #8a8c92;\n    font-size: 13px;\n    font-weight: 450;\n    letter-spacing: .01em;\n}\n.vk-menu-actions {\n    position: absolute;\n    top: 15px;\n    right: 18px;\n    display: flex;\n    gap: 7px;\n}\n.vk-menu-actions span {\n    width: 25px;\n    height: 25px;\n    display: inline-flex;\n    align-items: center;\n    justify-content: center;\n    border: 1px solid #d6d7db;\n    border-radius: 999px;\n    color: #666970;\n    background: rgba(255,255,255,.55);\n    font-size: 11px;\n    font-weight: 700;\n    user-select: none;\n}\n.st-key-main_tabs_v1 [data-baseweb="tab-list"],\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) [data-baseweb="tab-list"] {\n    display: grid !important;\n    grid-template-columns: repeat(8, minmax(0, 1fr)) !important;\n    gap: 15px !important;\n    width: 100% !important;\n    padding: 10px 26px 30px 26px !important;\n    margin: 0 !important;\n    background: var(--vk-shell) !important;\n    border-radius: 0 0 28px 28px !important;\n    overflow: visible !important;\n    box-sizing: border-box !important;\n}\n.st-key-main_tabs_v1 button[role="tab"],\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"] {\n    position: relative !important;\n    grid-column: span 2;\n    width: 100% !important;\n    min-width: 0 !important;\n    min-height: 112px !important;\n    height: auto !important;\n    margin: 0 !important;\n    padding: 16px 12px 14px 12px !important;\n    display: flex !important;\n    flex-direction: column !important;\n    align-items: center !important;\n    justify-content: center !important;\n    gap: 8px !important;\n    border: 1px solid var(--vk-line) !important;\n    border-radius: 12px !important;\n    background: var(--vk-card) !important;\n    box-shadow: 0 5px 13px rgba(25, 27, 34, .10) !important;\n    color: var(--vk-ink) !important;\n    transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease !important;\n    white-space: normal !important;\n    overflow: visible !important;\n}\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(9),\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(9) {\n    grid-column: 2 / span 2;\n}\n.st-key-main_tabs_v1 button[role="tab"]::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]::before {\n    content: "";\n    display: block;\n    width: 30px;\n    height: 30px;\n    flex: 0 0 30px;\n    background-color: #25262a;\n    -webkit-mask-repeat: no-repeat;\n    mask-repeat: no-repeat;\n    -webkit-mask-position: center;\n    mask-position: center;\n    -webkit-mask-size: contain;\n    mask-size: contain;\n    transition: background-color .16s ease, transform .16s ease;\n}\n.st-key-main_tabs_v1 button[role="tab"] p,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"] p {\n    margin: 0 !important;\n    text-align: center !important;\n    color: inherit !important;\n    font-size: 14px !important;\n    line-height: 1.22 !important;\n    font-weight: 650 !important;\n}\n.st-key-main_tabs_v1 button[role="tab"]:hover,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:hover {\n    transform: translateY(-2px) !important;\n    border-color: #d0d1d5 !important;\n    box-shadow: 0 8px 19px rgba(25, 27, 34, .13) !important;\n}\n.st-key-main_tabs_v1 button[role="tab"][aria-selected="true"],\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"][aria-selected="true"] {\n    color: #b72228 !important;\n    border-color: rgba(228,47,53,.44) !important;\n    box-shadow: 0 8px 20px rgba(228,47,53,.12), 0 4px 10px rgba(25,27,34,.08) !important;\n}\n.st-key-main_tabs_v1 button[role="tab"][aria-selected="true"]::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"][aria-selected="true"]::before {\n    background-color: var(--vk-red) !important;\n    transform: scale(1.04);\n}\n.st-key-main_tabs_v1 [data-baseweb="tab-highlight"],\n.st-key-main_tabs_v1 [data-baseweb="tab-border"],\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) [data-baseweb="tab-highlight"],\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) [data-baseweb="tab-border"] {\n    display: none !important;\n}\n.vk-footer-brand {\n    margin: 42px 0 16px 0;\n    text-align: center;\n    color: var(--vk-red);\n    font-weight: 900;\n    font-size: clamp(30px, 4vw, 58px);\n    line-height: 1;\n    letter-spacing: -.04em;\n}\n@media (max-width: 950px) {\n    .st-key-main_tabs_v1 [data-baseweb="tab-list"],\n    div[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) [data-baseweb="tab-list"] {\n        grid-template-columns: repeat(4, minmax(0, 1fr)) !important;\n    }\n    .st-key-main_tabs_v1 button[role="tab"],\n    div[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"] { grid-column: span 2; }\n    .st-key-main_tabs_v1 button[role="tab"]:nth-of-type(9),\n    div[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(9) { grid-column: span 2; }\n}\n@media (max-width: 620px) {\n    .vk-menu-header { padding-top: 52px; }\n    .vk-menu-actions { left: 50%; right: auto; transform: translateX(-50%); }\n    .st-key-main_tabs_v1 [data-baseweb="tab-list"],\n    div[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) [data-baseweb="tab-list"] {\n        grid-template-columns: 1fr !important;\n        padding-left: 16px !important;\n        padding-right: 16px !important;\n    }\n    .st-key-main_tabs_v1 button[role="tab"],\n    div[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"],\n    .st-key-main_tabs_v1 button[role="tab"]:nth-of-type(9),\n    div[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(9) {\n        grid-column: 1 !important;\n        min-height: 94px !important;\n    }\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(1)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(1)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Crect%20x%3D%274%27%20y%3D%274%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3Crect%20x%3D%2714%27%20y%3D%274%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3Crect%20x%3D%274%27%20y%3D%2714%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3Crect%20x%3D%2714%27%20y%3D%2714%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Crect%20x%3D%274%27%20y%3D%274%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3Crect%20x%3D%2714%27%20y%3D%274%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3Crect%20x%3D%274%27%20y%3D%2714%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3Crect%20x%3D%2714%27%20y%3D%2714%27%20width%3D%276%27%20height%3D%276%27%20rx%3D%271%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(2)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(2)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M6%203h9l3%203v15H6z%27%2F%3E%3Cpath%20d%3D%27M15%203v4h4%27%2F%3E%3Cpath%20d%3D%27M9%2011h6M9%2015h6M9%2019h4%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M6%203h9l3%203v15H6z%27%2F%3E%3Cpath%20d%3D%27M15%203v4h4%27%2F%3E%3Cpath%20d%3D%27M9%2011h6M9%2015h6M9%2019h4%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(3)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(3)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Ccircle%20cx%3D%2712%27%20cy%3D%275%27%20r%3D%272.2%27%2F%3E%3Ccircle%20cx%3D%276%27%20cy%3D%2718%27%20r%3D%272.2%27%2F%3E%3Ccircle%20cx%3D%2718%27%20cy%3D%2718%27%20r%3D%272.2%27%2F%3E%3Cpath%20d%3D%27M12%207.3v4M6%2015.8v-3h12v3%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Ccircle%20cx%3D%2712%27%20cy%3D%275%27%20r%3D%272.2%27%2F%3E%3Ccircle%20cx%3D%276%27%20cy%3D%2718%27%20r%3D%272.2%27%2F%3E%3Ccircle%20cx%3D%2718%27%20cy%3D%2718%27%20r%3D%272.2%27%2F%3E%3Cpath%20d%3D%27M12%207.3v4M6%2015.8v-3h12v3%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(4)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(4)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M5%2020V8l7-4%207%204v12%27%2F%3E%3Cpath%20d%3D%27M9%2020v-5h6v5M8%2010h.01M12%2010h.01M16%2010h.01%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M5%2020V8l7-4%207%204v12%27%2F%3E%3Cpath%20d%3D%27M9%2020v-5h6v5M8%2010h.01M12%2010h.01M16%2010h.01%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(5)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(5)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M11%203a9%209%200%201%200%209%209h-9z%27%2F%3E%3Cpath%20d%3D%27M14%203.4A9%209%200%200%201%2020.6%2010H14z%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M11%203a9%209%200%201%200%209%209h-9z%27%2F%3E%3Cpath%20d%3D%27M14%203.4A9%209%200%200%201%2020.6%2010H14z%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(6)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(6)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M4%207.5V4h3.5L20%2016.5%2016.5%2020%204%207.5z%27%2F%3E%3Ccircle%20cx%3D%277.2%27%20cy%3D%277.2%27%20r%3D%271%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M4%207.5V4h3.5L20%2016.5%2016.5%2020%204%207.5z%27%2F%3E%3Ccircle%20cx%3D%277.2%27%20cy%3D%277.2%27%20r%3D%271%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(7)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(7)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M12%203%2020%207.5v9L12%2021l-8-4.5v-9z%27%2F%3E%3Cpath%20d%3D%27m4%207.5%208%204.5%208-4.5M12%2012v9%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M12%203%2020%207.5v9L12%2021l-8-4.5v-9z%27%2F%3E%3Cpath%20d%3D%27m4%207.5%208%204.5%208-4.5M12%2012v9%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(8)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(8)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M4%2020h16M6%2017v-5M11%2017V8M16%2017V4M20%2017v-8%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M4%2020h16M6%2017v-5M11%2017V8M16%2017V4M20%2017v-8%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(9)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(9)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Crect%20x%3D%273%27%20y%3D%275%27%20width%3D%2718%27%20height%3D%2716%27%20rx%3D%272%27%2F%3E%3Cpath%20d%3D%27M7%203v4M17%203v4M3%2010h18%27%2F%3E%3Cpath%20d%3D%27M8%2014h.01M12%2014h.01M16%2014h.01M8%2018h.01M12%2018h.01%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Crect%20x%3D%273%27%20y%3D%275%27%20width%3D%2718%27%20height%3D%2716%27%20rx%3D%272%27%2F%3E%3Cpath%20d%3D%27M7%203v4M17%203v4M3%2010h18%27%2F%3E%3Cpath%20d%3D%27M8%2014h.01M12%2014h.01M16%2014h.01M8%2018h.01M12%2018h.01%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(10)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(10)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M4%207h16M9%207V4h6v3M7%207l1%2014h8l1-14M10%2011v6M14%2011v6%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Cpath%20d%3D%27M4%207h16M9%207V4h6v3M7%207l1%2014h8l1-14M10%2011v6M14%2011v6%27%2F%3E%3C%2Fsvg%3E");\n}\n\n.st-key-main_tabs_v1 button[role="tab"]:nth-of-type(11)::before,\ndiv[data-testid="stTabs"]:has(button[role="tab"]:nth-of-type(11)) button[role="tab"]:nth-of-type(11)::before {\n    -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Ccircle%20cx%3D%2712%27%20cy%3D%2712%27%20r%3D%278%27%2F%3E%3Ccircle%20cx%3D%2712%27%20cy%3D%2712%27%20r%3D%274%27%2F%3E%3Cpath%20d%3D%27M12%2012%2018%206M16%206h2v2%27%2F%3E%3C%2Fsvg%3E");\n    mask-image: url("data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27black%27%20stroke-width%3D%271.8%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%3E%3Ccircle%20cx%3D%2712%27%20cy%3D%2712%27%20r%3D%278%27%2F%3E%3Ccircle%20cx%3D%2712%27%20cy%3D%2712%27%20r%3D%274%27%2F%3E%3Cpath%20d%3D%27M12%2012%2018%206M16%206h2v2%27%2F%3E%3C%2Fsvg%3E");\n}\n\n</style>', unsafe_allow_html=True)
 
-    def __init__(self, label: str):
-        self.label = label
+st.markdown('\n<div class="vk-menu-header">\n    <div class="vk-menu-actions" aria-hidden="true"><span>i</span><span>◐</span><span>A</span></div>\n    <div class="vk-menu-brand">\n        <svg viewBox="0 0 34 34" fill="none" aria-hidden="true">\n            <path d="M4 27V22M9 27V17M14 27V20M19 27V11M24 27V15M29 27V6" stroke="#e42f35" stroke-width="2.7" stroke-linecap="round"/>\n            <path d="M4 18L10 14L15 16L21 8L26 11L30 4" stroke="#e42f35" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>\n        </svg>\n        <span>Аналитика спроса</span>\n    </div>\n    <div class="vk-menu-subtitle">Анализируйте. Принимайте решения. Двигайте результат.</div>\n</div>\n', unsafe_allow_html=True)
 
-    @property
-    def open(self) -> bool:
-        return st.session_state.get(SECTION_STATE_KEY) == self.label
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        return False
-
-
-tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_forecast = [
-    _MainSection(label) for label, _ in MENU_ITEMS
-]
+tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_forecast = st.tabs(
+    [
+        "Дашборд", "Отчет", "Топ-3 сущности", "Сущности", "Детализация", "Детализация категории", "ABC продукции",
+        "Анализ категории", "Окно свежести", "Списания категорий", "Прогноз плана",
+    ],
+    key="main_tabs_v1",
+    on_change="rerun",
+)
 
 if tab_report.open:
     with tab_report:
@@ -5340,24 +5117,14 @@ if tab_report.open:
                     ] if column in category_compare_table.columns
                 ]
                 category_compare_table = category_compare_table[visible_category_columns]
-                category_period_1_label = (
-                    f"{report_period_1[0]:%d.%m.%Y}, шт."
-                    if report_period_1[0] == report_period_1[1]
-                    else f"{report_period_1[0]:%d.%m.%Y}–{report_period_1[1]:%d.%m.%Y}, шт."
-                )
-                category_period_2_label = (
-                    f"{report_period_2[0]:%d.%m.%Y}, шт."
-                    if report_period_2[0] == report_period_2[1]
-                    else f"{report_period_2[0]:%d.%m.%Y}–{report_period_2[1]:%d.%m.%Y}, шт."
-                )
                 st.dataframe(
                     category_compare_table,
                     use_container_width=True,
                     hide_index=True,
                     height=min(620, 38 * len(category_compare_table) + 80),
                     column_config={
-                        "Период 1, шт.": st.column_config.NumberColumn(label=category_period_1_label, format="%.0f"),
-                        "Период 2, шт.": st.column_config.NumberColumn(label=category_period_2_label, format="%.0f"),
+                        "Период 1, шт.": st.column_config.NumberColumn(format="%.0f"),
+                        "Период 2, шт.": st.column_config.NumberColumn(format="%.0f"),
                         "Разница, шт.": st.column_config.NumberColumn(format="%+.0f"),
                         "Разница, %": st.column_config.NumberColumn(format="%+.1f%%"),
                     },
