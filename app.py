@@ -29,7 +29,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.4-REPORT-DEPARTMENT-EXCEL"
+BUILD_ID = "75.11.5-REPORT-CATEGORY-SKU-DRILLDOWN"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -5325,20 +5325,26 @@ def prepare_report_sales_frame(
 ) -> pd.DataFrame:
     """Подготавливает компактный дневной набор для отчёта.
 
-    В session_state не храним сырые строки чеков: для отчёта достаточно
-    день + точка + категория + сущность. Это резко снижает расход RAM.
+    Данные остаются агрегированными по дню и точке, но SKU и название товара
+    сохраняются, чтобы в отчёте можно было раскрыть категорию до конкретных
+    товаров без повторного обращения к PostgreSQL.
     """
     compact_columns = [
         "period", "business_date", "point", "shop_number",
-        "category", "entity", "sales",
+        "category", "entity", "sku", "product_name", "sales",
     ]
     if sales.empty:
         return pd.DataFrame(columns=compact_columns)
 
-    report = sales[[
-        column for column in ["business_date", "shop_number", "sku", "sold_quantity"]
+    source_columns = [
+        column for column in [
+            "business_date", "shop_number", "sku", "product_name", "sold_quantity"
+        ]
         if column in sales.columns
-    ]].copy()
+    ]
+    report = sales[source_columns].copy()
+    if "product_name" not in report.columns:
+        report["product_name"] = ""
     report["business_date"] = pd.to_datetime(report["business_date"], errors="coerce").dt.date
     report["shop_number"] = pd.to_numeric(report["shop_number"], errors="coerce").astype("Int64")
     report = report[report["business_date"].notna() & report["shop_number"].notna()].copy()
@@ -5347,17 +5353,31 @@ def prepare_report_sales_frame(
     report = report[report["shop_number"] != 11].copy()
     report["point"] = report["shop_number"].map(lambda value: f"Т{int(value)}")
     report["sku"] = report["sku"].map(normalize_sku)
-    entity_map = entities[["sku", "category", "entity"]].copy()
+
+    entity_columns = [
+        column for column in ["sku", "category", "entity", "entity_product_name"]
+        if column in entities.columns
+    ]
+    entity_map = entities[entity_columns].copy()
     entity_map["sku"] = entity_map["sku"].map(normalize_sku)
     entity_map = entity_map.drop_duplicates("sku")
     report = report.merge(entity_map, on="sku", how="left", validate="many_to_one")
     report["category"] = report["category"].fillna("Не сопоставлено")
     report["entity"] = report["entity"].fillna("Не сопоставлено")
+    report["product_name"] = report["product_name"].fillna("").astype(str).str.strip()
+    if "entity_product_name" in report.columns:
+        mapped_names = report["entity_product_name"].fillna("").astype(str).str.strip()
+        report.loc[report["product_name"].eq(""), "product_name"] = mapped_names
+        report = report.drop(columns=["entity_product_name"])
+    report.loc[report["product_name"].eq(""), "product_name"] = "Без названия"
     report["sales"] = pd.to_numeric(report["sold_quantity"], errors="coerce").fillna(0.0)
 
     report = (
         report.groupby(
-            ["business_date", "point", "shop_number", "category", "entity"],
+            [
+                "business_date", "point", "shop_number", "category", "entity",
+                "sku", "product_name",
+            ],
             as_index=False,
             dropna=False,
         )["sales"].sum()
@@ -5377,6 +5397,89 @@ def _report_group_period_values(
         frame.groupby(group_columns, dropna=False, as_index=False)
         .agg(**{value_name: ("sales", "sum")})
     )
+
+
+def build_report_category_sku_breakdown(
+    frame_1: pd.DataFrame,
+    frame_2: pd.DataFrame,
+    category: str,
+    period_1_dates: list[date],
+    period_2_dates: list[date],
+) -> pd.DataFrame:
+    """Раскрывает выбранную категорию до SKU, формирующих её продажи."""
+    days_1 = max(len(period_1_dates), 1)
+    days_2 = max(len(period_2_dates), 1)
+
+    def sku_period(frame: pd.DataFrame, value_name: str) -> pd.DataFrame:
+        columns = ["SKU", "Название товара", "Сущность", value_name]
+        if frame.empty or "sku" not in frame.columns:
+            return pd.DataFrame(columns=columns)
+        selected = frame[frame["category"].astype(str).eq(str(category))].copy()
+        if selected.empty:
+            return pd.DataFrame(columns=columns)
+        selected["sku"] = selected["sku"].map(normalize_sku)
+        selected["product_name"] = selected.get("product_name", "").fillna("").astype(str).str.strip()
+        selected.loc[selected["product_name"].eq(""), "product_name"] = "Без названия"
+        selected["entity"] = selected["entity"].fillna("Не сопоставлено").astype(str)
+        grouped = (
+            selected.groupby(["sku", "product_name", "entity"], dropna=False, as_index=False)
+            .agg(**{value_name: ("sales", "sum")})
+            .rename(columns={
+                "sku": "SKU",
+                "product_name": "Название товара",
+                "entity": "Сущность",
+            })
+        )
+        return grouped[columns]
+
+    left = sku_period(frame_1, "Период 1, шт.")
+    right = sku_period(frame_2, "Период 2, шт.")
+    result = left.merge(
+        right,
+        on=["SKU", "Название товара", "Сущность"],
+        how="outer",
+    ).fillna({"Период 1, шт.": 0.0, "Период 2, шт.": 0.0})
+    if result.empty:
+        return result
+
+    result["Период 1, шт."] = pd.to_numeric(result["Период 1, шт."], errors="coerce").fillna(0.0)
+    result["Период 2, шт."] = pd.to_numeric(result["Период 2, шт."], errors="coerce").fillna(0.0)
+    result = result[(result["Период 1, шт."] > 0) | (result["Период 2, шт."] > 0)].copy()
+    if result.empty:
+        return result
+
+    total_1 = float(result["Период 1, шт."].sum())
+    total_2 = float(result["Период 2, шт."].sum())
+    result["Изменение, шт."] = result["Период 2, шт."] - result["Период 1, шт."]
+    result["Изменение, %"] = (
+        result["Изменение, шт."].div(result["Период 1, шт."].replace(0, pd.NA)) * 100
+    )
+    result.loc[result["Период 1, шт."].eq(0), "Изменение, %"] = pd.NA
+    result["Доля категории П1, %"] = (result["Период 1, шт."] / total_1 * 100) if total_1 else 0.0
+    result["Доля категории П2, %"] = (result["Период 2, шт."] / total_2 * 100) if total_2 else 0.0
+    result["СР/день П1"] = result["Период 1, шт."] / days_1
+    result["СР/день П2"] = result["Период 2, шт."] / days_2
+    result = result.sort_values(
+        ["Период 2, шт.", "Период 1, шт.", "Название товара"],
+        ascending=[False, False, True],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    total_delta = total_2 - total_1
+    total_row = {
+        "SKU": "",
+        "Название товара": "ВСЕГО КАТЕГОРИИ",
+        "Сущность": "",
+        "Период 1, шт.": total_1,
+        "Период 2, шт.": total_2,
+        "Изменение, шт.": total_delta,
+        "Изменение, %": (total_delta / total_1 * 100) if total_1 else pd.NA,
+        "Доля категории П1, %": 100.0 if total_1 else 0.0,
+        "Доля категории П2, %": 100.0 if total_2 else 0.0,
+        "СР/день П1": total_1 / days_1,
+        "СР/день П2": total_2 / days_2,
+    }
+    return pd.concat([result, pd.DataFrame([total_row])], ignore_index=True)
 
 
 def build_report_tables(
@@ -5777,7 +5880,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.11.3 · PLAN CHECK DETAILED NOTES")
+    st.caption("Аналитика спроса · версия 75.11.5 · REPORT CATEGORY SKU DRILLDOWN")
     st.caption("Автозагрузка данных · SEPARATE-MENU")
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
         pg_host = st.text_input(
@@ -6432,6 +6535,7 @@ if tab_report.open:
                             "report_graph_entity_v770",
                             "report_graph_point_v770",
                             "report_department_export_v771",
+                            "report_category_compare_select_v772",
                         ]:
                             st.session_state.pop(stale_key, None)
                         st.session_state["period_comparison_report_v770"] = {
@@ -6603,7 +6707,8 @@ if tab_report.open:
                     if report_period_2[0] == report_period_2[1]
                     else f"{report_period_2[0]:%d.%m.%Y}–{report_period_2[1]:%d.%m.%Y}, шт."
                 )
-                st.dataframe(
+                st.caption("Нажмите на строку категории — ниже откроется список SKU, из которых складываются её продажи.")
+                category_selection = st.dataframe(
                     category_compare_table,
                     use_container_width=True,
                     hide_index=True,
@@ -6614,7 +6719,71 @@ if tab_report.open:
                         "Разница, шт.": st.column_config.NumberColumn(format="%+.0f"),
                         "Разница, %": st.column_config.NumberColumn(format="%+.1f%%"),
                     },
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="report_category_compare_select_v772",
                 )
+
+                selected_category_rows = list(getattr(category_selection.selection, "rows", []) or [])
+                if selected_category_rows:
+                    selected_category_index = int(selected_category_rows[0])
+                    if 0 <= selected_category_index < len(category_compare_table):
+                        selected_drill_category = str(
+                            category_compare_table.iloc[selected_category_index]["Категория"]
+                        ).strip()
+                        if selected_drill_category and selected_drill_category != "ВСЕГО":
+                            category_sku_breakdown = build_report_category_sku_breakdown(
+                                filtered_report_1,
+                                filtered_report_2,
+                                selected_drill_category,
+                                report_dates_1,
+                                report_dates_2,
+                            )
+                            st.markdown(f"#### SKU внутри категории «{selected_drill_category}»")
+                            if category_sku_breakdown.empty:
+                                st.info("По выбранной категории нет SKU с продажами в этих двух периодах.")
+                            else:
+                                sku_count = int(
+                                    category_sku_breakdown["SKU"].astype(str).str.strip().ne("").sum()
+                                )
+                                sku_total_1 = float(
+                                    pd.to_numeric(
+                                        category_sku_breakdown.iloc[-1]["Период 1, шт."], errors="coerce"
+                                    ) or 0.0
+                                )
+                                sku_total_2 = float(
+                                    pd.to_numeric(
+                                        category_sku_breakdown.iloc[-1]["Период 2, шт."], errors="coerce"
+                                    ) or 0.0
+                                )
+                                st.caption(
+                                    f"SKU с продажами: {sku_count} · "
+                                    f"сумма П1: {sku_total_1:,.0f} шт. · "
+                                    f"сумма П2: {sku_total_2:,.0f} шт. ".replace(",", " ")
+                                    + "Строка «ВСЕГО КАТЕГОРИИ» должна совпадать с выбранной категорией выше."
+                                )
+                                st.dataframe(
+                                    category_sku_breakdown,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    height=min(720, 38 * len(category_sku_breakdown) + 80),
+                                    column_config={
+                                        "Период 1, шт.": st.column_config.NumberColumn(
+                                            label=category_period_1_label, format="%.0f"
+                                        ),
+                                        "Период 2, шт.": st.column_config.NumberColumn(
+                                            label=category_period_2_label, format="%.0f"
+                                        ),
+                                        "Изменение, шт.": st.column_config.NumberColumn(format="%+.0f"),
+                                        "Изменение, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                                        "Доля категории П1, %": st.column_config.NumberColumn(format="%.1f%%"),
+                                        "Доля категории П2, %": st.column_config.NumberColumn(format="%.1f%%"),
+                                        "СР/день П1": st.column_config.NumberColumn(format="%.2f"),
+                                        "СР/день П2": st.column_config.NumberColumn(format="%.2f"),
+                                    },
+                                )
+                        elif selected_drill_category == "ВСЕГО":
+                            st.info("Выберите конкретную категорию, а не строку «ВСЕГО», чтобы раскрыть её до SKU.")
             else:
                 st.info("Для выбранных фильтров нет категорий для сравнения.")
 
