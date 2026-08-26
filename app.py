@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.19-REPORT-CATEGORY-SKU-POINT-DRILLDOWN"
+BUILD_ID = "75.11.20-REPORT-WEEKDAY-POINT-SKU-DRILLDOWN"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -6125,6 +6125,250 @@ def build_report_sku_point_breakdown(
     return pd.concat([result, pd.DataFrame([total_row])], ignore_index=True)[ordered_columns]
 
 
+def _report_weekday_index(weekday_label: str) -> int | None:
+    """Return Python weekday number for a short Russian label (Пн..Вс)."""
+    reverse_map = {label: number for number, label in REPORT_WEEKDAYS_RU.items()}
+    return reverse_map.get(str(weekday_label).strip())
+
+
+def _report_filter_weekday(frame: pd.DataFrame, weekday_label: str) -> pd.DataFrame:
+    """Keep rows that belong to one selected weekday."""
+    weekday_number = _report_weekday_index(weekday_label)
+    if weekday_number is None or frame.empty or "business_date" not in frame.columns:
+        return frame.iloc[0:0].copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    work = frame.copy()
+    work["business_date"] = pd.to_datetime(work["business_date"], errors="coerce").dt.date
+    return work[
+        work["business_date"].map(
+            lambda value: value.weekday() == weekday_number if isinstance(value, date) else False
+        )
+    ].copy()
+
+
+def build_report_weekday_point_breakdown(
+    frame_1: pd.DataFrame,
+    frame_2: pd.DataFrame,
+    weekday_label: str,
+    period_1_dates: list[date],
+    period_2_dates: list[date],
+    points: list[str] | None = None,
+) -> pd.DataFrame:
+    """Compare selected weekday by point, including quantity and revenue."""
+    weekday_number = _report_weekday_index(weekday_label)
+    if weekday_number is None:
+        return pd.DataFrame()
+
+    weekday_dates_1 = [item for item in period_1_dates if item.weekday() == weekday_number]
+    weekday_dates_2 = [item for item in period_2_dates if item.weekday() == weekday_number]
+    days_1 = max(len(weekday_dates_1), 1)
+    days_2 = max(len(weekday_dates_2), 1)
+
+    def one_period(frame: pd.DataFrame, qty_name: str, revenue_name: str) -> pd.DataFrame:
+        columns = ["Точка", qty_name, revenue_name]
+        work = _report_filter_weekday(frame, weekday_label)
+        if work.empty or "point" not in work.columns:
+            return pd.DataFrame(columns=columns)
+        work["sales"] = pd.to_numeric(work.get("sales"), errors="coerce").fillna(0.0)
+        if "revenue" not in work.columns:
+            work["revenue"] = 0.0
+        work["revenue"] = pd.to_numeric(work["revenue"], errors="coerce").fillna(0.0)
+        result = (
+            work.groupby("point", as_index=False, dropna=False)
+            .agg(**{qty_name: ("sales", "sum"), revenue_name: ("revenue", "sum")})
+            .rename(columns={"point": "Точка"})
+        )
+        return result[columns]
+
+    left = one_period(frame_1, "Период 1, шт.", "Выручка П1, ₽")
+    right = one_period(frame_2, "Период 2, шт.", "Выручка П2, ₽")
+
+    requested_points: list[str] = []
+    for point in points or []:
+        point_text = str(point).strip()
+        if point_text and point_text not in requested_points:
+            requested_points.append(point_text)
+
+    if requested_points:
+        result = pd.DataFrame({"Точка": requested_points})
+        result = result.merge(left, on="Точка", how="left").merge(right, on="Точка", how="left")
+    else:
+        result = left.merge(right, on="Точка", how="outer")
+    if result.empty:
+        return result
+
+    for column in ["Период 1, шт.", "Период 2, шт.", "Выручка П1, ₽", "Выручка П2, ₽"]:
+        if column not in result.columns:
+            result[column] = 0.0
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0.0)
+
+    result["Изменение, шт."] = result["Период 2, шт."] - result["Период 1, шт."]
+    result["Изменение, %"] = (
+        result["Изменение, шт."].div(result["Период 1, шт."].replace(0, pd.NA)) * 100
+    )
+    result.loc[result["Период 1, шт."].eq(0), "Изменение, %"] = pd.NA
+    result["Изменение выручки, ₽"] = result["Выручка П2, ₽"] - result["Выручка П1, ₽"]
+    result["Изменение выручки, %"] = (
+        result["Изменение выручки, ₽"].div(result["Выручка П1, ₽"].replace(0, pd.NA)) * 100
+    )
+    result.loc[result["Выручка П1, ₽"].eq(0), "Изменение выручки, %"] = pd.NA
+    result["СР/этот день П1"] = result["Период 1, шт."] / days_1
+    result["СР/этот день П2"] = result["Период 2, шт."] / days_2
+
+    def point_number(value: object) -> int:
+        match = re.search(r"(\d+)", str(value))
+        return int(match.group(1)) if match else 9999
+
+    result["_point_number"] = result["Точка"].map(point_number)
+    result = result.sort_values(["_point_number", "Точка"], kind="stable").drop(columns="_point_number")
+    result = result.reset_index(drop=True)
+
+    total_1 = float(result["Период 1, шт."].sum())
+    total_2 = float(result["Период 2, шт."].sum())
+    revenue_1 = float(result["Выручка П1, ₽"].sum())
+    revenue_2 = float(result["Выручка П2, ₽"].sum())
+    delta = total_2 - total_1
+    revenue_delta = revenue_2 - revenue_1
+    total_row = {
+        "Точка": "ВСЕГО",
+        "Период 1, шт.": total_1,
+        "Период 2, шт.": total_2,
+        "Выручка П1, ₽": revenue_1,
+        "Выручка П2, ₽": revenue_2,
+        "Изменение, шт.": delta,
+        "Изменение, %": (delta / total_1 * 100) if total_1 else pd.NA,
+        "Изменение выручки, ₽": revenue_delta,
+        "Изменение выручки, %": (revenue_delta / revenue_1 * 100) if revenue_1 else pd.NA,
+        "СР/этот день П1": total_1 / days_1,
+        "СР/этот день П2": total_2 / days_2,
+    }
+    ordered_columns = [
+        "Точка", "Период 1, шт.", "Период 2, шт.",
+        "Выручка П1, ₽", "Выручка П2, ₽",
+        "Изменение, шт.", "Изменение, %",
+        "Изменение выручки, ₽", "Изменение выручки, %",
+        "СР/этот день П1", "СР/этот день П2",
+    ]
+    return pd.concat([result, pd.DataFrame([total_row])], ignore_index=True)[ordered_columns]
+
+
+def build_report_weekday_point_sku_breakdown(
+    frame_1: pd.DataFrame,
+    frame_2: pd.DataFrame,
+    weekday_label: str,
+    point: str,
+    period_1_dates: list[date],
+    period_2_dates: list[date],
+) -> pd.DataFrame:
+    """List SKU sales for one point inside the selected weekday comparison."""
+    weekday_number = _report_weekday_index(weekday_label)
+    if weekday_number is None or not str(point).strip():
+        return pd.DataFrame()
+
+    weekday_dates_1 = [item for item in period_1_dates if item.weekday() == weekday_number]
+    weekday_dates_2 = [item for item in period_2_dates if item.weekday() == weekday_number]
+    days_1 = max(len(weekday_dates_1), 1)
+    days_2 = max(len(weekday_dates_2), 1)
+
+    def one_period(frame: pd.DataFrame, qty_name: str, revenue_name: str) -> pd.DataFrame:
+        columns = ["Категория", "Сущность", "SKU", "Название товара", qty_name, revenue_name]
+        work = _report_filter_weekday(frame, weekday_label)
+        if work.empty or "point" not in work.columns:
+            return pd.DataFrame(columns=columns)
+        work = work[work["point"].astype(str).eq(str(point))].copy()
+        if work.empty:
+            return pd.DataFrame(columns=columns)
+        work["sku"] = work["sku"].map(normalize_sku)
+        work["product_name"] = work.get("product_name", "").fillna("").astype(str).str.strip()
+        work.loc[work["product_name"].eq(""), "product_name"] = "Без названия"
+        work["category"] = work.get("category", "Не сопоставлено").fillna("Не сопоставлено").astype(str)
+        work["entity"] = work.get("entity", "Не сопоставлено").fillna("Не сопоставлено").astype(str)
+        work["sales"] = pd.to_numeric(work.get("sales"), errors="coerce").fillna(0.0)
+        if "revenue" not in work.columns:
+            work["revenue"] = 0.0
+        work["revenue"] = pd.to_numeric(work["revenue"], errors="coerce").fillna(0.0)
+        result = (
+            work.groupby(["category", "entity", "sku", "product_name"], as_index=False, dropna=False)
+            .agg(**{qty_name: ("sales", "sum"), revenue_name: ("revenue", "sum")})
+            .rename(columns={
+                "category": "Категория",
+                "entity": "Сущность",
+                "sku": "SKU",
+                "product_name": "Название товара",
+            })
+        )
+        return result[columns]
+
+    left = one_period(frame_1, "Период 1, шт.", "Выручка П1, ₽")
+    right = one_period(frame_2, "Период 2, шт.", "Выручка П2, ₽")
+    result = left.merge(
+        right,
+        on=["Категория", "Сущность", "SKU", "Название товара"],
+        how="outer",
+    ).fillna({
+        "Период 1, шт.": 0.0,
+        "Период 2, шт.": 0.0,
+        "Выручка П1, ₽": 0.0,
+        "Выручка П2, ₽": 0.0,
+    })
+    if result.empty:
+        return result
+
+    for column in ["Период 1, шт.", "Период 2, шт.", "Выручка П1, ₽", "Выручка П2, ₽"]:
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0.0)
+    result = result[(result["Период 1, шт."] > 0) | (result["Период 2, шт."] > 0)].copy()
+    if result.empty:
+        return result
+
+    result["Изменение, шт."] = result["Период 2, шт."] - result["Период 1, шт."]
+    result["Изменение, %"] = (
+        result["Изменение, шт."].div(result["Период 1, шт."].replace(0, pd.NA)) * 100
+    )
+    result.loc[result["Период 1, шт."].eq(0), "Изменение, %"] = pd.NA
+    result["Изменение выручки, ₽"] = result["Выручка П2, ₽"] - result["Выручка П1, ₽"]
+    result["Изменение выручки, %"] = (
+        result["Изменение выручки, ₽"].div(result["Выручка П1, ₽"].replace(0, pd.NA)) * 100
+    )
+    result.loc[result["Выручка П1, ₽"].eq(0), "Изменение выручки, %"] = pd.NA
+    result["СР/этот день П1"] = result["Период 1, шт."] / days_1
+    result["СР/этот день П2"] = result["Период 2, шт."] / days_2
+    result = result.sort_values(
+        ["Период 2, шт.", "Период 1, шт.", "Категория", "Название товара"],
+        ascending=[False, False, True, True],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    totals = {
+        "Категория": "ВСЕГО",
+        "Сущность": "",
+        "SKU": "",
+        "Название товара": "ВСЕГО SKU ТОЧКИ",
+    }
+    for column in ["Период 1, шт.", "Период 2, шт.", "Выручка П1, ₽", "Выручка П2, ₽"]:
+        totals[column] = float(result[column].sum())
+    totals["Изменение, шт."] = totals["Период 2, шт."] - totals["Период 1, шт."]
+    totals["Изменение, %"] = (
+        totals["Изменение, шт."] / totals["Период 1, шт."] * 100
+        if totals["Период 1, шт."] else pd.NA
+    )
+    totals["Изменение выручки, ₽"] = totals["Выручка П2, ₽"] - totals["Выручка П1, ₽"]
+    totals["Изменение выручки, %"] = (
+        totals["Изменение выручки, ₽"] / totals["Выручка П1, ₽"] * 100
+        if totals["Выручка П1, ₽"] else pd.NA
+    )
+    totals["СР/этот день П1"] = totals["Период 1, шт."] / days_1
+    totals["СР/этот день П2"] = totals["Период 2, шт."] / days_2
+
+    ordered_columns = [
+        "Категория", "Сущность", "SKU", "Название товара",
+        "Период 1, шт.", "Период 2, шт.",
+        "Выручка П1, ₽", "Выручка П2, ₽",
+        "Изменение, шт.", "Изменение, %",
+        "Изменение выручки, ₽", "Изменение выручки, %",
+        "СР/этот день П1", "СР/этот день П2",
+    ]
+    return pd.concat([result, pd.DataFrame([totals])], ignore_index=True)[ordered_columns]
+
+
 def build_report_tables(
     frame_1: pd.DataFrame,
     frame_2: pd.DataFrame,
@@ -7291,6 +7535,8 @@ if tab_report.open:
                             "report_graph_point_v770",
                             "report_department_export_v771",
                             "report_category_compare_select_v772",
+                            "report_weekday_drill_select_v75120",
+                            "report_weekday_point_select_v75120",
                         ]:
                             st.session_state.pop(stale_key, None)
                         st.session_state["period_comparison_report_v770"] = {
@@ -7689,6 +7935,113 @@ if tab_report.open:
                     "Изменение, %": st.column_config.NumberColumn(format="%+.1f%%"),
                 },
             )
+
+            weekday_summary_for_drill = report_tables["weekday_summary"].copy()
+            weekday_options = [
+                weekday
+                for weekday in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+                if weekday in set(weekday_summary_for_drill.get("День недели", pd.Series(dtype=str)).astype(str))
+            ]
+            if weekday_options:
+                st.markdown("##### Разбор выбранного дня недели по точкам")
+                selected_report_weekday = st.selectbox(
+                    "День недели",
+                    weekday_options,
+                    key="report_weekday_drill_select_v75120",
+                )
+                selected_weekday_number = _report_weekday_index(selected_report_weekday)
+                selected_weekday_dates_1 = [
+                    item for item in report_dates_1
+                    if selected_weekday_number is not None and item.weekday() == selected_weekday_number
+                ]
+                selected_weekday_dates_2 = [
+                    item for item in report_dates_2
+                    if selected_weekday_number is not None and item.weekday() == selected_weekday_number
+                ]
+                st.caption(
+                    f"{selected_report_weekday}: П1 — {len(selected_weekday_dates_1)} сравн. дней · "
+                    f"П2 — {len(selected_weekday_dates_2)} сравн. дней. "
+                    "Нажмите на точку — ниже откроется список SKU этой точки за выбранный день недели."
+                )
+
+                weekday_point_breakdown = build_report_weekday_point_breakdown(
+                    filtered_report_1,
+                    filtered_report_2,
+                    selected_report_weekday,
+                    report_dates_1,
+                    report_dates_2,
+                    selected_report_points,
+                )
+                if weekday_point_breakdown.empty:
+                    st.info("По выбранному дню недели нет продаж на выбранных точках.")
+                else:
+                    weekday_point_selection = st.dataframe(
+                        weekday_point_breakdown,
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(720, 38 * len(weekday_point_breakdown) + 80),
+                        column_config={
+                            "Период 1, шт.": st.column_config.NumberColumn(format="%.0f"),
+                            "Период 2, шт.": st.column_config.NumberColumn(format="%.0f"),
+                            "Выручка П1, ₽": st.column_config.NumberColumn(format="%.2f"),
+                            "Выручка П2, ₽": st.column_config.NumberColumn(format="%.2f"),
+                            "Изменение, шт.": st.column_config.NumberColumn(format="%+.0f"),
+                            "Изменение, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                            "Изменение выручки, ₽": st.column_config.NumberColumn(format="%+.2f"),
+                            "Изменение выручки, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                            "СР/этот день П1": st.column_config.NumberColumn(format="%.2f"),
+                            "СР/этот день П2": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                        on_select="rerun",
+                        selection_mode="single-row",
+                        key="report_weekday_point_select_v75120",
+                    )
+                    selected_weekday_point_rows = list(
+                        getattr(weekday_point_selection.selection, "rows", []) or []
+                    )
+                    if selected_weekday_point_rows:
+                        selected_weekday_point_index = int(selected_weekday_point_rows[0])
+                        if 0 <= selected_weekday_point_index < len(weekday_point_breakdown):
+                            selected_weekday_point = str(
+                                weekday_point_breakdown.iloc[selected_weekday_point_index]["Точка"]
+                            ).strip()
+                            if selected_weekday_point and selected_weekday_point != "ВСЕГО":
+                                weekday_point_sku = build_report_weekday_point_sku_breakdown(
+                                    filtered_report_1,
+                                    filtered_report_2,
+                                    selected_report_weekday,
+                                    selected_weekday_point,
+                                    report_dates_1,
+                                    report_dates_2,
+                                )
+                                st.markdown(
+                                    f"##### SKU · {selected_report_weekday} · {selected_weekday_point}"
+                                )
+                                if weekday_point_sku.empty:
+                                    st.info("Для выбранной точки нет SKU с продажами в этот день недели.")
+                                else:
+                                    st.dataframe(
+                                        weekday_point_sku,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        height=min(760, 38 * len(weekday_point_sku) + 80),
+                                        column_config={
+                                            "Период 1, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                            "Период 2, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                            "Выручка П1, ₽": st.column_config.NumberColumn(format="%.2f"),
+                                            "Выручка П2, ₽": st.column_config.NumberColumn(format="%.2f"),
+                                            "Изменение, шт.": st.column_config.NumberColumn(format="%+.0f"),
+                                            "Изменение, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                                            "Изменение выручки, ₽": st.column_config.NumberColumn(format="%+.2f"),
+                                            "Изменение выручки, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                                            "СР/этот день П1": st.column_config.NumberColumn(format="%.2f"),
+                                            "СР/этот день П2": st.column_config.NumberColumn(format="%.2f"),
+                                        },
+                                    )
+                            elif selected_weekday_point == "ВСЕГО":
+                                st.info("Выберите конкретную точку, а не строку «ВСЕГО».")
+            else:
+                st.info("Нет дней недели для дополнительного разбора по точкам.")
 
             st.markdown("#### Количество продаж по точкам")
             matrix_choice = st.radio(
