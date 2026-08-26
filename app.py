@@ -29,7 +29,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.9-SEPARATE-PLAN-ENTITY-SOURCES"
+BUILD_ID = "75.11.12-REPORT-CATEGORY-POINT-MATRIX"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -1958,8 +1958,9 @@ def calculate_sku_daily_forecast(
     entities: pd.DataFrame,
     target_date: date,
     point_mapping: dict[int, str],
+    lookback_weeks: int = 8,
 ) -> pd.DataFrame:
-    """Прогнозирует каждую ячейку Т по среднему SKU за фактический день продажи."""
+    """Прогнозирует каждую ячейку Т по среднему SKU за выбранный исторический период."""
     menu_enriched = menu.merge(
         entities[["sku", "category", "entity"]], on="sku", how="left"
     )
@@ -2034,7 +2035,8 @@ def calculate_sku_daily_forecast(
                     "Сущность": item["entity"],
                     "SKU": item["sku"],
                     "Название товара": item["product_name"],
-                    "Продано за 2 месяца, шт.": round(sold_total, 3),
+                    "Период среднего, недель": int(lookback_weeks),
+                    "Продано за выбранный период, шт.": round(sold_total, 3),
                     "Дней с продажами": sale_days,
                     "Среднее SKU за день продажи": (
                         round(float(average_per_sale_day), 2)
@@ -2064,7 +2066,7 @@ def calculate_sku_daily_forecast(
                         "Продаж SKU на точке не было: среднее принято равным 1 шт./день"
                         if used_default_average
                         else (
-                            f"За 2 месяца продажи были только в {sale_days} дн.; "
+                            f"За выбранные {int(lookback_weeks)} нед. продажи были только в {sale_days} дн.; "
                             "прогноз рассчитан, но выборка недостаточна для уверенного решения"
                             if low_sales_day_count
                             else ""
@@ -2631,6 +2633,8 @@ def fill_forecast_into_matrix(
             if pd.notna(record.get("Рекомендованный план")):
                 target_cell.value = int(record["Рекомендованный план"])
                 sale_days = int(record.get("Дней с продажами", 0) or 0)
+                lookback_weeks = int(record.get("Период среднего, недель", 0) or 0)
+                period_label = f"{lookback_weeks} нед." if lookback_weeks > 0 else "выбранный период"
                 low_sales_day_count = sale_days in (1, 2)
                 warning_line = (
                     "\n⚠ Мало данных: итог подсвечен светло-красным; "
@@ -2642,7 +2646,7 @@ def fill_forecast_into_matrix(
                     (
                         f"Среднее SKU за день продажи: "
                         f"{float(record['Среднее SKU за день продажи']):.2f}\n"
-                        f"Дней с продажами за 2 месяца: {sale_days}\n"
+                        f"Дней с продажами за период ({period_label}): {sale_days}\n"
                         f"Основание среднего: {record['Статус прогноза']}\n"
                         f"Идеальный цикл поставки: {int(record['Дней покрытия поставкой'])} дн.\n"
                         f"Срок категории: {int(record['Жизненный цикл, дней'])} дн.\n"
@@ -2657,7 +2661,7 @@ def fill_forecast_into_matrix(
             else:
                 target_cell.value = None
                 target_cell.comment = Comment(
-                    "Нет продаж этого SKU на выбранной точке за расчётные два месяца.",
+                    "Нет продаж этого SKU на выбранной точке за выбранный период среднего.",
                     "Прогноз плана",
                 )
 
@@ -2759,7 +2763,7 @@ def fill_forecast_into_matrix(
     calculation_rows: list[dict[str, object]] = []
     calculation_keys = [
         "Дата плана", "День недели", "Лист", "Строка Excel", "Категория", "Сущность",
-        "SKU", "Название товара", "Жизненный цикл, дней",
+        "SKU", "Название товара", "Жизненный цикл, дней", "Период среднего, недель",
     ]
     for _, group in forecast.groupby(calculation_keys, dropna=False, sort=False):
         first = group.iloc[0]
@@ -2784,7 +2788,7 @@ def fill_forecast_into_matrix(
             for value in row
         ])
     # Подсвечиваем итоговый план светло-красным, если среднее основано только
-    # на 1–2 днях продаж за двухмесячный период. Сам расчёт при этом не меняется.
+    # на 1–2 днях продаж за выбранный пользователем период. Сам расчёт при этом не меняется.
     calculation_header_map = {
         str(cell.value): cell.column for cell in calculation_sheet[1] if cell.value is not None
     }
@@ -2823,7 +2827,8 @@ def fill_forecast_into_matrix(
         "Сущность",
         "SKU",
         "Название товара",
-        "Продано за 2 месяца, шт.",
+        "Период среднего, недель",
+        "Продано за выбранный период, шт.",
         "Дней с продажами",
         "Среднее SKU за день продажи",
         "Жизненный цикл, дней",
@@ -2900,16 +2905,22 @@ def fill_forecast_into_matrix(
     metadata_column = len(export_columns) + 2
     detail_sheet.cell(row=1, column=metadata_column).value = "Период выгрузки плана"
     detail_sheet.cell(row=2, column=metadata_column).value = _forecast_export_date_label(forecast)
-    detail_sheet.cell(row=3, column=metadata_column).value = "Исторический период"
+    selected_lookback = int(pd.to_numeric(forecast.get("Период среднего, недель"), errors="coerce").dropna().iloc[0]) if "Период среднего, недель" in forecast.columns and not pd.to_numeric(forecast.get("Период среднего, недель"), errors="coerce").dropna().empty else 0
+    detail_sheet.cell(row=3, column=metadata_column).value = "Период для расчёта среднего"
     detail_sheet.cell(row=4, column=metadata_column).value = (
+        f"{selected_lookback} нед. ({selected_lookback * 7} дн.) перед каждой датой плана"
+        if selected_lookback > 0 else "Выбран пользователем"
+    )
+    detail_sheet.cell(row=5, column=metadata_column).value = "Общий диапазон загруженной истории"
+    detail_sheet.cell(row=6, column=metadata_column).value = (
         f"{history_from:%d.%m.%Y}–{(target_date - timedelta(days=1)):%d.%m.%Y}"
     )
-    detail_sheet.cell(row=5, column=metadata_column).value = "Легенда"
-    detail_sheet.cell(row=6, column=metadata_column).value = (
+    detail_sheet.cell(row=7, column=metadata_column).value = "Легенда"
+    detail_sheet.cell(row=8, column=metadata_column).value = (
         "Светло-красный план = продажи SKU на точке были только в 1–2 дня "
-        "за расчётные 2 месяца; значение требует осторожной оценки."
+        "за выбранный период среднего; значение требует осторожной оценки."
     )
-    detail_sheet.cell(row=6, column=metadata_column).fill = PatternFill(
+    detail_sheet.cell(row=8, column=metadata_column).fill = PatternFill(
         "solid", fgColor="F4CCCC"
     )
 
@@ -5792,6 +5803,30 @@ def build_report_tables(
         total_row["ВСЕГО"] = float(pd.to_numeric(pivot["ВСЕГО"], errors="coerce").sum())
         return pd.concat([pivot, pd.DataFrame([total_row])], ignore_index=True)
 
+
+    def category_point_matrix(frame: pd.DataFrame) -> pd.DataFrame:
+        """Category totals by point for one selected report period."""
+        if frame.empty:
+            total_row = {"Категория": "ВСЕГО"}
+            total_row.update({point: 0.0 for point in points})
+            total_row["ВСЕГО"] = 0.0
+            return pd.DataFrame([total_row], columns=["Категория", *points, "ВСЕГО"])
+        pivot = frame.pivot_table(
+            index=["category"],
+            columns="point",
+            values="sales",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+        pivot = pivot.reindex(columns=points, fill_value=0.0)
+        pivot["ВСЕГО"] = pivot.sum(axis=1)
+        pivot = pivot.reset_index().rename(columns={"category": "Категория"})
+        total_row = {"Категория": "ВСЕГО"}
+        for point in points:
+            total_row[point] = float(pd.to_numeric(pivot[point], errors="coerce").sum())
+        total_row["ВСЕГО"] = float(pd.to_numeric(pivot["ВСЕГО"], errors="coerce").sum())
+        return pd.concat([pivot, pd.DataFrame([total_row])], ignore_index=True)
+
     matrix_1 = matrix(frame_1)
     matrix_2 = matrix(frame_2)
     matrix_delta = pd.DataFrame()
@@ -5833,6 +5868,46 @@ def build_report_tables(
             ["_is_total", "Категория", "Сущность"], kind="stable"
         ).drop(columns="_is_total")
 
+    category_matrix_1 = category_point_matrix(frame_1)
+    category_matrix_2 = category_point_matrix(frame_2)
+    category_matrix_delta = category_matrix_1.merge(
+        category_matrix_2,
+        on=["Категория"],
+        how="outer",
+        suffixes=("__1", "__2"),
+    ).fillna(0.0)
+    category_result_columns = ["Категория"]
+    for point in points:
+        p1 = pd.to_numeric(category_matrix_delta.get(f"{point}__1", 0.0), errors="coerce").fillna(0.0)
+        p2 = pd.to_numeric(category_matrix_delta.get(f"{point}__2", 0.0), errors="coerce").fillna(0.0)
+        delta = p2 - p1
+        pct = delta.div(p1.replace(0, pd.NA)) * 100
+        pct = pct.mask(p1.eq(0), pd.NA)
+        qty_col = f"{point} Δ, шт."
+        pct_col = f"{point} Δ, %"
+        category_matrix_delta[qty_col] = delta
+        category_matrix_delta[pct_col] = pct
+        category_result_columns.extend([qty_col, pct_col])
+
+    category_total_p1 = pd.to_numeric(
+        category_matrix_delta.get("ВСЕГО__1", 0.0), errors="coerce"
+    ).fillna(0.0)
+    category_total_p2 = pd.to_numeric(
+        category_matrix_delta.get("ВСЕГО__2", 0.0), errors="coerce"
+    ).fillna(0.0)
+    category_total_delta = category_total_p2 - category_total_p1
+    category_matrix_delta["ВСЕГО Δ, шт."] = category_total_delta
+    category_matrix_delta["ВСЕГО Δ, %"] = (
+        category_total_delta.div(category_total_p1.replace(0, pd.NA)) * 100
+    )
+    category_matrix_delta.loc[category_total_p1.eq(0), "ВСЕГО Δ, %"] = pd.NA
+    category_result_columns.extend(["ВСЕГО Δ, шт.", "ВСЕГО Δ, %"])
+    category_matrix_delta = category_matrix_delta[category_result_columns]
+    category_matrix_delta["_is_total"] = category_matrix_delta["Категория"].eq("ВСЕГО")
+    category_matrix_delta = category_matrix_delta.sort_values(
+        ["_is_total", "Категория"], kind="stable"
+    ).drop(columns="_is_total")
+
     return {
         "category_summary": category_summary.sort_values("Период 2, шт.", ascending=False, kind="stable"),
         "category_entity": category_entity.sort_values(["Категория", "Период 2, шт."], ascending=[True, False], kind="stable"),
@@ -5841,6 +5916,9 @@ def build_report_tables(
         "matrix_1": matrix_1,
         "matrix_2": matrix_2,
         "matrix_delta": matrix_delta,
+        "category_matrix_1": category_matrix_1,
+        "category_matrix_2": category_matrix_2,
+        "category_matrix_delta": category_matrix_delta,
     }
 
 
@@ -5959,6 +6037,9 @@ def build_period_comparison_excel(
         tables["matrix_1"].to_excel(writer, sheet_name="Матрица П1", index=False)
         tables["matrix_2"].to_excel(writer, sheet_name="Матрица П2", index=False)
         tables["matrix_delta"].to_excel(writer, sheet_name="Изменение матрицы", index=False)
+        tables["category_matrix_1"].to_excel(writer, sheet_name="Категории-точки П1", index=False)
+        tables["category_matrix_2"].to_excel(writer, sheet_name="Категории-точки П2", index=False)
+        tables["category_matrix_delta"].to_excel(writer, sheet_name="Категории-точки Δ", index=False)
         dynamic_export = dynamic_data.copy()
         if not dynamic_export.empty:
             for date_column in ["Дата П1", "Дата П2"]:
@@ -6008,22 +6089,30 @@ def build_period_comparison_excel(
                         if isinstance(value, (int, float)):
                             sheet.cell(row, delta_col).fill = positive_fill if value >= 0 else negative_fill
 
-        matrix_delta_sheet = workbook["Изменение матрицы"]
-        matrix_delta_headers = {str(cell.value): cell.column for cell in matrix_delta_sheet[1]}
-        for header, col in matrix_delta_headers.items():
-            if header.endswith("Δ, %"):
-                for row in range(2, matrix_delta_sheet.max_row + 1):
-                    matrix_delta_sheet.cell(row, col).number_format = '0.0"%"'
-            elif header.endswith("Δ, шт."):
-                for row in range(2, matrix_delta_sheet.max_row + 1):
-                    matrix_delta_sheet.cell(row, col).number_format = '+#,##0;-#,##0;0'
-                    value = matrix_delta_sheet.cell(row, col).value
-                    if isinstance(value, (int, float)):
-                        matrix_delta_sheet.cell(row, col).fill = positive_fill if value >= 0 else negative_fill
-        if matrix_delta_sheet.max_row > 1:
-            for cell in matrix_delta_sheet[matrix_delta_sheet.max_row]:
-                cell.fill = total_fill
-                cell.font = Font(bold=True)
+        for delta_sheet_name in ["Изменение матрицы", "Категории-точки Δ"]:
+            matrix_delta_sheet = workbook[delta_sheet_name]
+            matrix_delta_headers = {str(cell.value): cell.column for cell in matrix_delta_sheet[1]}
+            for header, col in matrix_delta_headers.items():
+                if header.endswith("Δ, %"):
+                    for row in range(2, matrix_delta_sheet.max_row + 1):
+                        matrix_delta_sheet.cell(row, col).number_format = '0.0"%"'
+                elif header.endswith("Δ, шт."):
+                    for row in range(2, matrix_delta_sheet.max_row + 1):
+                        matrix_delta_sheet.cell(row, col).number_format = '+#,##0;-#,##0;0'
+                        value = matrix_delta_sheet.cell(row, col).value
+                        if isinstance(value, (int, float)):
+                            matrix_delta_sheet.cell(row, col).fill = positive_fill if value >= 0 else negative_fill
+            if matrix_delta_sheet.max_row > 1:
+                for cell in matrix_delta_sheet[matrix_delta_sheet.max_row]:
+                    cell.fill = total_fill
+                    cell.font = Font(bold=True)
+
+        for total_sheet_name in ["Категории-точки П1", "Категории-точки П2"]:
+            total_sheet = workbook[total_sheet_name]
+            if total_sheet.max_row > 1:
+                for cell in total_sheet[total_sheet.max_row]:
+                    cell.fill = total_fill
+                    cell.font = Font(bold=True)
 
         charts_sheet = workbook.create_sheet("Графики")
         charts_sheet.sheet_view.showGridLines = False
@@ -6130,7 +6219,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.11.9 · SEPARATE PLAN / ENTITY SOURCES")
+    st.caption("Аналитика спроса · версия 75.11.12 · REPORT CATEGORY POINT MATRIX")
     st.caption("Автозагрузка данных · SEPARATE-MENU")
     st.caption(f"SKU / категории / сущности · {entity_reference_source}")
     if entity_reference_warning and not entity_reference_source.startswith("Apps Script"):
@@ -7160,6 +7249,45 @@ if tab_report.open:
                 hide_index=True,
                 height=min(700, 38 * len(report_matrix_display) + 80),
                 column_config=matrix_column_config,
+            )
+
+            st.markdown("#### Количество продаж по точкам относительно категории")
+            st.caption(
+                "Строки — категории, столбцы — выбранные точки. В ячейке показано суммарное количество "
+                "продаж категории на конкретной точке за выбранный период. Последний столбец — итог по категории, "
+                "строка «ВСЕГО» — итог по каждой точке."
+            )
+            category_point_choice = st.radio(
+                "Период для таблицы по категориям и точкам",
+                ["Период 1", "Период 2", "Изменение"],
+                horizontal=True,
+                key="report_category_point_matrix_choice_v75112",
+            )
+            category_point_key = {
+                "Период 1": "category_matrix_1",
+                "Период 2": "category_matrix_2",
+                "Изменение": "category_matrix_delta",
+            }[category_point_choice]
+            category_point_display = report_tables[category_point_key].copy()
+            if category_point_choice == "Изменение":
+                category_point_column_config = {}
+                for column in category_point_display.columns:
+                    if column.endswith("Δ, шт."):
+                        category_point_column_config[column] = st.column_config.NumberColumn(format="%+.0f")
+                    elif column.endswith("Δ, %"):
+                        category_point_column_config[column] = st.column_config.NumberColumn(format="%+.1f%%")
+            else:
+                category_point_column_config = {
+                    column: st.column_config.NumberColumn(format="%.0f")
+                    for column in category_point_display.columns
+                    if column != "Категория"
+                }
+            st.dataframe(
+                category_point_display,
+                use_container_width=True,
+                hide_index=True,
+                height=min(700, 38 * len(category_point_display) + 80),
+                column_config=category_point_column_config,
             )
 
             st.markdown("#### Графически: рост и снижение по категориям")
@@ -12050,8 +12178,9 @@ if tab_forecast.open:
             "Меню и даты плана загружаются автоматически из текущей матрицы. "
             "Сначала выберите нужные даты из тех, которые найдены в матрице; затем приложение "
             "рассчитает только выбранные дни и заполнит Т1–Т29 только в соответствующих блоках меню. "
-            "Для каждого SKU и каждой точки используется два календарных месяца продаж до даты плана. "
-            "Среднее считается только по дням, когда SKU действительно продавался. "
+            "Период для расчёта среднего выбирается вручную ползунком ниже — от 1 до 26 недель (примерно 6 месяцев). "
+            "Для каждого SKU и каждой точки среднее считается только по дням, когда SKU действительно продавался, "
+            "и только внутри выбранного исторического периода. "
             "Множитель загрузки зависит от категории: Япония — ×1, вторые блюда — ×3, "
             "напитки — ×4, остальные категории — ×2. Т11 остаётся пустой."
         )
@@ -12075,6 +12204,7 @@ if tab_forecast.open:
                     "forecast_selected_matrix_dates_v760",
                     "forecast_preview_block_v760",
                     "forecast_calculated_dates_v760",
+                    "forecast_calculated_lookback_weeks_v75111",
                 ]:
                     st.session_state.pop(stale_key, None)
                 st.session_state[forecast_signature_key] = forecast_matrix_signature
@@ -12187,14 +12317,26 @@ if tab_forecast.open:
 
                     first_target_date = selected_target_dates[0]
                     last_target_date = selected_target_dates[-1]
-                    history_from = (
-                        pd.Timestamp(first_target_date) - pd.DateOffset(months=2)
-                    ).date()
+                    lookback_weeks = st.slider(
+                        "Период для расчёта среднего, недель",
+                        min_value=1,
+                        max_value=26,
+                        value=8,
+                        step=1,
+                        key="forecast_average_period_weeks_v75111",
+                        help=(
+                            "Ползунок задаёт глубину истории перед каждой датой плана. "
+                            "Например, 4 недели = предыдущие 28 календарных дней, а 26 недель ≈ 6 месяцев истории. "
+                            "Среднее SKU всё равно считается только по фактическим дням продаж внутри выбранного окна."
+                        ),
+                    )
+                    history_from = first_target_date - timedelta(weeks=int(lookback_weeks))
                     st.info(
                         f"К расчёту выбрано {len(selected_target_dates)} дат: "
                         f"{', '.join(value.strftime('%d.%m.%Y') for value in selected_target_dates)}. "
-                        "Для каждой даты будет использовано меню именно её блока в матрице и своё "
-                        "окно предыдущих двух календарных месяцев."
+                        f"Период среднего: {int(lookback_weeks)} нед. ({int(lookback_weeks) * 7} дн.). "
+                        "Для каждой даты используется меню именно её блока и отдельное историческое окно "
+                        "непосредственно перед этой датой."
                     )
 
                     forecast_button = st.button(
@@ -12234,9 +12376,7 @@ if tab_forecast.open:
                             for (target_date, sheet_name), menu_block in selected_matrix_menu.groupby(
                                 ["target_date", "sheet"], sort=True
                             ):
-                                block_history_from = (
-                                    pd.Timestamp(target_date) - pd.DateOffset(months=2)
-                                ).date()
+                                block_history_from = target_date - timedelta(weeks=int(lookback_weeks))
                                 block_history = forecast_history[
                                     pd.to_datetime(
                                         forecast_history["business_date"], errors="coerce"
@@ -12252,6 +12392,7 @@ if tab_forecast.open:
                                     entities,
                                     target_date,
                                     forecast_points,
+                                    lookback_weeks=int(lookback_weeks),
                                 )
                                 if not block_result.empty:
                                     forecast_parts.append(block_result)
@@ -12273,16 +12414,31 @@ if tab_forecast.open:
                             st.session_state["forecast_calculated_dates_v760"] = list(
                                 selected_target_dates
                             )
+                            st.session_state["forecast_calculated_lookback_weeks_v75111"] = int(
+                                lookback_weeks
+                            )
 
                     if "forecast_result" in st.session_state:
                         forecast_result = st.session_state["forecast_result"]
                         calculated_dates = st.session_state.get(
                             "forecast_calculated_dates_v760", []
                         )
-                        if calculated_dates and list(selected_target_dates) != list(calculated_dates):
+                        calculated_lookback_weeks = int(
+                            st.session_state.get("forecast_calculated_lookback_weeks_v75111", 0) or 0
+                        )
+                        calculation_current = (
+                            list(selected_target_dates) == list(calculated_dates)
+                            and int(lookback_weeks) == calculated_lookback_weeks
+                        )
+                        if not calculation_current:
+                            changed_parts = []
+                            if list(selected_target_dates) != list(calculated_dates):
+                                changed_parts.append("даты плана")
+                            if int(lookback_weeks) != calculated_lookback_weeks:
+                                changed_parts.append("период среднего")
                             st.warning(
-                                "Выбор дат изменён после последнего расчёта. "
-                                "Нажмите «Рассчитать план для выбранных дат», чтобы обновить готовый план."
+                                f"После последнего расчёта изменены: {', '.join(changed_parts)}. "
+                                "Нажмите «Рассчитать план для выбранных дат», чтобы пересчитать готовый план."
                             )
 
                         st.markdown("#### Рекомендованный план")
@@ -12335,7 +12491,7 @@ if tab_forecast.open:
                             "из скачанной копии; исходная матрица не изменяется."
                         )
 
-                        if calculated_dates and list(selected_target_dates) == list(calculated_dates):
+                        if calculation_current:
                             filled_matrix = fill_forecast_into_matrix(
                                 st.session_state["forecast_matrix_bytes"],
                                 forecast_result,
