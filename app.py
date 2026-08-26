@@ -29,7 +29,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.6-REPORT-SKU-SALES-SUMS"
+BUILD_ID = "75.11.8-MATRIX-ENTITY-SOURCE"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -112,6 +112,8 @@ MATRIX_PLAN_SHEETS = [
     "План 3-я неделя",
     "План 4-я неделя",
 ]
+MATRIX_ENTITY_SHEET = "Справочник + атрибуты"
+MATRIX_SNAPSHOT_SHEETS = [*MATRIX_PLAN_SHEETS, MATRIX_ENTITY_SHEET]
 
 st.set_page_config(
     page_title="Аналитика спроса",
@@ -161,14 +163,16 @@ def _coerce_api_cell(value: object) -> object:
 
 
 def _build_matrix_xlsx_from_apps_script(sheet_payloads: dict[str, list[list[object]]]) -> bytes:
-    """Rebuild a minimal XLSX with the four plan sheets returned by Apps Script."""
+    """Rebuild a minimal XLSX with plan sheets plus the SKU/entity reference sheet."""
     from openpyxl import Workbook
 
     workbook = Workbook()
     default_sheet = workbook.active
     workbook.remove(default_sheet)
 
-    for sheet_name in MATRIX_PLAN_SHEETS:
+    for sheet_name in MATRIX_SNAPSHOT_SHEETS:
+        if sheet_name not in sheet_payloads:
+            continue
         values = sheet_payloads.get(sheet_name, [])
         worksheet = workbook.create_sheet(title=sheet_name)
         for row in values:
@@ -185,7 +189,7 @@ def _fetch_apps_script_matrix_snapshot(
     api_url: str,
     api_key: str,
 ) -> tuple[bytes, str, str, str]:
-    """Read the four current plan sheets from Apps Script and cache for 15 minutes."""
+    """Read current plan sheets and the SKU/entity reference from Apps Script every 15 minutes."""
     checked_at = datetime.now().isoformat(timespec="seconds")
     if not api_url or not api_key:
         return b"", "", checked_at, "не указан URL или ключ Apps Script"
@@ -211,7 +215,7 @@ def _fetch_apps_script_matrix_snapshot(
             raise RuntimeError("в Apps Script не найдены листы: " + ", ".join(missing))
 
         sheet_payloads: dict[str, list[list[object]]] = {}
-        for sheet_name in MATRIX_PLAN_SHEETS:
+        for sheet_name in MATRIX_SNAPSHOT_SHEETS:
             sheet_response = session.get(
                 api_url,
                 params={"key": api_key, "action": "sheet", "name": sheet_name},
@@ -234,7 +238,7 @@ def _fetch_apps_script_matrix_snapshot(
             raise RuntimeError("не удалось собрать XLSX из ответа Apps Script")
 
         updated_at = str(meta.get("updatedAt") or "").replace("T", " ").replace("Z", " UTC")
-        source = "Apps Script · 2.3 Матрица КОМБО"
+        source = "Apps Script · 2.3 Матрица КОМБО · Справочник + атрибуты"
         if updated_at:
             source += f" · обновлена {updated_at}"
         return content, source, checked_at, ""
@@ -483,26 +487,47 @@ def styler_safe_preview(frame: pd.DataFrame, preferred_rows: int | None = None) 
     return frame.head(max_rows).copy(), max_rows, truncated
 
 
-@st.cache_data(show_spinner=False)
-def load_entities(path: str, modified_at: float) -> pd.DataFrame:
-    raw = pd.read_excel(path, header=None)
+def _parse_entity_reference_raw(raw: pd.DataFrame) -> pd.DataFrame:
+    """Normalize SKU/category/entity mapping from the matrix reference sheet."""
+    if raw is None or raw.empty:
+        raise ValueError("Лист справочника пуст.")
+
     header_row = None
-    for index, row in raw.head(20).iterrows():
-        lowered = {str(value).strip().lower() for value in row if pd.notna(value)}
+    for index, row in raw.head(30).iterrows():
+        lowered = {str(value).strip().casefold() for value in row if pd.notna(value)}
         if "код" in lowered and "название блюда" in lowered:
-            header_row = index
+            header_row = int(index)
             break
     if header_row is None:
         raise ValueError("В справочнике не найдена строка с колонками «код» и «Название блюда».")
 
-    data = pd.read_excel(path, header=header_row)
-    data.columns = [str(column).strip() for column in data.columns]
-    required = ["код", "Название блюда", "Категория", "Атрибут 1", "Атрибут 2", "Атрибут 3"]
-    missing = [column for column in required if column not in data.columns]
+    header_values = [
+        str(value).strip() if pd.notna(value) else ""
+        for value in raw.iloc[header_row].tolist()
+    ]
+    data = raw.iloc[header_row + 1 :].copy()
+    data.columns = header_values
+    lookup: dict[str, str] = {}
+    for column in data.columns:
+        key = str(column).strip().casefold()
+        if key and key not in lookup:
+            lookup[key] = column
+
+    canonical = {
+        "код": "код",
+        "название блюда": "Название блюда",
+        "категория": "Категория",
+        "атрибут 1": "Атрибут 1",
+        "атрибут 2": "Атрибут 2",
+        "атрибут 3": "Атрибут 3",
+    }
+    missing = [name for key, name in canonical.items() if key not in lookup]
     if missing:
         raise ValueError(f"В справочнике отсутствуют колонки: {', '.join(missing)}")
 
-    result = data[required].copy()
+    result = pd.DataFrame(
+        {name: data[lookup[key]] for key, name in canonical.items()}
+    )
     result["sku"] = result["код"].map(normalize_sku)
     result = result[result["sku"].notna()].drop_duplicates("sku", keep="last")
     result = result.rename(
@@ -514,14 +539,104 @@ def load_entities(path: str, modified_at: float) -> pd.DataFrame:
             "Атрибут 3": "attribute_3",
         }
     )
-    attributes = result[["attribute_1", "attribute_2", "attribute_3"]].fillna("").astype(str)
+    for column in ["entity_product_name", "category", "attribute_1", "attribute_2", "attribute_3"]:
+        result[column] = result[column].fillna("").astype(str).str.strip()
+    result["category"] = result["category"].replace("", "Не сопоставлено")
+    attributes = result[["attribute_1", "attribute_2", "attribute_3"]]
     result["entity"] = attributes.apply(
-        lambda row: " • ".join(value.strip() for value in row if value.strip()) or "Не задана",
+        lambda row: " • ".join(value for value in row if value) or "Не задана",
         axis=1,
     )
     return result[
         ["sku", "entity_product_name", "category", "attribute_1", "attribute_2", "attribute_3", "entity"]
+    ].reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def load_entities(path: str, modified_at: float) -> pd.DataFrame:
+    """Legacy fallback: read the old standalone entity workbook."""
+    raw = pd.read_excel(path, header=None)
+    return _parse_entity_reference_raw(raw)
+
+
+@st.cache_data(show_spinner=False)
+def load_entities_from_matrix_bytes(matrix_bytes: bytes) -> pd.DataFrame:
+    """Read SKU/category/entity mapping from «Справочник + атрибуты» in 2.3 Matrix COMBO."""
+    if not matrix_bytes or matrix_bytes[:2] != b"PK":
+        raise ValueError("Матрица 2.3 не содержит корректный XLSX.")
+    try:
+        raw = pd.read_excel(
+            io.BytesIO(matrix_bytes),
+            sheet_name=MATRIX_ENTITY_SHEET,
+            header=None,
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"В матрице 2.3 не найден лист «{MATRIX_ENTITY_SHEET}»."
+        ) from error
+    return _parse_entity_reference_raw(raw)
+
+
+def _entity_reference_signature(frame: pd.DataFrame) -> str:
+    columns = [
+        "sku", "entity_product_name", "category",
+        "attribute_1", "attribute_2", "attribute_3", "entity",
     ]
+    normalized = frame.reindex(columns=columns).fillna("").astype(str)
+    normalized = normalized.sort_values("sku", kind="stable").reset_index(drop=True)
+    return hashlib.sha256(normalized.to_csv(index=False).encode("utf-8")).hexdigest()
+
+
+def get_current_entity_reference() -> tuple[pd.DataFrame, str, str, str, str]:
+    """Use the live 2.3 Matrix reference first; keep local/legacy files only as emergency fallback."""
+    matrix_bytes, matrix_source, checked_at, matrix_error = get_current_combo_matrix_snapshot()
+    errors: list[str] = []
+    if matrix_error:
+        errors.append(matrix_error)
+
+    if matrix_bytes:
+        try:
+            frame = load_entities_from_matrix_bytes(matrix_bytes)
+            return (
+                frame,
+                f"{matrix_source} · лист «{MATRIX_ENTITY_SHEET}»",
+                checked_at,
+                "; ".join(errors),
+                _entity_reference_signature(frame),
+            )
+        except Exception as error:
+            errors.append(f"текущая матрица: {error}")
+
+    # If Apps Script returned a reduced snapshot without the reference sheet,
+    # try the bundled full 2.3 Matrix before ever touching the old entities.xlsx.
+    if COMBO_MATRIX_FILE.exists():
+        try:
+            local_bytes = COMBO_MATRIX_FILE.read_bytes()
+            frame = load_entities_from_matrix_bytes(local_bytes)
+            return (
+                frame,
+                f"Резерв · {COMBO_MATRIX_FILE.name} · лист «{MATRIX_ENTITY_SHEET}»",
+                checked_at,
+                "; ".join(errors),
+                _entity_reference_signature(frame),
+            )
+        except Exception as error:
+            errors.append(f"локальная матрица: {error}")
+
+    if ENTITY_FILE.exists():
+        try:
+            frame = load_entities(str(ENTITY_FILE), ENTITY_FILE.stat().st_mtime)
+            return (
+                frame,
+                f"Аварийный резерв · {ENTITY_FILE.name}",
+                checked_at,
+                "; ".join(errors),
+                _entity_reference_signature(frame),
+            )
+        except Exception as error:
+            errors.append(f"старый справочник: {error}")
+
+    raise RuntimeError("; ".join(errors) or "Справочник SKU/сущностей недоступен.")
 
 
 def connection_settings() -> dict[str, object]:
@@ -3937,12 +4052,12 @@ def unmapped_classification_report_bytes(
     instruction = pd.DataFrame(
         {
             "Инструкция": [
-                "Отчёт построен только по SKU, которых нет в текущем справочнике сущностей.",
+                "Отчёт построен только по SKU, которых нет в листе «Справочник + атрибуты» матрицы 2.3.",
                 "Предложенная категория формируется по названию товара из PostgreSQL и не применяется автоматически.",
                 "Заполните «Подтверждённая категория», если хотите зафиксировать решение вручную; либо просто пришлите файл на проверку.",
                 "Низкая/средняя уверенность означает, что название неоднозначно и требует ручного просмотра.",
                 "Лист «Продажи по месяцам» показывает каждый SKU отдельно по календарному месяцу; «Сводка по месяцам» готова для переноса в PDF-отчёт.",
-                "После подтверждения SKU можно добавить в entities.xlsx, и месячный отчёт автоматически выделит две новые категории.",
+                "После подтверждения SKU добавьте его в лист «Справочник + атрибуты» матрицы 2.3 — приложение подхватит категорию и сущность автоматически.",
             ]
         }
     )
@@ -4081,6 +4196,12 @@ def prepare_analysis(
     merged = sales.merge(entities, on="sku", how="left", validate="many_to_one")
     merged["category"] = merged["category"].fillna("Не сопоставлено")
     merged["entity"] = merged["entity"].fillna("Не сопоставлено")
+    # Для найденного SKU название, категория и сущность считаются справочными данными
+    # листа «Справочник + атрибуты». PostgreSQL остаётся источником факта продажи.
+    if "entity_product_name" in merged.columns:
+        sql_names = merged["product_name"].fillna("").astype(str).str.strip()
+        matrix_names = merged["entity_product_name"].fillna("").astype(str).str.strip()
+        merged["product_name"] = matrix_names.where(matrix_names.ne(""), sql_names)
 
     daily_detail = (
         merged.groupby(
@@ -5331,14 +5452,14 @@ def prepare_report_sales_frame(
     """
     compact_columns = [
         "period", "business_date", "point", "shop_number",
-        "category", "entity", "sku", "product_name", "sales",
+        "category", "entity", "sku", "product_name", "sales", "revenue",
     ]
     if sales.empty:
         return pd.DataFrame(columns=compact_columns)
 
     source_columns = [
         column for column in [
-            "business_date", "shop_number", "sku", "product_name", "sold_quantity"
+            "business_date", "shop_number", "sku", "product_name", "sold_quantity", "revenue"
         ]
         if column in sales.columns
     ]
@@ -5367,10 +5488,13 @@ def prepare_report_sales_frame(
     report["product_name"] = report["product_name"].fillna("").astype(str).str.strip()
     if "entity_product_name" in report.columns:
         mapped_names = report["entity_product_name"].fillna("").astype(str).str.strip()
-        report.loc[report["product_name"].eq(""), "product_name"] = mapped_names
+        report["product_name"] = mapped_names.where(mapped_names.ne(""), report["product_name"])
         report = report.drop(columns=["entity_product_name"])
     report.loc[report["product_name"].eq(""), "product_name"] = "Без названия"
     report["sales"] = pd.to_numeric(report["sold_quantity"], errors="coerce").fillna(0.0)
+    if "revenue" not in report.columns:
+        report["revenue"] = 0.0
+    report["revenue"] = pd.to_numeric(report["revenue"], errors="coerce").fillna(0.0)
 
     report = (
         report.groupby(
@@ -5380,7 +5504,8 @@ def prepare_report_sales_frame(
             ],
             as_index=False,
             dropna=False,
-        )["sales"].sum()
+        )
+        .agg(sales=("sales", "sum"), revenue=("revenue", "sum"))
     )
     report["period"] = period_name
     return report[compact_columns]
@@ -5406,12 +5531,16 @@ def build_report_category_sku_breakdown(
     period_1_dates: list[date],
     period_2_dates: list[date],
 ) -> pd.DataFrame:
-    """Раскрывает выбранную категорию до SKU, формирующих её продажи."""
+    """Раскрывает выбранную категорию до SKU с количеством продаж и выручкой."""
     days_1 = max(len(period_1_dates), 1)
     days_2 = max(len(period_2_dates), 1)
 
-    def sku_period(frame: pd.DataFrame, value_name: str) -> pd.DataFrame:
-        columns = ["SKU", "Название товара", "Сущность", value_name]
+    def sku_period(
+        frame: pd.DataFrame,
+        quantity_name: str,
+        revenue_name: str,
+    ) -> pd.DataFrame:
+        columns = ["SKU", "Название товара", "Сущность", quantity_name, revenue_name]
         if frame.empty or "sku" not in frame.columns:
             return pd.DataFrame(columns=columns)
         selected = frame[frame["category"].astype(str).eq(str(category))].copy()
@@ -5421,9 +5550,17 @@ def build_report_category_sku_breakdown(
         selected["product_name"] = selected.get("product_name", "").fillna("").astype(str).str.strip()
         selected.loc[selected["product_name"].eq(""), "product_name"] = "Без названия"
         selected["entity"] = selected["entity"].fillna("Не сопоставлено").astype(str)
+        if "revenue" not in selected.columns:
+            selected["revenue"] = 0.0
+        selected["revenue"] = pd.to_numeric(selected["revenue"], errors="coerce").fillna(0.0)
         grouped = (
             selected.groupby(["sku", "product_name", "entity"], dropna=False, as_index=False)
-            .agg(**{value_name: ("sales", "sum")})
+            .agg(
+                **{
+                    quantity_name: ("sales", "sum"),
+                    revenue_name: ("revenue", "sum"),
+                }
+            )
             .rename(columns={
                 "sku": "SKU",
                 "product_name": "Название товара",
@@ -5432,29 +5569,42 @@ def build_report_category_sku_breakdown(
         )
         return grouped[columns]
 
-    left = sku_period(frame_1, "Период 1, шт.")
-    right = sku_period(frame_2, "Период 2, шт.")
+    left = sku_period(frame_1, "Период 1, шт.", "Выручка П1, ₽")
+    right = sku_period(frame_2, "Период 2, шт.", "Выручка П2, ₽")
     result = left.merge(
         right,
         on=["SKU", "Название товара", "Сущность"],
         how="outer",
-    ).fillna({"Период 1, шт.": 0.0, "Период 2, шт.": 0.0})
+    ).fillna({
+        "Период 1, шт.": 0.0,
+        "Период 2, шт.": 0.0,
+        "Выручка П1, ₽": 0.0,
+        "Выручка П2, ₽": 0.0,
+    })
     if result.empty:
         return result
 
-    result["Период 1, шт."] = pd.to_numeric(result["Период 1, шт."], errors="coerce").fillna(0.0)
-    result["Период 2, шт."] = pd.to_numeric(result["Период 2, шт."], errors="coerce").fillna(0.0)
+    for column in ["Период 1, шт.", "Период 2, шт.", "Выручка П1, ₽", "Выручка П2, ₽"]:
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0.0)
     result = result[(result["Период 1, шт."] > 0) | (result["Период 2, шт."] > 0)].copy()
     if result.empty:
         return result
 
     total_1 = float(result["Период 1, шт."].sum())
     total_2 = float(result["Период 2, шт."].sum())
+    total_revenue_1 = float(result["Выручка П1, ₽"].sum())
+    total_revenue_2 = float(result["Выручка П2, ₽"].sum())
+
     result["Изменение, шт."] = result["Период 2, шт."] - result["Период 1, шт."]
     result["Изменение, %"] = (
         result["Изменение, шт."].div(result["Период 1, шт."].replace(0, pd.NA)) * 100
     )
     result.loc[result["Период 1, шт."].eq(0), "Изменение, %"] = pd.NA
+    result["Изменение выручки, ₽"] = result["Выручка П2, ₽"] - result["Выручка П1, ₽"]
+    result["Изменение выручки, %"] = (
+        result["Изменение выручки, ₽"].div(result["Выручка П1, ₽"].replace(0, pd.NA)) * 100
+    )
+    result.loc[result["Выручка П1, ₽"].eq(0), "Изменение выручки, %"] = pd.NA
     result["СР/день П1"] = result["Период 1, шт."] / days_1
     result["СР/день П2"] = result["Период 2, шт."] / days_2
     result = result.sort_values(
@@ -5464,18 +5614,33 @@ def build_report_category_sku_breakdown(
     ).reset_index(drop=True)
 
     total_delta = total_2 - total_1
+    total_revenue_delta = total_revenue_2 - total_revenue_1
     total_row = {
         "SKU": "",
         "Название товара": "ВСЕГО КАТЕГОРИИ",
         "Сущность": "",
         "Период 1, шт.": total_1,
         "Период 2, шт.": total_2,
+        "Выручка П1, ₽": total_revenue_1,
+        "Выручка П2, ₽": total_revenue_2,
         "Изменение, шт.": total_delta,
         "Изменение, %": (total_delta / total_1 * 100) if total_1 else pd.NA,
+        "Изменение выручки, ₽": total_revenue_delta,
+        "Изменение выручки, %": (
+            total_revenue_delta / total_revenue_1 * 100
+        ) if total_revenue_1 else pd.NA,
         "СР/день П1": total_1 / days_1,
         "СР/день П2": total_2 / days_2,
     }
-    return pd.concat([result, pd.DataFrame([total_row])], ignore_index=True)
+    ordered_columns = [
+        "SKU", "Название товара", "Сущность",
+        "Период 1, шт.", "Период 2, шт.",
+        "Выручка П1, ₽", "Выручка П2, ₽",
+        "Изменение, шт.", "Изменение, %",
+        "Изменение выручки, ₽", "Изменение выручки, %",
+        "СР/день П1", "СР/день П2",
+    ]
+    return pd.concat([result, pd.DataFrame([total_row])], ignore_index=True)[ordered_columns]
 
 
 def build_report_tables(
@@ -5488,7 +5653,7 @@ def build_report_tables(
     days_1 = max(len(period_1_dates), 1)
     days_2 = max(len(period_2_dates), 1)
 
-    def comparison(group_columns: list[str]) -> pd.DataFrame:
+    def comparison(group_columns: list[str], include_revenue: bool = False) -> pd.DataFrame:
         left = _report_group_period_values(frame_1, group_columns, "Период 1, шт.")
         right = _report_group_period_values(frame_2, group_columns, "Период 2, шт.")
         result = left.merge(right, on=group_columns, how="outer").fillna({"Период 1, шт.": 0.0, "Период 2, шт.": 0.0})
@@ -5499,9 +5664,33 @@ def build_report_tables(
         result["СР/день П1"] = result["Период 1, шт."] / days_1
         result["СР/день П2"] = result["Период 2, шт."] / days_2
         result["Изменение СР/день"] = result["СР/день П2"] - result["СР/день П1"]
+
+        if include_revenue:
+            def revenue_period(frame: pd.DataFrame, value_name: str) -> pd.DataFrame:
+                if frame.empty:
+                    return pd.DataFrame(columns=group_columns + [value_name])
+                work = frame.copy()
+                if "revenue" not in work.columns:
+                    work["revenue"] = 0.0
+                work["revenue"] = pd.to_numeric(work["revenue"], errors="coerce").fillna(0.0)
+                return (
+                    work.groupby(group_columns, dropna=False, as_index=False)
+                    .agg(**{value_name: ("revenue", "sum")})
+                )
+
+            revenue_left = revenue_period(frame_1, "Выручка П1, ₽")
+            revenue_right = revenue_period(frame_2, "Выручка П2, ₽")
+            result = result.merge(revenue_left, on=group_columns, how="left")
+            result = result.merge(revenue_right, on=group_columns, how="left")
+            result[["Выручка П1, ₽", "Выручка П2, ₽"]] = result[["Выручка П1, ₽", "Выручка П2, ₽"]].fillna(0.0)
+            result["Изменение выручки, ₽"] = result["Выручка П2, ₽"] - result["Выручка П1, ₽"]
+            result["Изменение выручки, %"] = (
+                result["Изменение выручки, ₽"].div(result["Выручка П1, ₽"].replace(0, pd.NA)) * 100
+            )
+            result.loc[result["Выручка П1, ₽"].eq(0), "Изменение выручки, %"] = pd.NA
         return result
 
-    category_summary = comparison(["category"]).rename(columns={"category": "Категория"})
+    category_summary = comparison(["category"], include_revenue=True).rename(columns={"category": "Категория"})
     category_entity = comparison(["category", "entity"]).rename(columns={"category": "Категория", "entity": "Сущность"})
     by_point = comparison(["category", "entity", "point"]).rename(
         columns={"category": "Категория", "entity": "Сущность", "point": "Точка"}
@@ -5611,6 +5800,10 @@ def _append_report_total_row(frame: pd.DataFrame, label_column: str = "Кате�
                 p1 = pd.to_numeric(result.get("Период 1, шт."), errors="coerce").sum()
                 p2 = pd.to_numeric(result.get("Период 2, шт."), errors="coerce").sum()
                 total_row[column] = ((p2 - p1) / p1 * 100) if p1 else pd.NA
+            elif column == "Изменение выручки, %":
+                revenue_1 = pd.to_numeric(result.get("Выручка П1, ₽"), errors="coerce").sum()
+                revenue_2 = pd.to_numeric(result.get("Выручка П2, ₽"), errors="coerce").sum()
+                total_row[column] = ((revenue_2 - revenue_1) / revenue_1 * 100) if revenue_1 else pd.NA
             elif column == "СР/день П1" or column == "СР/день П2" or column == "Изменение СР/день":
                 total_row[column] = pd.NA
             else:
@@ -5859,14 +6052,16 @@ def build_period_comparison_html(
 
 # Основной фирменный заголовок выводится вместе с внешним меню ниже.
 
-if not ENTITY_FILE.exists():
-    st.error(f"Не найден справочник: {ENTITY_FILE.name}")
-    st.stop()
-
 try:
-    entities = load_entities(str(ENTITY_FILE), ENTITY_FILE.stat().st_mtime)
+    (
+        entities,
+        entity_reference_source,
+        entity_reference_checked_at,
+        entity_reference_warning,
+        entity_reference_signature,
+    ) = get_current_entity_reference()
 except Exception as error:
-    st.error(f"Ошибка справочника сущностей: {error}")
+    st.error(f"Не удалось загрузить SKU/категории/сущности из матрицы 2.3: {error}")
     st.stop()
 
 today = date.today()
@@ -5876,8 +6071,11 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.11.5 · REPORT CATEGORY SKU DRILLDOWN")
+    st.caption("Аналитика спроса · версия 75.11.8 · MATRIX ENTITY SOURCE")
     st.caption("Автозагрузка данных · SEPARATE-MENU")
+    st.caption(f"SKU / категории / сущности · {entity_reference_source}")
+    if entity_reference_warning and not entity_reference_source.startswith("Apps Script"):
+        st.caption(f"Автоисточник временно недоступен: {entity_reference_warning}")
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
         pg_host = st.text_input(
             "Сервер",
@@ -5952,6 +6150,7 @@ auto_signature = (
     pg_user.strip(),
     password_signature,
     refresh_bucket,
+    entity_reference_signature[:16],
 )
 
 analysis_needs_refresh = (
@@ -6663,7 +6862,7 @@ if tab_report.open:
             st.caption(
                 f"Период 1: {report_period_1[0]:%d.%m.%Y}–{report_period_1[1]:%d.%m.%Y} · "
                 f"Период 2: {report_period_2[0]:%d.%m.%Y}–{report_period_2[1]:%d.%m.%Y}. "
-                "По каждой категории показаны продажи в штуках, количественная разница и изменение в процентах."
+                "По каждой категории показаны продажи в штуках и выручка в рублях за оба периода, а также их изменение."
             )
             category_compare_table = report_tables["category_summary"].copy()
             if not category_compare_table.empty:
@@ -6671,25 +6870,42 @@ if tab_report.open:
                     columns={
                         "Изменение, шт.": "Разница, шт.",
                         "Изменение, %": "Разница, %",
+                        "Изменение выручки, ₽": "Разница выручки, ₽",
+                        "Изменение выручки, %": "Разница выручки, %",
                     }
                 )
                 category_total_p1 = float(pd.to_numeric(category_compare_table["Период 1, шт."], errors="coerce").fillna(0).sum())
                 category_total_p2 = float(pd.to_numeric(category_compare_table["Период 2, шт."], errors="coerce").fillna(0).sum())
                 category_total_delta = category_total_p2 - category_total_p1
                 category_total_pct = (category_total_delta / category_total_p1 * 100) if category_total_p1 else None
+                category_revenue_p1 = float(pd.to_numeric(category_compare_table.get("Выручка П1, ₽", 0.0), errors="coerce").fillna(0).sum())
+                category_revenue_p2 = float(pd.to_numeric(category_compare_table.get("Выручка П2, ₽", 0.0), errors="coerce").fillna(0).sum())
+                category_revenue_delta = category_revenue_p2 - category_revenue_p1
+                category_revenue_pct = (
+                    category_revenue_delta / category_revenue_p1 * 100
+                    if category_revenue_p1 else None
+                )
                 total_row = {column: None for column in category_compare_table.columns}
                 total_row["Категория"] = "ВСЕГО"
                 total_row["Период 1, шт."] = category_total_p1
                 total_row["Период 2, шт."] = category_total_p2
+                total_row["Выручка П1, ₽"] = category_revenue_p1
+                total_row["Выручка П2, ₽"] = category_revenue_p2
                 total_row["Разница, шт."] = category_total_delta
                 total_row["Разница, %"] = category_total_pct
+                total_row["Разница выручки, ₽"] = category_revenue_delta
+                total_row["Разница выручки, %"] = category_revenue_pct
                 category_compare_table = pd.concat(
                     [category_compare_table, pd.DataFrame([total_row])],
                     ignore_index=True,
                 )
                 visible_category_columns = [
                     column for column in [
-                        "Категория", "Период 1, шт.", "Период 2, шт.", "Разница, шт.", "Разница, %"
+                        "Категория",
+                        "Период 1, шт.", "Период 2, шт.",
+                        "Выручка П1, ₽", "Выручка П2, ₽",
+                        "Разница, шт.", "Разница, %",
+                        "Разница выручки, ₽", "Разница выручки, %",
                     ] if column in category_compare_table.columns
                 ]
                 category_compare_table = category_compare_table[visible_category_columns]
@@ -6712,8 +6928,18 @@ if tab_report.open:
                     column_config={
                         "Период 1, шт.": st.column_config.NumberColumn(label=category_period_1_label, format="%.0f"),
                         "Период 2, шт.": st.column_config.NumberColumn(label=category_period_2_label, format="%.0f"),
+                        "Выручка П1, ₽": st.column_config.NumberColumn(
+                            label=f"Выручка П1 · {report_period_1[0]:%d.%m.%Y}–{report_period_1[1]:%d.%m.%Y}, ₽",
+                            format="%.2f",
+                        ),
+                        "Выручка П2, ₽": st.column_config.NumberColumn(
+                            label=f"Выручка П2 · {report_period_2[0]:%d.%m.%Y}–{report_period_2[1]:%d.%m.%Y}, ₽",
+                            format="%.2f",
+                        ),
                         "Разница, шт.": st.column_config.NumberColumn(format="%+.0f"),
                         "Разница, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                        "Разница выручки, ₽": st.column_config.NumberColumn(format="%+.2f"),
+                        "Разница выручки, %": st.column_config.NumberColumn(format="%+.1f%%"),
                     },
                     on_select="rerun",
                     selection_mode="single-row",
@@ -6752,11 +6978,21 @@ if tab_report.open:
                                         category_sku_breakdown.iloc[-1]["Период 2, шт."], errors="coerce"
                                     ) or 0.0
                                 )
+                                sku_revenue_total_1 = float(
+                                    pd.to_numeric(
+                                        category_sku_breakdown.iloc[-1]["Выручка П1, ₽"], errors="coerce"
+                                    ) or 0.0
+                                )
+                                sku_revenue_total_2 = float(
+                                    pd.to_numeric(
+                                        category_sku_breakdown.iloc[-1]["Выручка П2, ₽"], errors="coerce"
+                                    ) or 0.0
+                                )
                                 st.caption(
                                     f"SKU с продажами: {sku_count} · "
-                                    f"сумма П1: {sku_total_1:,.0f} шт. · "
-                                    f"сумма П2: {sku_total_2:,.0f} шт. ".replace(",", " ")
-                                    + "Строка «ВСЕГО КАТЕГОРИИ» должна совпадать с выбранной категорией выше."
+                                    f"П1: {sku_total_1:,.0f} шт. / {sku_revenue_total_1:,.0f} ₽ · "
+                                    f"П2: {sku_total_2:,.0f} шт. / {sku_revenue_total_2:,.0f} ₽. ".replace(",", " ")
+                                    + "Строка «ВСЕГО КАТЕГОРИИ» должна совпадать с выбранной категорией выше и по штукам, и по выручке."
                                 )
                                 category_sku_display = category_sku_breakdown.rename(
                                     columns={
@@ -6776,8 +7012,18 @@ if tab_report.open:
                                         "Сумма продаж SKU П2, шт.": st.column_config.NumberColumn(
                                             label=f"Сумма продаж SKU · {category_period_2_label}", format="%.0f"
                                         ),
+                                        "Выручка П1, ₽": st.column_config.NumberColumn(
+                                            label=f"Выручка SKU П1 · {report_period_1[0]:%d.%m.%Y}–{report_period_1[1]:%d.%m.%Y}, ₽",
+                                            format="%.2f",
+                                        ),
+                                        "Выручка П2, ₽": st.column_config.NumberColumn(
+                                            label=f"Выручка SKU П2 · {report_period_2[0]:%d.%m.%Y}–{report_period_2[1]:%d.%m.%Y}, ₽",
+                                            format="%.2f",
+                                        ),
                                         "Изменение, шт.": st.column_config.NumberColumn(format="%+.0f"),
                                         "Изменение, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                                        "Изменение выручки, ₽": st.column_config.NumberColumn(format="%+.2f"),
+                                        "Изменение выручки, %": st.column_config.NumberColumn(format="%+.1f%%"),
                                         "СР/день П1": st.column_config.NumberColumn(format="%.2f"),
                                         "СР/день П2": st.column_config.NumberColumn(format="%.2f"),
                                     },
