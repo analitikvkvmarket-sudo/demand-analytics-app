@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.15-FRESHNESS-POINT-MENU-DAILY"
+BUILD_ID = "75.11.16-CATEGORY-SKU-ACTIVE-DAY-AVG"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -10501,9 +10501,13 @@ if tab_category_analysis.open:
 
                         # Среднее за выбранный период показываем отдельным узким блоком
                         # справа от последней календарной даты — визуально отдельно от дат.
-                        # Нулевые дни уже присутствуют в calendar_heat, поэтому корректно
-                        # участвуют в среднем по каждой точке.
-                        calendar_average = calendar_heat.mean(axis=1).fillna(0.0)
+                        # Бизнес-логика: СР = всё проданное количество / число ФАКТИЧЕСКИХ
+                        # дней продаж SKU. Календарные дни с нулём в знаменатель не входят.
+                        calendar_sales_sum = calendar_heat.fillna(0.0).sum(axis=1)
+                        calendar_active_sale_days = calendar_heat.fillna(0.0).gt(0).sum(axis=1)
+                        calendar_average = calendar_sales_sum.div(
+                            calendar_active_sale_days.where(calendar_active_sale_days > 0)
+                        ).fillna(0.0)
                         calendar_dates = list(calendar_heat.columns)
                         calendar_x_values = [
                             calendar_date.strftime("%Y-%m-%d") for calendar_date in calendar_dates
@@ -10577,7 +10581,7 @@ if tab_category_analysis.open:
                                 text=average_text.to_numpy().reshape(-1, 1),
                                 texttemplate="%{text}",
                                 hovertemplate=(
-                                    "%{y}<br>Среднее за выбранный период: %{z:.1f} шт."
+                                    "%{y}<br>СР за фактический день продаж: %{z:.2f} шт."
                                     "<extra></extra>"
                                 ),
                                 colorscale=[
@@ -10634,8 +10638,9 @@ if tab_category_analysis.open:
                         st.caption(
                             "Зелёный — SKU продавался, число внутри — продано за день. "
                             "Серый — в эту дату продаж SKU не было. Справа от последней даты "
-                            "отдельным блоком показано «СР за период» по каждой точке. В среднее "
-                            "входят все календарные дни выбранного периода, включая нулевые."
+                            "отдельным блоком показано «СР за период» по каждой точке. Расчёт: "
+                            "всё проданное количество SKU / количество фактических дней продаж; "
+                            "дни с нулевыми продажами в знаменатель не входят."
                         )
 
 
