@@ -29,7 +29,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.12-REPORT-CATEGORY-POINT-MATRIX"
+BUILD_ID = "75.11.13-CATEGORY-SKU-CALENDAR-AVG"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -6219,7 +6219,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.11.12 · REPORT CATEGORY POINT MATRIX")
+    st.caption("Аналитика спроса · версия 75.11.13 · CATEGORY SKU CALENDAR AVG")
     st.caption("Автозагрузка данных · SEPARATE-MENU")
     st.caption(f"SKU / категории / сущности · {entity_reference_source}")
     if entity_reference_warning and not entity_reference_source.startswith("Apps Script"):
@@ -10307,27 +10307,52 @@ if tab_category_analysis.open:
                             values="Продано, шт.",
                             aggfunc="sum",
                         ).sort_index(axis=1)
-                        calendar_text = calendar_heat.apply(
-                            lambda column: column.map(
-                                lambda value: "" if pd.isna(value) else str(int(round(value)))
-                            )
-                        )
+
+                        # После последнего календарного дня показываем среднее за выбранный
+                        # период для каждой строки/точки. Нулевые дни уже присутствуют в
+                        # calendar_heat, поэтому они корректно входят в среднее.
+                        calendar_average = calendar_heat.mean(axis=1).fillna(0.0)
+                        calendar_heat_chart = calendar_heat.copy()
+                        average_column_label = "СР за период"
+                        calendar_heat_chart[average_column_label] = calendar_average
+
+                        calendar_text = calendar_heat_chart.copy().astype(object)
+                        for column_name in calendar_heat_chart.columns:
+                            if column_name == average_column_label:
+                                calendar_text[column_name] = calendar_heat_chart[column_name].map(
+                                    lambda value: "" if pd.isna(value) else f"{float(value):.1f}"
+                                )
+                            else:
+                                calendar_text[column_name] = calendar_heat_chart[column_name].map(
+                                    lambda value: "" if pd.isna(value) else str(int(round(value)))
+                                )
+
                         calendar_heat_max = max(float(calendar_heat.stack().max()), 1.0)
                         calendar_dates = list(calendar_heat.columns)
-                        calendar_tick_values = pd.to_datetime(calendar_dates)
+                        calendar_x_values = [
+                            calendar_date.strftime("%Y-%m-%d") for calendar_date in calendar_dates
+                        ] + [average_column_label]
                         calendar_tick_labels = [
                             f"{calendar_date:%d.%m}<br>{weekday_names[calendar_date.weekday()]}"
                             for calendar_date in calendar_dates
+                        ] + ["СР<br>за период"]
+                        calendar_hover_labels = [
+                            f"Дата: {calendar_date:%d.%m.%Y}" for calendar_date in calendar_dates
+                        ] + ["Среднее за выбранный период"]
+                        calendar_customdata = [
+                            calendar_hover_labels for _ in range(len(calendar_heat_chart.index))
                         ]
+
                         sku_calendar_chart = go.Figure(
                             data=go.Heatmap(
-                                z=calendar_heat.to_numpy(),
-                                x=pd.to_datetime(calendar_heat.columns),
-                                y=calendar_heat.index.tolist(),
+                                z=calendar_heat_chart.to_numpy(),
+                                x=calendar_x_values,
+                                y=calendar_heat_chart.index.tolist(),
                                 text=calendar_text.to_numpy(),
+                                customdata=calendar_customdata,
                                 texttemplate="%{text}",
                                 hovertemplate=(
-                                    "%{y}<br>Дата: %{x|%d.%m.%Y}<br>Продано: %{z:.0f} шт."
+                                    "%{y}<br>%{customdata}<br>Значение: %{z:.1f} шт."
                                     "<extra></extra>"
                                 ),
                                 colorscale=[
@@ -10349,18 +10374,19 @@ if tab_category_analysis.open:
                             yaxis_title="Период · точка",
                             xaxis=dict(
                                 tickmode="array",
-                                tickvals=calendar_tick_values,
+                                tickvals=calendar_x_values,
                                 ticktext=calendar_tick_labels,
                                 tickangle=-45,
                             ),
-                            height=max(330, 100 + 55 * len(calendar_heat)),
+                            height=max(330, 100 + 55 * len(calendar_heat_chart)),
                             margin=dict(l=20, r=20, t=60, b=40),
                         )
                         st.plotly_chart(sku_calendar_chart, use_container_width=True)
                         st.caption(
                             "Зелёный — SKU продавался, число внутри — продано за день. "
-                            "Серый — в эту дату продаж SKU не было. Показаны только даты "
-                            "выбранного периода."
+                            "Серый — в эту дату продаж SKU не было. Последний столбец «СР за период» "
+                            "показывает среднее количество продаж по каждой точке за все календарные "
+                            "дни выбранного периода, включая дни с нулевыми продажами."
                         )
 
 
