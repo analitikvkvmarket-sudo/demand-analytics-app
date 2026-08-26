@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.17-WRITEOFF-CATEGORY-SKU-POINT-DRILLDOWN"
+BUILD_ID = "75.11.18-WRITEOFF-POINTS-SEPARATE-ROWS"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -3163,6 +3163,101 @@ def build_sales_time_period(
         ["Дата отгрузки", "Категория", "Сущность", "Название товара"]
     )
 
+
+
+
+def _freshness_point_source_is_separate(
+    source: pd.DataFrame,
+    context: dict[str, object] | None,
+) -> bool:
+    """Проверяет, что детализация списаний действительно содержит отдельные строки Т1–Т29."""
+    if source is None or source.empty or "Точка" not in source.columns:
+        return False
+    point_values = source["Точка"].dropna().astype(str).str.strip()
+    if point_values.empty:
+        return False
+    # Склеенная строка вида "Т1, Т2, Т3" — это агрегат, а не разрез по точкам.
+    if point_values.str.contains(",", regex=False).any():
+        return False
+    expected_points = set()
+    if isinstance(context, dict):
+        expected_points = {
+            str(point).strip() for point in (context.get("points") or []) if str(point).strip()
+        }
+    if expected_points and not set(point_values.unique()).issubset(expected_points):
+        return False
+    return True
+
+
+def rebuild_freshness_writeoff_source_by_point(
+    context: dict[str, object] | None,
+    entities: pd.DataFrame,
+) -> tuple[pd.DataFrame, str]:
+    """Автоматически восстанавливает несуммированную детализацию списаний по каждой точке."""
+    if not isinstance(context, dict):
+        return pd.DataFrame(), "нет сохранённого периода окна свежести"
+    shipment_start = context.get("start")
+    shipment_end = context.get("end")
+    selected_points = [str(point).strip() for point in (context.get("points") or []) if str(point).strip()]
+    if not isinstance(shipment_start, date) or not isinstance(shipment_end, date) or not selected_points:
+        return pd.DataFrame(), "неполный контекст периода или точек"
+
+    try:
+        matrix_bytes, matrix_source, _, matrix_error = get_current_combo_matrix_snapshot()
+        if not matrix_bytes:
+            return pd.DataFrame(), matrix_error or "матрица недоступна"
+        plans = parse_freshness_plan(matrix_bytes)
+        if plans.empty:
+            return pd.DataFrame(), "в матрице не найдены планы 1–4 недель"
+
+        current_mapping = st.session_state.get("point_mapping", {})
+        point_to_shop = {
+            str(label): int(shop_number)
+            for shop_number, label in current_mapping.items()
+            if str(label).startswith("Т") and str(label) != "Т11"
+        }
+        valid_points = [point for point in selected_points if point in point_to_shop]
+        if not valid_points:
+            return pd.DataFrame(), "для выбранных точек не найдено сопоставление с магазинами PostgreSQL"
+
+        point_numbers = [int(point[1:]) for point in valid_points]
+        shop_numbers = tuple(point_to_shop[point] for point in valid_points)
+        history_start = shipment_start - timedelta(days=8)
+        history_end = shipment_end + timedelta(days=8)
+        sales_history = load_forecast_history(history_start, history_end, shop_numbers)
+
+        point_results: list[pd.DataFrame] = []
+        for point_label, point_number, shop_number in zip(valid_points, point_numbers, shop_numbers):
+            point_plan_rows = plans[
+                (plans["point_number"] == point_number)
+                & plans["plan_date"].between(
+                    shipment_start - timedelta(days=7), shipment_end, inclusive="both"
+                )
+            ].copy()
+            point_sales_history = (
+                sales_history[
+                    pd.to_numeric(sales_history.get("shop_number"), errors="coerce") == shop_number
+                ].copy()
+                if not sales_history.empty
+                else pd.DataFrame()
+            )
+            point_result = build_sales_time_period(
+                point_plan_rows,
+                point_sales_history,
+                entities,
+                shipment_start,
+                shipment_end,
+            )
+            if not point_result.empty:
+                point_result.insert(0, "Точка", point_label)
+                point_results.append(point_result)
+
+        rebuilt = pd.concat(point_results, ignore_index=True) if point_results else pd.DataFrame()
+        if rebuilt.empty:
+            return pd.DataFrame(), f"для периода нет построчной детализации; источник матрицы: {matrix_source}"
+        return rebuilt, ""
+    except Exception as error:
+        return pd.DataFrame(), str(error)
 
 
 FRESHNESS_POINT_DAY_COLUMNS = [f"День {day_number}" for day_number in range(1, 8)]
@@ -10652,6 +10747,7 @@ if tab_sales_time.open:
         )
         st.session_state["freshness_category_source_v62"] = pd.DataFrame()
         st.session_state["freshness_category_source_by_point_v63"] = pd.DataFrame()
+        st.session_state["freshness_category_source_by_point_v64"] = pd.DataFrame()
         st.session_state["freshness_category_context_v62"] = None
         st.subheader("Окно свежести партии SKU")
         st.caption(
@@ -11352,6 +11448,7 @@ if tab_sales_time.open:
                 # Для вкладки «Списания» сохраняем также несуммированную детализацию по каждой точке.
                 # Это позволяет раскрыть категорию до SKU, а SKU — до конкретных Т1–Т29.
                 st.session_state["freshness_category_source_by_point_v63"] = sales_time_menu_by_point.copy()
+                st.session_state["freshness_category_source_by_point_v64"] = sales_time_menu_by_point.copy()
                 st.session_state["freshness_category_source_v62"] = sales_time_menu.copy()
                 st.session_state["freshness_category_context_v62"] = {
                     "start": shipment_start,
@@ -12157,8 +12254,12 @@ if tab_category_writeoffs.open:
             "freshness_category_source_v62", pd.DataFrame()
         )
         category_writeoff_source_by_point = st.session_state.get(
-            "freshness_category_source_by_point_v63", pd.DataFrame()
+            "freshness_category_source_by_point_v64", pd.DataFrame()
         )
+        if category_writeoff_source_by_point.empty:
+            category_writeoff_source_by_point = st.session_state.get(
+                "freshness_category_source_by_point_v63", pd.DataFrame()
+            )
         category_writeoff_context = st.session_state.get("freshness_category_context_v62")
         if category_writeoff_source.empty:
             st.info(
@@ -12173,11 +12274,25 @@ if tab_category_writeoffs.open:
                     f"{', '.join(category_writeoff_context['points'])}."
                 )
 
-            # В старой сессии отдельной детализации по точкам может ещё не быть.
-            # Для одной точки агрегированный источник эквивалентен; для нескольких точек
-            # пользователь получит полноценный разрез после повторного расчёта «Окна свежести».
-            if category_writeoff_source_by_point.empty:
-                category_writeoff_source_by_point = category_writeoff_source.copy()
+            # Не используем агрегированную строку "Т1, Т2, ..." как разрез по точкам.
+            # Если после обновления приложения в сессии остался только старый агрегат,
+            # автоматически пересчитываем несуммированную детализацию из матрицы и PostgreSQL.
+            point_source_ready = _freshness_point_source_is_separate(
+                category_writeoff_source_by_point, category_writeoff_context
+            )
+            point_source_rebuild_error = ""
+            if not point_source_ready:
+                rebuilt_point_source, point_source_rebuild_error = (
+                    rebuild_freshness_writeoff_source_by_point(
+                        category_writeoff_context, entities
+                    )
+                )
+                if not rebuilt_point_source.empty:
+                    category_writeoff_source_by_point = rebuilt_point_source
+                    st.session_state["freshness_category_source_by_point_v64"] = (
+                        rebuilt_point_source.copy()
+                    )
+                    point_source_ready = True
 
             writeoff_category_options = sorted(
                 category_writeoff_source["Категория"].dropna().astype(str).unique().tolist()
@@ -12234,8 +12349,13 @@ if tab_category_writeoffs.open:
 
                 # Суммарный SKU-уровень строим из исходной детализации по точкам,
                 # чтобы значения не зависели от экранного суммирования в «Окне свежести».
+                writeoff_sku_summary_source = (
+                    category_writeoff_by_point
+                    if point_source_ready and not category_writeoff_by_point.empty
+                    else category_writeoff_detail
+                )
                 writeoff_sku_summary_all = (
-                    category_writeoff_by_point.groupby(
+                    writeoff_sku_summary_source.groupby(
                         ["Категория", "SKU", "Название товара"], as_index=False, dropna=False
                     )
                     .agg(
@@ -12382,10 +12502,14 @@ if tab_category_writeoffs.open:
                                     selected_category_sku.iloc[selected_sku_index]["Название товара"]
                                 )
 
-                                sku_point_detail = category_writeoff_by_point[
-                                    category_writeoff_by_point["Категория"].astype(str).eq(selected_writeoff_category)
-                                    & category_writeoff_by_point["SKU"].astype(str).eq(selected_writeoff_sku)
-                                ].copy()
+                                sku_point_detail = (
+                                    category_writeoff_by_point[
+                                        category_writeoff_by_point["Категория"].astype(str).eq(selected_writeoff_category)
+                                        & category_writeoff_by_point["SKU"].astype(str).eq(selected_writeoff_sku)
+                                    ].copy()
+                                    if point_source_ready and not category_writeoff_by_point.empty
+                                    else pd.DataFrame()
+                                )
                                 if not sku_point_detail.empty:
                                     point_group_columns = ["Точка"]
                                     sku_point_summary = (
@@ -12432,11 +12556,23 @@ if tab_category_writeoffs.open:
                                         },
                                     )
                                 else:
-                                    st.info("Для выбранного SKU нет детализации по точкам.")
+                                    if point_source_rebuild_error:
+                                        st.warning(
+                                            "Не удалось автоматически восстановить разрез по отдельным точкам: "
+                                            f"{point_source_rebuild_error}. Откройте «Окно свежести» и повторно "
+                                            "выберите период/точки — после расчёта здесь появятся отдельные строки Т1–Т29."
+                                        )
+                                    else:
+                                        st.info("Для выбранного SKU нет детализации по отдельным точкам.")
 
                 # Полная выгрузка сохраняет иерархию: категории -> SKU со списанием -> точки.
+                writeoff_point_export_source = (
+                    category_writeoff_by_point
+                    if point_source_ready and not category_writeoff_by_point.empty
+                    else pd.DataFrame()
+                )
                 writeoff_point_export = (
-                    category_writeoff_by_point.groupby(
+                    writeoff_point_export_source.groupby(
                         ["Категория", "SKU", "Название товара", "Точка"],
                         as_index=False,
                         dropna=False,
