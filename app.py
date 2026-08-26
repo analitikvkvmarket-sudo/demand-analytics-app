@@ -29,7 +29,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.5-REPORT-CATEGORY-SKU-DRILLDOWN"
+BUILD_ID = "75.11.6-REPORT-SKU-SALES-SUMS"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -5455,8 +5455,6 @@ def build_report_category_sku_breakdown(
         result["Изменение, шт."].div(result["Период 1, шт."].replace(0, pd.NA)) * 100
     )
     result.loc[result["Период 1, шт."].eq(0), "Изменение, %"] = pd.NA
-    result["Доля категории П1, %"] = (result["Период 1, шт."] / total_1 * 100) if total_1 else 0.0
-    result["Доля категории П2, %"] = (result["Период 2, шт."] / total_2 * 100) if total_2 else 0.0
     result["СР/день П1"] = result["Период 1, шт."] / days_1
     result["СР/день П2"] = result["Период 2, шт."] / days_2
     result = result.sort_values(
@@ -5474,8 +5472,6 @@ def build_report_category_sku_breakdown(
         "Период 2, шт.": total_2,
         "Изменение, шт.": total_delta,
         "Изменение, %": (total_delta / total_1 * 100) if total_1 else pd.NA,
-        "Доля категории П1, %": 100.0 if total_1 else 0.0,
-        "Доля категории П2, %": 100.0 if total_2 else 0.0,
         "СР/день П1": total_1 / days_1,
         "СР/день П2": total_2 / days_2,
     }
@@ -6762,22 +6758,26 @@ if tab_report.open:
                                     f"сумма П2: {sku_total_2:,.0f} шт. ".replace(",", " ")
                                     + "Строка «ВСЕГО КАТЕГОРИИ» должна совпадать с выбранной категорией выше."
                                 )
+                                category_sku_display = category_sku_breakdown.rename(
+                                    columns={
+                                        "Период 1, шт.": "Сумма продаж SKU П1, шт.",
+                                        "Период 2, шт.": "Сумма продаж SKU П2, шт.",
+                                    }
+                                )
                                 st.dataframe(
-                                    category_sku_breakdown,
+                                    category_sku_display,
                                     use_container_width=True,
                                     hide_index=True,
-                                    height=min(720, 38 * len(category_sku_breakdown) + 80),
+                                    height=min(720, 38 * len(category_sku_display) + 80),
                                     column_config={
-                                        "Период 1, шт.": st.column_config.NumberColumn(
-                                            label=category_period_1_label, format="%.0f"
+                                        "Сумма продаж SKU П1, шт.": st.column_config.NumberColumn(
+                                            label=f"Сумма продаж SKU · {category_period_1_label}", format="%.0f"
                                         ),
-                                        "Период 2, шт.": st.column_config.NumberColumn(
-                                            label=category_period_2_label, format="%.0f"
+                                        "Сумма продаж SKU П2, шт.": st.column_config.NumberColumn(
+                                            label=f"Сумма продаж SKU · {category_period_2_label}", format="%.0f"
                                         ),
                                         "Изменение, шт.": st.column_config.NumberColumn(format="%+.0f"),
                                         "Изменение, %": st.column_config.NumberColumn(format="%+.1f%%"),
-                                        "Доля категории П1, %": st.column_config.NumberColumn(format="%.1f%%"),
-                                        "Доля категории П2, %": st.column_config.NumberColumn(format="%.1f%%"),
                                         "СР/день П1": st.column_config.NumberColumn(format="%.2f"),
                                         "СР/день П2": st.column_config.NumberColumn(format="%.2f"),
                                     },
