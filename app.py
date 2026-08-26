@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.24-SYSTEM-MENU-ARCHIVE"
+BUILD_ID = "75.11.25-SYSTEM-MENU-ARCHIVE-HISTORICAL-IMPORT"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -138,7 +138,7 @@ def _read_runtime_secret(name: str, default: str = "") -> str:
 
 MENU_ARCHIVE_APPS_SCRIPT_URL = _read_runtime_secret(
     "MENU_ARCHIVE_APPS_SCRIPT_URL",
-    "https://script.google.com/macros/s/AKfycbzZgzZoalMe64P96i5NhQ3aLuT3r_rgJrStxLgT3JP8At2qnYMX1cPBvvSWu-FsueWr/exec",
+    "https://script.google.com/macros/s/AKfycbxFFSAo2Psisj1cR0WLQu8HeI-8iFjSxAx-xTKxi_s35euGNP6ZIcUxqMyBBgkr5Xe8/exec",
 )
 # Ключ намеренно НЕ зашит в исходник. На Streamlit Cloud задайте
 # MENU_ARCHIVE_APPS_SCRIPT_KEY в Secrets.
@@ -468,6 +468,342 @@ def _fetch_system_menu_archive_day(
     except Exception as error:
         return "", pd.DataFrame(), str(error)
 
+
+def _historical_menu_date_iso(value: object) -> str:
+    """Normalize an uploaded historical-menu date to YYYY-MM-DD."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    if isinstance(value, pd.Timestamp):
+        return value.date().isoformat()
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+
+    value_text = str(value).strip()
+    if not value_text:
+        return ""
+
+    match = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s.*)?$", value_text)
+    if match:
+        try:
+            return date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
+        except ValueError:
+            return ""
+
+    match = re.match(r"^(\d{1,2})[./-](\d{1,2})[./-](\d{4})(?:\s.*)?$", value_text)
+    if match:
+        try:
+            return date(int(match.group(3)), int(match.group(2)), int(match.group(1))).isoformat()
+        except ValueError:
+            return ""
+    return ""
+
+
+def _historical_menu_weekday_short(menu_date_iso: str) -> str:
+    try:
+        parsed = datetime.strptime(str(menu_date_iso or ""), "%Y-%m-%d").date()
+    except ValueError:
+        return ""
+    return ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"][parsed.weekday()]
+
+
+def _historical_menu_text(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except Exception:
+        pass
+    return str(value).strip()
+
+
+def _historical_menu_sku(value: object) -> str:
+    value_text = _historical_menu_text(value)
+    if not value_text:
+        return ""
+    try:
+        number = float(value_text.replace("\u00a0", "").replace(" ", "").replace(",", "."))
+        if math.isfinite(number) and number.is_integer():
+            return str(int(number))
+    except (TypeError, ValueError):
+        pass
+    return value_text
+
+
+def _historical_menu_number(value: object) -> float | int | None:
+    value_text = _historical_menu_text(value)
+    if value_text == "":
+        return None
+    try:
+        number = float(value_text.replace("\u00a0", "").replace(" ", "").replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _normalize_historical_menu_header(value: object) -> str:
+    return (
+        _historical_menu_text(value)
+        .upper()
+        .replace("T", "Т")
+        .replace("F", "Ф")
+        .replace("Ё", "Е")
+        .replace(" ", "")
+    )
+
+
+def _parse_historical_menu_workbook(
+    file_bytes: bytes,
+    source_name: str = "историческое меню.xlsx",
+) -> tuple[pd.DataFrame, str]:
+    """Parse matrix-style archive files and keep plan columns Т1–Т29 only."""
+    output_columns = [
+        "Лист",
+        "Дата меню",
+        "День недели",
+        "SKU",
+        "Цена",
+        "Категория",
+        "Название блюда",
+        "Точка",
+        "План",
+    ]
+    empty = pd.DataFrame(columns=output_columns)
+    if not file_bytes or file_bytes[:2] != b"PK":
+        return empty, "файл не похож на XLSX"
+
+    try:
+        sheet_frames = pd.read_excel(
+            io.BytesIO(file_bytes),
+            sheet_name=None,
+            header=None,
+            dtype=object,
+        )
+    except Exception as error:
+        return empty, f"не удалось прочитать Excel: {error}"
+
+    records: list[dict[str, object]] = []
+    for sheet_name, raw_frame in sheet_frames.items():
+        if raw_frame is None or raw_frame.empty:
+            continue
+
+        mode = ""
+        menu_date_iso = ""
+        weekday = ""
+        header_map: dict[str, int] | None = None
+        point_columns: list[tuple[int, str]] = []
+
+        for _, row_series in raw_frame.iterrows():
+            row = row_series.tolist()
+            row_text = [_historical_menu_text(value) for value in row]
+            joined_lower = re.sub(
+                r"\s+",
+                " ",
+                " ".join(value for value in row_text if value),
+            ).strip().lower()
+
+            has_date_label = any(
+                re.fullmatch(r"дата\s*: ?", value, flags=re.IGNORECASE)
+                for value in row_text[:12]
+                if value
+            )
+            if not has_date_label:
+                has_date_label = any(
+                    re.fullmatch(r"дата\s*:?", value, flags=re.IGNORECASE)
+                    for value in row_text[:12]
+                    if value
+                )
+
+            if has_date_label:
+                menu_date_iso = ""
+                for value in row[:12]:
+                    parsed_date = _historical_menu_date_iso(value)
+                    if parsed_date:
+                        menu_date_iso = parsed_date
+                        break
+                weekday = _historical_menu_weekday_short(menu_date_iso)
+                header_map = None
+                point_columns = []
+                if "участок комплектации" in joined_lower:
+                    mode = "skip"
+                elif "план на день кухня" in joined_lower:
+                    mode = "menu"
+                else:
+                    mode = ""
+                continue
+
+            if mode != "menu":
+                continue
+
+            lower_headers = [
+                re.sub(r"\s+", " ", value).strip().lower()
+                for value in row_text
+            ]
+            code_index = next(
+                (index for index, value in enumerate(lower_headers) if value.startswith("код")),
+                None,
+            )
+            price_index = next(
+                (index for index, value in enumerate(lower_headers) if value == "цена"),
+                None,
+            )
+            category_index = next(
+                (index for index, value in enumerate(lower_headers) if value == "категория"),
+                None,
+            )
+            name_index = next(
+                (index for index, value in enumerate(lower_headers) if value == "название блюда"),
+                None,
+            )
+
+            if all(index is not None for index in [code_index, price_index, category_index, name_index]):
+                header_map = {
+                    "sku": int(code_index),
+                    "price": int(price_index),
+                    "category": int(category_index),
+                    "name": int(name_index),
+                }
+                point_columns = []
+                for column_index, header_value in enumerate(row_text):
+                    normalized = _normalize_historical_menu_header(header_value)
+                    point_match = re.fullmatch(r"Т(\d+)", normalized)
+                    if not point_match:
+                        continue
+                    point_number = int(point_match.group(1))
+                    if 1 <= point_number <= 29:
+                        point_columns.append((column_index, f"Т{point_number}"))
+                continue
+
+            if not header_map or not point_columns or not menu_date_iso:
+                continue
+
+            sku = _historical_menu_sku(
+                row[header_map["sku"]] if header_map["sku"] < len(row) else None
+            )
+            product_name = _historical_menu_text(
+                row[header_map["name"]] if header_map["name"] < len(row) else None
+            )
+            if not sku or not product_name:
+                continue
+
+            price = _historical_menu_number(
+                row[header_map["price"]] if header_map["price"] < len(row) else None
+            )
+            category = _historical_menu_text(
+                row[header_map["category"]] if header_map["category"] < len(row) else None
+            )
+
+            for column_index, point_name in point_columns:
+                if column_index >= len(row):
+                    continue
+                plan = _historical_menu_number(row[column_index])
+                if plan is None:
+                    continue
+                records.append(
+                    {
+                        "Лист": str(sheet_name),
+                        "Дата меню": menu_date_iso,
+                        "День недели": weekday,
+                        "SKU": sku,
+                        "Цена": price,
+                        "Категория": category,
+                        "Название блюда": product_name,
+                        "Точка": point_name,
+                        "План": plan,
+                    }
+                )
+
+    if not records:
+        return empty, (
+            "в файле не найдены блоки «План на день кухня» с колонками Код/Цена/Категория/Название блюда и Т1–Т29"
+        )
+
+    frame = pd.DataFrame(records, columns=output_columns)
+    frame = frame.drop_duplicates().sort_values(
+        ["Дата меню", "Лист", "Категория", "Название блюда", "SKU", "Точка"],
+        kind="stable",
+    ).reset_index(drop=True)
+    return frame, ""
+
+
+def _import_system_menu_archive_date(
+    api_url: str,
+    api_key: str,
+    menu_date_iso: str,
+    day_frame: pd.DataFrame,
+    source_name: str,
+) -> tuple[dict[str, object], str]:
+    """Send one historical menu date to the archive POST import endpoint."""
+    if not api_url:
+        return {}, "не указан URL системного архива"
+    if not api_key:
+        return {}, "не указан MENU_ARCHIVE_APPS_SCRIPT_KEY"
+    if day_frame.empty:
+        return {}, "для выбранной даты нет строк"
+
+    records: list[dict[str, object]] = []
+    for _, row in day_frame.iterrows():
+        price_value = row.get("Цена")
+        price = None if pd.isna(price_value) else price_value
+        if isinstance(price, float) and price.is_integer():
+            price = int(price)
+        plan_value = row.get("План", 0)
+        plan = float(plan_value)
+        if plan.is_integer():
+            plan = int(plan)
+        records.append(
+            {
+                "source_sheet": str(row.get("Лист", "") or ""),
+                "menu_date": menu_date_iso,
+                "weekday": str(row.get("День недели", "") or ""),
+                "sku": str(row.get("SKU", "") or "").strip(),
+                "price": price,
+                "category": str(row.get("Категория", "") or "").strip(),
+                "product_name": str(row.get("Название блюда", "") or "").strip(),
+                "point": str(row.get("Точка", "") or "").strip(),
+                "plan": plan,
+            }
+        )
+
+    try:
+        import requests
+
+        response = requests.post(
+            api_url,
+            json={
+                "action": "import",
+                "key": api_key,
+                "menu_date": menu_date_iso,
+                "source_name": source_name,
+                "skip_existing": True,
+                "rows": records,
+            },
+            timeout=180,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except Exception as json_error:
+            sample = response.text[:300].replace("\n", " ")
+            raise RuntimeError(
+                "Apps Script не вернул JSON. Проверьте, что развернута версия с doPost/import. "
+                f"Ответ: {sample or json_error}"
+            )
+        if not payload.get("ok"):
+            raise RuntimeError(payload.get("error") or "архив вернул ошибку импорта")
+        return payload, ""
+    except Exception as error:
+        return {}, str(error)
 
 def _archive_point_sort_key(value: object) -> tuple[int, str]:
     label = str(value or "").strip().upper().replace("T", "Т")
@@ -13801,6 +14137,155 @@ if tab_menu_archive.open:
                     f"Архив подключён · сохранено дат: {len(archive_dates)} · "
                     f"{archive_dates[0]} — {archive_dates[-1]}"
                 )
+
+
+                archive_import_message = st.session_state.pop(
+                    "system_menu_archive_import_message_v751125",
+                    "",
+                )
+                if archive_import_message:
+                    st.success(archive_import_message)
+
+                with st.expander("Добавить старое меню из Excel", expanded=False):
+                    st.caption(
+                        "Загрузите старую матрицу меню. Система сама найдёт блоки «План на день кухня», "
+                        "возьмёт только Т1–Т29 и добавит только те даты, которых ещё нет в архиве. "
+                        "Ф1–Ф29 и «Участок комплектации» не импортируются."
+                    )
+                    historical_menu_file = st.file_uploader(
+                        "Старое меню (.xlsx)",
+                        type=["xlsx"],
+                        key="system_menu_archive_historical_upload_v751125",
+                    )
+
+                    if historical_menu_file is not None:
+                        historical_bytes = historical_menu_file.getvalue()
+                        historical_frame, historical_error = _parse_historical_menu_workbook(
+                            historical_bytes,
+                            historical_menu_file.name,
+                        )
+
+                        if historical_error:
+                            st.error(f"Не удалось разобрать старое меню: {historical_error}")
+                        elif historical_frame.empty:
+                            st.warning("В файле не найдено строк меню для импорта.")
+                        else:
+                            historical_dates = sorted(
+                                historical_frame["Дата меню"].dropna().astype(str).unique().tolist()
+                            )
+                            existing_archive_dates = set(archive_dates)
+                            new_historical_dates = [
+                                value for value in historical_dates if value not in existing_archive_dates
+                            ]
+                            duplicate_historical_dates = [
+                                value for value in historical_dates if value in existing_archive_dates
+                            ]
+
+                            historical_summary = (
+                                historical_frame.groupby("Дата меню", as_index=False)
+                                .agg(
+                                    SKU=("SKU", "nunique"),
+                                    Точек=("Точка", "nunique"),
+                                    Строк=("План", "size"),
+                                    **{"План, шт.": ("План", "sum")},
+                                )
+                            )
+                            historical_summary["Статус"] = historical_summary["Дата меню"].map(
+                                lambda value: (
+                                    "Уже есть — пропустить"
+                                    if value in existing_archive_dates
+                                    else "Будет добавлено"
+                                )
+                            )
+                            historical_summary["Дата меню"] = historical_summary["Дата меню"].map(
+                                lambda value: datetime.strptime(value, "%Y-%m-%d").strftime("%d.%m.%Y")
+                            )
+
+                            import_metrics = st.columns(4)
+                            import_metrics[0].metric("Дат в файле", len(historical_dates))
+                            import_metrics[1].metric("Новых дат", len(new_historical_dates))
+                            import_metrics[2].metric(
+                                "SKU",
+                                int(historical_frame["SKU"].nunique()),
+                            )
+                            import_metrics[3].metric(
+                                "Строк Т1–Т29",
+                                len(historical_frame),
+                            )
+
+                            st.dataframe(
+                                historical_summary,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                            if duplicate_historical_dates:
+                                st.caption(
+                                    "Уже существующие даты не будут перезаписаны: "
+                                    + ", ".join(
+                                        datetime.strptime(value, "%Y-%m-%d").strftime("%d.%m.%Y")
+                                        for value in duplicate_historical_dates
+                                    )
+                                )
+
+                            if not new_historical_dates:
+                                st.info("Все даты из этого файла уже есть в системном архиве.")
+                            elif st.button(
+                                f"Добавить в архив отсутствующие даты ({len(new_historical_dates)})",
+                                type="primary",
+                                use_container_width=True,
+                                key="system_menu_archive_import_button_v751125",
+                            ):
+                                import_progress = st.progress(0)
+                                import_status = st.empty()
+                                imported_dates: list[str] = []
+                                skipped_dates: list[str] = []
+                                failed_imports: list[str] = []
+
+                                for position, import_date_iso in enumerate(new_historical_dates, start=1):
+                                    import_status.info(
+                                        "Добавляю "
+                                        + datetime.strptime(import_date_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+                                        + "…"
+                                    )
+                                    day_frame = historical_frame[
+                                        historical_frame["Дата меню"] == import_date_iso
+                                    ].copy()
+                                    import_payload, import_error = _import_system_menu_archive_date(
+                                        MENU_ARCHIVE_APPS_SCRIPT_URL,
+                                        MENU_ARCHIVE_APPS_SCRIPT_KEY,
+                                        import_date_iso,
+                                        day_frame,
+                                        historical_menu_file.name,
+                                    )
+                                    if import_error:
+                                        failed_imports.append(f"{import_date_iso}: {import_error}")
+                                    else:
+                                        import_status_value = str(import_payload.get("status") or "")
+                                        if import_status_value == "skipped_existing":
+                                            skipped_dates.append(import_date_iso)
+                                        else:
+                                            imported_dates.append(import_date_iso)
+                                    import_progress.progress(position / len(new_historical_dates))
+
+                                import_status.empty()
+                                if failed_imports:
+                                    st.error(
+                                        "Не все даты удалось добавить:\n\n"
+                                        + "\n".join(f"• {value}" for value in failed_imports)
+                                    )
+                                else:
+                                    _fetch_system_menu_archive_dates.clear()
+                                    _fetch_system_menu_archive_day.clear()
+                                    message_parts = []
+                                    if imported_dates:
+                                        message_parts.append(f"добавлено дат: {len(imported_dates)}")
+                                    if skipped_dates:
+                                        message_parts.append(f"уже были в архиве: {len(skipped_dates)}")
+                                    st.session_state[
+                                        "system_menu_archive_import_message_v751125"
+                                    ] = "Историческое меню загружено · " + " · ".join(message_parts)
+                                    st.rerun()
 
                 archive_date_iso = st.selectbox(
                     "Дата сохранённого меню",
