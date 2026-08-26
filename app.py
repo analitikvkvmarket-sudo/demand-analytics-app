@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.20-REPORT-WEEKDAY-POINT-SKU-DRILLDOWN"
+BUILD_ID = "75.11.21-CATEGORY-POINT-AVG-TITLE-PERIOD-WEEKDAY"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -10908,11 +10908,20 @@ if tab_category_analysis.open:
                                 ],
                                 ignore_index=True,
                             )
+                        category_point_period_title = " · ".join(
+                            f"{name}: {range_start:%d.%m.%Y}–{range_end:%d.%m.%Y}"
+                            for name, range_start, range_end in category_periods
+                        )
+                        category_point_weekday_title = ", ".join(selected_weekday_names)
+                        category_point_chart_title = (
+                            f"Средние продажи категории по точкам · {category_point_weekday_title}"
+                            f"<br><sup>{category_point_period_title}</sup>"
+                        )
                         point_average_chart = px.bar(
                             point_chart_data,
                             x="Точка",
                             y="Среднее за выбранный день, шт.",
-                            title="Средние продажи категории по точкам",
+                            title=category_point_chart_title,
                             text_auto=".1f",
                             color="Период",
                             barmode="group",
