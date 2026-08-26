@@ -18,6 +18,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
+from plotly.subplots import make_subplots
 import psycopg
 import streamlit as st
 from dotenv import load_dotenv
@@ -29,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.13-CATEGORY-SKU-CALENDAR-AVG"
+BUILD_ID = "75.11.15-FRESHNESS-POINT-MENU-DAILY"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -3163,6 +3164,196 @@ def build_sales_time_period(
     )
 
 
+
+FRESHNESS_POINT_DAY_COLUMNS = [f"День {day_number}" for day_number in range(1, 8)]
+
+
+def prepare_freshness_point_menu_view(
+    point_rows: pd.DataFrame,
+    as_of_date: date | None = None,
+) -> pd.DataFrame:
+    """Готовит меню точки с фактом продаж по каждому дню окна свежести."""
+    as_of_date = as_of_date or date.today()
+    if point_rows is None or point_rows.empty:
+        return pd.DataFrame()
+
+    work = point_rows.copy()
+    work["Отгружено по плану"] = pd.to_numeric(
+        work.get("Отгружено по плану"), errors="coerce"
+    ).fillna(0.0)
+    # Меню точки — только позиции, которым в матрице реально задан план > 0.
+    work = work[work["Отгружено по плану"] > 0].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    for column in FRESHNESS_POINT_DAY_COLUMNS:
+        work[column] = pd.to_numeric(work.get(column), errors="coerce").fillna(0.0)
+
+    work["Продано в свежесть, шт."] = pd.to_numeric(
+        work.get("Продано в зелёный период"), errors="coerce"
+    ).fillna(0.0)
+    work["Продано за срок, шт."] = pd.to_numeric(
+        work.get("Продано за срок"), errors="coerce"
+    ).fillna(0.0)
+    work["Остаток, шт."] = pd.to_numeric(
+        work.get("Расчётный остаток"), errors="coerce"
+    ).fillna(0.0)
+    work["Дата меню"] = pd.to_datetime(work.get("Дата отгрузки"), errors="coerce")
+
+    # Текстовый экран: 0 остаётся нулём, будущие дни и дни за пределами срока — «—».
+    display = work.copy()
+    for column in FRESHNESS_POINT_DAY_COLUMNS:
+        display[column] = display[column].map(
+            lambda value: f"{float(value):,.0f}".replace(",", " ")
+        ).astype(object)
+
+    for row_index, row in display.iterrows():
+        category = row.get("Категория", "")
+        shelf_days = product_lifecycle_days(category)
+        menu_date_ts = pd.to_datetime(row.get("Дата меню"), errors="coerce")
+        for day_number, column in enumerate(FRESHNESS_POINT_DAY_COLUMNS, start=1):
+            if day_number > shelf_days:
+                display.at[row_index, column] = "—"
+                continue
+            if pd.notna(menu_date_ts):
+                fact_date = menu_date_ts.date() + timedelta(days=day_number)
+                if fact_date > as_of_date:
+                    display.at[row_index, column] = "—"
+
+    display = display.rename(
+        columns={
+            "Отгружено по плану": "План, шт.",
+            "Срок годности, дней": "Окно, дней",
+        }
+    )
+    columns = [
+        "Точка", "Дата меню", "Категория", "Сущность", "SKU", "Название товара",
+        "План, шт.", "Окно, дней", *FRESHNESS_POINT_DAY_COLUMNS,
+        "Продано в свежесть, шт.", "Продано за срок, шт.", "Остаток, шт.", "Статус партии",
+    ]
+    columns = [column for column in columns if column in display.columns]
+    display = display[columns].copy()
+    display["_point_sort"] = pd.to_numeric(
+        display.get("Точка", pd.Series(dtype=str)).astype(str).str.extract(r"(\d+)", expand=False),
+        errors="coerce",
+    )
+    display["_category_sort"] = display.get("Категория", pd.Series(dtype=str)).map(
+        {
+            "Завтраки": 0, "Салаты": 1, "Супы": 2, "Вторые блюда": 3,
+            "Сэндвичи": 4, "Япония": 5, "Десерты": 6, "Напитки": 7, "Хлеб": 8,
+        }
+    ).fillna(99)
+    return (
+        display.sort_values(
+            ["_point_sort", "Дата меню", "_category_sort", "Категория", "Название товара", "SKU"],
+            kind="stable",
+        )
+        .drop(columns=["_point_sort", "_category_sort"])
+        .reset_index(drop=True)
+    )
+
+
+def build_freshness_point_menu_excel(
+    point_rows: pd.DataFrame,
+    period_start: date,
+    period_end: date,
+) -> bytes:
+    """Excel: отдельный лист на каждую точку, план + продажи по дням свежести."""
+    from openpyxl import Workbook
+
+    view = prepare_freshness_point_menu_view(point_rows, as_of_date=date.today())
+    if view.empty:
+        raise ValueError("Нет строк меню с планом больше нуля для выбранных точек и периода.")
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    header_fill = PatternFill("solid", fgColor="1F4E3D")
+    header_font = Font(color="FFFFFF", bold=True)
+    green_fill = PatternFill("solid", fgColor="D9EAD3")
+    green_positive_fill = PatternFill("solid", fgColor="B6D7A8")
+    grey_fill = PatternFill("solid", fgColor="E7E6E6")
+    outside_fill = PatternFill("solid", fgColor="F2F2F2")
+    imported_font = Font(color="008000")
+    title_font = Font(bold=True, size=12)
+
+    ordered_points = sorted(
+        view["Точка"].dropna().astype(str).unique(),
+        key=lambda label: int(re.search(r"\d+", label).group()) if re.search(r"\d+", label) else 999,
+    )
+    for point_label in ordered_points:
+        point_view = view[view["Точка"].astype(str).eq(point_label)].copy()
+        sheet = workbook.create_sheet(title=str(point_label)[:31])
+        sheet.sheet_view.showGridLines = False
+        sheet["A1"] = f"Окно свежести · {point_label}"
+        sheet["A1"].font = title_font
+        sheet["A2"] = f"Период формирования меню: {period_start:%d.%m.%Y}–{period_end:%d.%m.%Y}"
+        sheet["A3"] = (
+            "День 1 начинается на следующий день после даты меню. "
+            "Зелёный = основной период свежести; серый = завершающий срок."
+        )
+        header_row = 5
+        export_columns = [column for column in point_view.columns if column != "Точка"]
+        for col_idx, column in enumerate(export_columns, start=1):
+            cell = sheet.cell(header_row, col_idx, column)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        for out_row, (_, row) in enumerate(point_view.iterrows(), start=header_row + 1):
+            category = row.get("Категория", "")
+            green_days = product_green_days(category)
+            shelf_days = product_lifecycle_days(category)
+            for col_idx, column in enumerate(export_columns, start=1):
+                value = row.get(column)
+                cell = sheet.cell(out_row, col_idx)
+                if column == "Дата меню":
+                    parsed = pd.to_datetime(value, errors="coerce")
+                    cell.value = parsed.to_pydatetime() if pd.notna(parsed) else None
+                    cell.number_format = "DD.MM.YYYY"
+                elif column in FRESHNESS_POINT_DAY_COLUMNS and value == "—":
+                    cell.value = "—"
+                else:
+                    # Экранные строки Day N возвращаем в число для удобной выгрузки.
+                    if column in FRESHNESS_POINT_DAY_COLUMNS:
+                        numeric_value = pd.to_numeric(str(value).replace(" ", ""), errors="coerce")
+                        cell.value = 0 if pd.isna(numeric_value) else float(numeric_value)
+                        cell.number_format = "0"
+                    else:
+                        cell.value = value
+                cell.font = imported_font
+                if column in FRESHNESS_POINT_DAY_COLUMNS:
+                    day_number = int(column.split()[-1])
+                    if day_number <= green_days:
+                        numeric = pd.to_numeric(str(value).replace(" ", ""), errors="coerce")
+                        cell.fill = green_positive_fill if pd.notna(numeric) and float(numeric) > 0 else green_fill
+                    elif day_number <= shelf_days:
+                        cell.fill = grey_fill
+                    else:
+                        cell.fill = outside_fill
+                cell.alignment = Alignment(
+                    horizontal="left" if column in {"Категория", "Сущность", "Название товара", "Статус партии"} else "center",
+                    vertical="center",
+                )
+
+        sheet.freeze_panes = f"A{header_row + 1}"
+        sheet.auto_filter.ref = f"A{header_row}:{get_column_letter(len(export_columns))}{header_row + len(point_view)}"
+        widths = {
+            "Дата меню": 13, "Категория": 18, "Сущность": 24, "SKU": 12,
+            "Название товара": 38, "План, шт.": 12, "Окно, дней": 12,
+            "Продано в свежесть, шт.": 20, "Продано за срок, шт.": 18,
+            "Остаток, шт.": 14, "Статус партии": 26,
+        }
+        for col_idx, column in enumerate(export_columns, start=1):
+            width = 10 if column in FRESHNESS_POINT_DAY_COLUMNS else widths.get(column, 14)
+            sheet.column_dimensions[get_column_letter(col_idx)].width = width
+        sheet.row_dimensions[header_row].height = 32
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
 def freshness_stage_for_sale(category: object, loading_date: object, sale_date: object) -> str:
     """Возвращает цветовой этап свежести для продажи, привязанной к партии."""
     loading_ts = pd.to_datetime(loading_date, errors="coerce")
@@ -6219,7 +6410,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.11.13 · CATEGORY SKU CALENDAR AVG")
+    st.caption("Аналитика спроса · версия 75.11.14 · CATEGORY SKU CALENDAR AVG SEPARATE")
     st.caption("Автозагрузка данных · SEPARATE-MENU")
     st.caption(f"SKU / категории / сущности · {entity_reference_source}")
     if entity_reference_warning and not entity_reference_source.startswith("Apps Script"):
@@ -10308,51 +10499,54 @@ if tab_category_analysis.open:
                             aggfunc="sum",
                         ).sort_index(axis=1)
 
-                        # После последнего календарного дня показываем среднее за выбранный
-                        # период для каждой строки/точки. Нулевые дни уже присутствуют в
-                        # calendar_heat, поэтому они корректно входят в среднее.
+                        # Среднее за выбранный период показываем отдельным узким блоком
+                        # справа от последней календарной даты — визуально отдельно от дат.
+                        # Нулевые дни уже присутствуют в calendar_heat, поэтому корректно
+                        # участвуют в среднем по каждой точке.
                         calendar_average = calendar_heat.mean(axis=1).fillna(0.0)
-                        calendar_heat_chart = calendar_heat.copy()
-                        average_column_label = "СР за период"
-                        calendar_heat_chart[average_column_label] = calendar_average
-
-                        calendar_text = calendar_heat_chart.copy().astype(object)
-                        for column_name in calendar_heat_chart.columns:
-                            if column_name == average_column_label:
-                                calendar_text[column_name] = calendar_heat_chart[column_name].map(
-                                    lambda value: "" if pd.isna(value) else f"{float(value):.1f}"
-                                )
-                            else:
-                                calendar_text[column_name] = calendar_heat_chart[column_name].map(
-                                    lambda value: "" if pd.isna(value) else str(int(round(value)))
-                                )
-
-                        calendar_heat_max = max(float(calendar_heat.stack().max()), 1.0)
                         calendar_dates = list(calendar_heat.columns)
                         calendar_x_values = [
                             calendar_date.strftime("%Y-%m-%d") for calendar_date in calendar_dates
-                        ] + [average_column_label]
+                        ]
                         calendar_tick_labels = [
                             f"{calendar_date:%d.%m}<br>{weekday_names[calendar_date.weekday()]}"
                             for calendar_date in calendar_dates
-                        ] + ["СР<br>за период"]
+                        ]
                         calendar_hover_labels = [
                             f"Дата: {calendar_date:%d.%m.%Y}" for calendar_date in calendar_dates
-                        ] + ["Среднее за выбранный период"]
-                        calendar_customdata = [
-                            calendar_hover_labels for _ in range(len(calendar_heat_chart.index))
                         ]
+                        calendar_customdata = [
+                            calendar_hover_labels for _ in range(len(calendar_heat.index))
+                        ]
+                        calendar_text = calendar_heat.applymap(
+                            lambda value: "" if pd.isna(value) else str(int(round(value)))
+                        )
+                        average_text = calendar_average.map(
+                            lambda value: "" if pd.isna(value) else f"{float(value):.1f}"
+                        )
 
-                        sku_calendar_chart = go.Figure(
-                            data=go.Heatmap(
-                                z=calendar_heat_chart.to_numpy(),
+                        calendar_heat_max = max(float(calendar_heat.stack().max()), 1.0)
+                        calendar_rows_count = max(len(calendar_heat.index), 1)
+                        # Блок среднего остаётся компактным даже при длинном выбранном периоде.
+                        average_width = min(0.10, max(0.055, 2.2 / max(len(calendar_dates), 1)))
+                        date_width = 1.0 - average_width
+                        sku_calendar_chart = make_subplots(
+                            rows=1,
+                            cols=2,
+                            shared_yaxes=True,
+                            column_widths=[date_width, average_width],
+                            horizontal_spacing=0.012,
+                        )
+                        sku_calendar_chart.add_trace(
+                            go.Heatmap(
+                                z=calendar_heat.to_numpy(),
                                 x=calendar_x_values,
-                                y=calendar_heat_chart.index.tolist(),
+                                y=calendar_heat.index.tolist(),
                                 text=calendar_text.to_numpy(),
                                 customdata=calendar_customdata,
                                 texttemplate="%{text}",
                                 hovertemplate=(
-                                    "%{y}<br>%{customdata}<br>Значение: %{z:.1f} шт."
+                                    "%{y}<br>%{customdata}<br>Продано: %{z:.0f} шт."
                                     "<extra></extra>"
                                 ),
                                 colorscale=[
@@ -10363,30 +10557,85 @@ if tab_category_analysis.open:
                                 ],
                                 zmin=0,
                                 zmax=calendar_heat_max,
-                                colorbar_title="Продано, шт.",
+                                showscale=True,
+                                colorbar=dict(
+                                    title="Продано, шт.",
+                                    x=1.075,
+                                    len=min(0.86, max(0.36, 0.18 + 0.12 * calendar_rows_count)),
+                                ),
                                 xgap=3,
                                 ygap=4,
-                            )
+                            ),
+                            row=1,
+                            col=1,
+                        )
+                        sku_calendar_chart.add_trace(
+                            go.Heatmap(
+                                z=calendar_average.to_numpy().reshape(-1, 1),
+                                x=["СР за период"],
+                                y=calendar_heat.index.tolist(),
+                                text=average_text.to_numpy().reshape(-1, 1),
+                                texttemplate="%{text}",
+                                hovertemplate=(
+                                    "%{y}<br>Среднее за выбранный период: %{z:.1f} шт."
+                                    "<extra></extra>"
+                                ),
+                                colorscale=[
+                                    [0.0, "#D9D9D9"],
+                                    [0.000001, "#D9D9D9"],
+                                    [0.000002, "#A9D18E"],
+                                    [1.0, "#008A3B"],
+                                ],
+                                zmin=0,
+                                zmax=calendar_heat_max,
+                                showscale=False,
+                                xgap=3,
+                                ygap=4,
+                            ),
+                            row=1,
+                            col=2,
                         )
                         sku_calendar_chart.update_layout(
                             title=f"Календарь продаж SKU {selected_lifecycle_sku}",
-                            xaxis_title="Дата выбранного периода",
-                            yaxis_title="Период · точка",
-                            xaxis=dict(
-                                tickmode="array",
-                                tickvals=calendar_x_values,
-                                ticktext=calendar_tick_labels,
-                                tickangle=-45,
-                            ),
-                            height=max(330, 100 + 55 * len(calendar_heat_chart)),
-                            margin=dict(l=20, r=20, t=60, b=40),
+                            height=max(330, 100 + 55 * len(calendar_heat)),
+                            margin=dict(l=20, r=95, t=60, b=55),
+                        )
+                        sku_calendar_chart.update_xaxes(
+                            title_text="Дата выбранного периода",
+                            tickmode="array",
+                            tickvals=calendar_x_values,
+                            ticktext=calendar_tick_labels,
+                            tickangle=-45,
+                            row=1,
+                            col=1,
+                        )
+                        sku_calendar_chart.update_xaxes(
+                            title_text="",
+                            tickmode="array",
+                            tickvals=["СР за период"],
+                            ticktext=["СР<br>за период"],
+                            tickangle=0,
+                            showgrid=False,
+                            row=1,
+                            col=2,
+                        )
+                        sku_calendar_chart.update_yaxes(
+                            title_text="Период · точка",
+                            row=1,
+                            col=1,
+                        )
+                        sku_calendar_chart.update_yaxes(
+                            showticklabels=False,
+                            title_text="",
+                            row=1,
+                            col=2,
                         )
                         st.plotly_chart(sku_calendar_chart, use_container_width=True)
                         st.caption(
                             "Зелёный — SKU продавался, число внутри — продано за день. "
-                            "Серый — в эту дату продаж SKU не было. Последний столбец «СР за период» "
-                            "показывает среднее количество продаж по каждой точке за все календарные "
-                            "дни выбранного периода, включая дни с нулевыми продажами."
+                            "Серый — в эту дату продаж SKU не было. Справа от последней даты "
+                            "отдельным блоком показано «СР за период» по каждой точке. В среднее "
+                            "входят все календарные дни выбранного периода, включая нулевые."
                         )
 
 
@@ -10946,6 +11195,131 @@ if tab_sales_time.open:
                 # а по клику на строку ниже можно раскрыть реализацию именно этой партии
                 # отдельно по Т1–Т29.
                 sales_time_menu_by_point = sales_time_menu.copy()
+
+                # 75.11.15: прямой табличный вид «матрица меню -> факт по дням свежести».
+                # Каждая точка показывается отдельно; строки = SKU из её плана с количеством > 0.
+                point_menu_view = prepare_freshness_point_menu_view(
+                    sales_time_menu_by_point,
+                    as_of_date=date.today(),
+                )
+                st.markdown("#### Меню по точкам · продажи по дням свежести")
+                st.caption(
+                    "Таблица строится от выбранных дат формирования меню в матрице. "
+                    "Для каждого SKU показан план точки и фактическое количество продаж в День 1, День 2 и далее. "
+                    "День 1 начинается на следующий календарный день после даты меню. "
+                    "Зелёные ячейки — основной период свежести; серые — завершающие дни срока; «—» — день вне срока или ещё не наступил."
+                )
+                if point_menu_view.empty:
+                    st.info(
+                        "Для выбранного периода и точек в матрице нет SKU с планом больше нуля, "
+                        "поэтому таблица окна свежести не сформирована."
+                    )
+                else:
+                    export_col, summary_col = st.columns([1.0, 2.2])
+                    with export_col:
+                        try:
+                            freshness_point_excel = build_freshness_point_menu_excel(
+                                sales_time_menu_by_point,
+                                shipment_start,
+                                shipment_end,
+                            )
+                        except Exception as export_error:
+                            freshness_point_excel = b""
+                            st.caption(f"Excel-выгрузка временно недоступна: {export_error}")
+                        if freshness_point_excel:
+                            st.download_button(
+                                "Скачать меню по точкам · Excel",
+                                data=freshness_point_excel,
+                                file_name=(
+                                    f"окно_свежести_по_точкам_"
+                                    f"{shipment_start:%Y-%m-%d}_{shipment_end:%Y-%m-%d}.xlsx"
+                                ),
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                use_container_width=True,
+                                key="freshness_point_menu_excel_v75115",
+                            )
+                    with summary_col:
+                        st.info(
+                            f"Точек: {point_menu_view['Точка'].nunique()} · "
+                            f"строк меню: {len(point_menu_view):,} · "
+                            f"SKU: {point_menu_view['SKU'].nunique()}".replace(",", " ")
+                        )
+
+                    def style_freshness_point_menu(row: pd.Series) -> list[str]:
+                        styles = [""] * len(row.index)
+                        category = row.get("Категория", "")
+                        green_days = product_green_days(category)
+                        shelf_days = product_lifecycle_days(category)
+                        for day_number, column_name in enumerate(FRESHNESS_POINT_DAY_COLUMNS, start=1):
+                            if column_name not in row.index:
+                                continue
+                            position = row.index.get_loc(column_name)
+                            value = row.get(column_name)
+                            numeric_value = pd.to_numeric(
+                                str(value).replace(" ", "") if value != "—" else None,
+                                errors="coerce",
+                            )
+                            if day_number <= green_days:
+                                if pd.notna(numeric_value) and float(numeric_value) > 0:
+                                    styles[position] = (
+                                        "background-color: #B6D7A8; color: #274E13; font-weight: 700"
+                                    )
+                                else:
+                                    styles[position] = (
+                                        "background-color: #D9EAD3; color: #274E13; font-weight: 600"
+                                    )
+                            elif day_number <= shelf_days:
+                                styles[position] = (
+                                    "background-color: #E7E6E6; color: #333333; font-weight: 600"
+                                )
+                            else:
+                                styles[position] = "background-color: #F2F2F2; color: #B7B7B7"
+                        return styles
+
+                    point_order_for_view = [
+                        point for point in selected_time_points
+                        if point in set(point_menu_view["Точка"].dropna().astype(str))
+                    ]
+                    for point_index, point_label in enumerate(point_order_for_view):
+                        point_table = point_menu_view[
+                            point_menu_view["Точка"].astype(str).eq(point_label)
+                        ].drop(columns="Точка").reset_index(drop=True)
+                        point_shop = point_to_shop.get(point_label)
+                        point_plan_total = pd.to_numeric(
+                            point_table.get("План, шт."), errors="coerce"
+                        ).fillna(0).sum()
+                        point_green_sales = pd.to_numeric(
+                            point_table.get("Продано в свежесть, шт."), errors="coerce"
+                        ).fillna(0).sum()
+                        point_title = (
+                            f"{point_label} · магазин {point_shop} · "
+                            f"SKU {point_table['SKU'].nunique()} · план {point_plan_total:,.0f} шт. · "
+                            f"продано в свежесть {point_green_sales:,.0f} шт."
+                        ).replace(",", " ")
+                        with st.expander(point_title, expanded=(point_index == 0)):
+                            point_screen, point_screen_limit, point_screen_truncated = styler_safe_preview(
+                                point_table
+                            )
+                            if point_screen_truncated:
+                                st.info(
+                                    f"Показаны первые {point_screen_limit:,} строк из {len(point_table):,}. "
+                                    "Excel-выгрузка содержит все строки.".replace(",", " ")
+                                )
+                            st.dataframe(
+                                point_screen.style.apply(style_freshness_point_menu, axis=1),
+                                use_container_width=True,
+                                hide_index=True,
+                                height=min(620, 38 * len(point_screen) + 80),
+                                column_config={
+                                    "Дата меню": st.column_config.DateColumn("Дата меню", format="DD.MM.YYYY"),
+                                    "План, шт.": st.column_config.NumberColumn("План, шт.", format="%.0f"),
+                                    "Окно, дней": st.column_config.NumberColumn("Окно, дней", format="%d"),
+                                    "Продано в свежесть, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                    "Продано за срок, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                    "Остаток, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                },
+                            )
+
                 if len(selected_time_points) > 1 and not sales_time_menu.empty:
                     timeline_sum_columns = [
                         "Отгружено по плану", "День 1", "День 2", "День 3", "День 4", "День 5",
