@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.18-WRITEOFF-POINTS-SEPARATE-ROWS"
+BUILD_ID = "75.11.19-REPORT-CATEGORY-SKU-POINT-DRILLDOWN"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -5999,6 +5999,132 @@ def build_report_category_sku_breakdown(
     return pd.concat([result, pd.DataFrame([total_row])], ignore_index=True)[ordered_columns]
 
 
+
+def build_report_sku_point_breakdown(
+    frame_1: pd.DataFrame,
+    frame_2: pd.DataFrame,
+    category: str,
+    sku: object,
+    period_1_dates: list[date],
+    period_2_dates: list[date],
+    points: list[str] | None = None,
+) -> pd.DataFrame:
+    """Раскрывает выбранный SKU до отдельных точек с продажами и выручкой П1/П2."""
+    selected_sku = normalize_sku(sku)
+    if not selected_sku:
+        return pd.DataFrame()
+
+    days_1 = max(len(period_1_dates), 1)
+    days_2 = max(len(period_2_dates), 1)
+
+    def point_period(
+        frame: pd.DataFrame,
+        quantity_name: str,
+        revenue_name: str,
+    ) -> pd.DataFrame:
+        columns = ["Точка", quantity_name, revenue_name]
+        if frame.empty or "sku" not in frame.columns or "point" not in frame.columns:
+            return pd.DataFrame(columns=columns)
+        work = frame[frame["category"].astype(str).eq(str(category))].copy()
+        if work.empty:
+            return pd.DataFrame(columns=columns)
+        work["_sku_norm"] = work["sku"].map(normalize_sku)
+        work = work[work["_sku_norm"].eq(selected_sku)].copy()
+        if work.empty:
+            return pd.DataFrame(columns=columns)
+        work["point"] = work["point"].fillna("").astype(str).str.strip()
+        work = work[work["point"].ne("")].copy()
+        work["sales"] = pd.to_numeric(work.get("sales"), errors="coerce").fillna(0.0)
+        if "revenue" not in work.columns:
+            work["revenue"] = 0.0
+        work["revenue"] = pd.to_numeric(work["revenue"], errors="coerce").fillna(0.0)
+        grouped = (
+            work.groupby("point", as_index=False, dropna=False)
+            .agg(
+                **{
+                    quantity_name: ("sales", "sum"),
+                    revenue_name: ("revenue", "sum"),
+                }
+            )
+            .rename(columns={"point": "Точка"})
+        )
+        return grouped[columns]
+
+    left = point_period(frame_1, "Период 1, шт.", "Выручка П1, ₽")
+    right = point_period(frame_2, "Период 2, шт.", "Выручка П2, ₽")
+
+    requested_points = []
+    for point in points or []:
+        point_text = str(point).strip()
+        if point_text and point_text not in requested_points:
+            requested_points.append(point_text)
+
+    if requested_points:
+        result = pd.DataFrame({"Точка": requested_points})
+        result = result.merge(left, on="Точка", how="left")
+        result = result.merge(right, on="Точка", how="left")
+    else:
+        result = left.merge(right, on="Точка", how="outer")
+
+    if result.empty:
+        return result
+
+    numeric_columns = ["Период 1, шт.", "Период 2, шт.", "Выручка П1, ₽", "Выручка П2, ₽"]
+    for column in numeric_columns:
+        if column not in result.columns:
+            result[column] = 0.0
+        result[column] = pd.to_numeric(result[column], errors="coerce").fillna(0.0)
+
+    result["Изменение, шт."] = result["Период 2, шт."] - result["Период 1, шт."]
+    result["Изменение, %"] = (
+        result["Изменение, шт."].div(result["Период 1, шт."].replace(0, pd.NA)) * 100
+    )
+    result.loc[result["Период 1, шт."].eq(0), "Изменение, %"] = pd.NA
+    result["Изменение выручки, ₽"] = result["Выручка П2, ₽"] - result["Выручка П1, ₽"]
+    result["Изменение выручки, %"] = (
+        result["Изменение выручки, ₽"].div(result["Выручка П1, ₽"].replace(0, pd.NA)) * 100
+    )
+    result.loc[result["Выручка П1, ₽"].eq(0), "Изменение выручки, %"] = pd.NA
+    result["СР/день П1"] = result["Период 1, шт."] / days_1
+    result["СР/день П2"] = result["Период 2, шт."] / days_2
+
+    def point_number(value: object) -> int:
+        match = re.search(r"(\d+)", str(value))
+        return int(match.group(1)) if match else 9999
+
+    result["_point_number"] = result["Точка"].map(point_number)
+    result = result.sort_values(["_point_number", "Точка"], kind="stable").drop(columns="_point_number")
+    result = result.reset_index(drop=True)
+
+    total_1 = float(result["Период 1, шт."].sum())
+    total_2 = float(result["Период 2, шт."].sum())
+    revenue_1 = float(result["Выручка П1, ₽"].sum())
+    revenue_2 = float(result["Выручка П2, ₽"].sum())
+    delta = total_2 - total_1
+    revenue_delta = revenue_2 - revenue_1
+    total_row = {
+        "Точка": "ВСЕГО SKU",
+        "Период 1, шт.": total_1,
+        "Период 2, шт.": total_2,
+        "Выручка П1, ₽": revenue_1,
+        "Выручка П2, ₽": revenue_2,
+        "Изменение, шт.": delta,
+        "Изменение, %": (delta / total_1 * 100) if total_1 else pd.NA,
+        "Изменение выручки, ₽": revenue_delta,
+        "Изменение выручки, %": (revenue_delta / revenue_1 * 100) if revenue_1 else pd.NA,
+        "СР/день П1": total_1 / days_1,
+        "СР/день П2": total_2 / days_2,
+    }
+    ordered_columns = [
+        "Точка", "Период 1, шт.", "Период 2, шт.",
+        "Выручка П1, ₽", "Выручка П2, ₽",
+        "Изменение, шт.", "Изменение, %",
+        "Изменение выручки, ₽", "Изменение выручки, %",
+        "СР/день П1", "СР/день П2",
+    ]
+    return pd.concat([result, pd.DataFrame([total_row])], ignore_index=True)[ordered_columns]
+
+
 def build_report_tables(
     frame_1: pd.DataFrame,
     frame_2: pd.DataFrame,
@@ -7434,7 +7560,14 @@ if tab_report.open:
                                         "Период 2, шт.": "Сумма продаж SKU П2, шт.",
                                     }
                                 )
-                                st.dataframe(
+                                st.caption(
+                                    "Нажмите на строку SKU — ниже откроется сравнение выбранного товара по каждой точке."
+                                )
+                                sku_selection_key = (
+                                    "report_category_sku_select_v773_"
+                                    + hashlib.sha1(selected_drill_category.encode("utf-8")).hexdigest()[:10]
+                                )
+                                sku_selection = st.dataframe(
                                     category_sku_display,
                                     use_container_width=True,
                                     hide_index=True,
@@ -7461,7 +7594,66 @@ if tab_report.open:
                                         "СР/день П1": st.column_config.NumberColumn(format="%.2f"),
                                         "СР/день П2": st.column_config.NumberColumn(format="%.2f"),
                                     },
+                                    on_select="rerun",
+                                    selection_mode="single-row",
+                                    key=sku_selection_key,
                                 )
+
+                                selected_sku_rows = list(getattr(sku_selection.selection, "rows", []) or [])
+                                if selected_sku_rows:
+                                    selected_sku_index = int(selected_sku_rows[0])
+                                    if 0 <= selected_sku_index < len(category_sku_breakdown):
+                                        selected_sku_row = category_sku_breakdown.iloc[selected_sku_index]
+                                        selected_drill_sku = normalize_sku(selected_sku_row.get("SKU"))
+                                        selected_drill_name = str(selected_sku_row.get("Название товара", "")).strip()
+                                        if selected_drill_sku:
+                                            sku_point_breakdown = build_report_sku_point_breakdown(
+                                                filtered_report_1,
+                                                filtered_report_2,
+                                                selected_drill_category,
+                                                selected_drill_sku,
+                                                report_dates_1,
+                                                report_dates_2,
+                                                selected_report_points,
+                                            )
+                                            st.markdown(
+                                                f"#### SKU {selected_drill_sku} · {selected_drill_name or 'Без названия'} · по точкам"
+                                            )
+                                            if sku_point_breakdown.empty:
+                                                st.info("По выбранному SKU нет данных в разрезе выбранных точек.")
+                                            else:
+                                                st.caption(
+                                                    "Каждая выбранная точка показана отдельной строкой. "
+                                                    "Строка «ВСЕГО SKU» сверяет сумму по всем выбранным точкам."
+                                                )
+                                                st.dataframe(
+                                                    sku_point_breakdown,
+                                                    use_container_width=True,
+                                                    hide_index=True,
+                                                    height=min(720, 38 * len(sku_point_breakdown) + 80),
+                                                    column_config={
+                                                        "Период 1, шт.": st.column_config.NumberColumn(
+                                                            label=category_period_1_label, format="%.0f"
+                                                        ),
+                                                        "Период 2, шт.": st.column_config.NumberColumn(
+                                                            label=category_period_2_label, format="%.0f"
+                                                        ),
+                                                        "Выручка П1, ₽": st.column_config.NumberColumn(
+                                                            label="Выручка П1, ₽", format="%.2f"
+                                                        ),
+                                                        "Выручка П2, ₽": st.column_config.NumberColumn(
+                                                            label="Выручка П2, ₽", format="%.2f"
+                                                        ),
+                                                        "Изменение, шт.": st.column_config.NumberColumn(format="%+.0f"),
+                                                        "Изменение, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                                                        "Изменение выручки, ₽": st.column_config.NumberColumn(format="%+.2f"),
+                                                        "Изменение выручки, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                                                        "СР/день П1": st.column_config.NumberColumn(format="%.2f"),
+                                                        "СР/день П2": st.column_config.NumberColumn(format="%.2f"),
+                                                    },
+                                                )
+                                        elif selected_drill_name == "ВСЕГО КАТЕГОРИИ":
+                                            st.info("Выберите конкретный SKU, а не строку «ВСЕГО КАТЕГОРИИ».")
                         elif selected_drill_category == "ВСЕГО":
                             st.info("Выберите конкретную категорию, а не строку «ВСЕГО», чтобы раскрыть её до SKU.")
             else:
