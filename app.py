@@ -29,7 +29,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.8-MATRIX-ENTITY-SOURCE"
+BUILD_ID = "75.11.9-SEPARATE-PLAN-ENTITY-SOURCES"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -105,7 +105,7 @@ MATRIX_APPS_SCRIPT_KEY = os.getenv(
     "VK_MATRIX_2026_8f31c5a7d942",
 ).strip()
 GOOGLE_MATRIX_REFRESH_SECONDS = 15 * 60
-GOOGLE_MATRIX_CACHE_FILE = Path(tempfile.gettempdir()) / "vkusnomarket_combo_matrix_cache.xlsx"
+GOOGLE_MATRIX_CACHE_FILE = Path(tempfile.gettempdir()) / "vkusnomarket_combo_plan_cache_v2.xlsx"
 MATRIX_PLAN_SHEETS = [
     "План 1-я неделя",
     "План 2-я неделя",
@@ -113,7 +113,6 @@ MATRIX_PLAN_SHEETS = [
     "План 4-я неделя",
 ]
 MATRIX_ENTITY_SHEET = "Справочник + атрибуты"
-MATRIX_SNAPSHOT_SHEETS = [*MATRIX_PLAN_SHEETS, MATRIX_ENTITY_SHEET]
 
 st.set_page_config(
     page_title="Аналитика спроса",
@@ -162,15 +161,19 @@ def _coerce_api_cell(value: object) -> object:
     return text
 
 
-def _build_matrix_xlsx_from_apps_script(sheet_payloads: dict[str, list[list[object]]]) -> bytes:
-    """Rebuild a minimal XLSX with plan sheets plus the SKU/entity reference sheet."""
+def _build_matrix_xlsx_from_apps_script(
+    sheet_payloads: dict[str, list[list[object]]],
+    sheet_order: list[str] | tuple[str, ...] | None = None,
+) -> bytes:
+    """Rebuild a minimal XLSX from the exact sheets returned by Apps Script."""
     from openpyxl import Workbook
 
     workbook = Workbook()
     default_sheet = workbook.active
     workbook.remove(default_sheet)
 
-    for sheet_name in MATRIX_SNAPSHOT_SHEETS:
+    ordered_sheets = list(sheet_order or sheet_payloads.keys())
+    for sheet_name in ordered_sheets:
         if sheet_name not in sheet_payloads:
             continue
         values = sheet_payloads.get(sheet_name, [])
@@ -189,7 +192,12 @@ def _fetch_apps_script_matrix_snapshot(
     api_url: str,
     api_key: str,
 ) -> tuple[bytes, str, str, str]:
-    """Read current plan sheets and the SKU/entity reference from Apps Script every 15 minutes."""
+    """Read ONLY current plan sheets from Apps Script every 15 minutes.
+
+    The SKU/entity reference is intentionally fetched by a separate function.
+    Failure of «Справочник + атрибуты» must never make the plan loader fall back
+    to an old bundled workbook.
+    """
     checked_at = datetime.now().isoformat(timespec="seconds")
     if not api_url or not api_key:
         return b"", "", checked_at, "не указан URL или ключ Apps Script"
@@ -212,10 +220,10 @@ def _fetch_apps_script_matrix_snapshot(
         available_sheets = set(meta.get("sheets") or [])
         missing = [name for name in MATRIX_PLAN_SHEETS if name not in available_sheets]
         if missing:
-            raise RuntimeError("в Apps Script не найдены листы: " + ", ".join(missing))
+            raise RuntimeError("в Apps Script не найдены листы планов: " + ", ".join(missing))
 
         sheet_payloads: dict[str, list[list[object]]] = {}
-        for sheet_name in MATRIX_SNAPSHOT_SHEETS:
+        for sheet_name in MATRIX_PLAN_SHEETS:
             sheet_response = session.get(
                 api_url,
                 params={"key": api_key, "action": "sheet", "name": sheet_name},
@@ -233,21 +241,73 @@ def _fetch_apps_script_matrix_snapshot(
                 raise RuntimeError(f"{sheet_name}: Apps Script не вернул массив values")
             sheet_payloads[sheet_name] = values
 
-        content = _build_matrix_xlsx_from_apps_script(sheet_payloads)
+        content = _build_matrix_xlsx_from_apps_script(
+            sheet_payloads,
+            MATRIX_PLAN_SHEETS,
+        )
         if content[:2] != b"PK":
-            raise RuntimeError("не удалось собрать XLSX из ответа Apps Script")
+            raise RuntimeError("не удалось собрать XLSX планов из ответа Apps Script")
 
         updated_at = str(meta.get("updatedAt") or "").replace("T", " ").replace("Z", " UTC")
-        source = "Apps Script · 2.3 Матрица КОМБО · Справочник + атрибуты"
+        source = "Apps Script · 2.3 Матрица КОМБО · планы 1–4 недель"
         if updated_at:
             source += f" · обновлена {updated_at}"
         return content, source, checked_at, ""
     except Exception as error:
-        return b"", "", checked_at, f"Apps Script: {error}"
+        return b"", "", checked_at, f"Apps Script (планы): {error}"
+
+
+@st.cache_data(ttl=GOOGLE_MATRIX_REFRESH_SECONDS, show_spinner=False)
+def _fetch_apps_script_entity_reference(
+    api_url: str,
+    api_key: str,
+) -> tuple[pd.DataFrame, str, str, str]:
+    """Read «Справочник + атрибуты» independently from the plan snapshot.
+
+    If the Apps Script deployment does not expose this sheet, only the entity
+    reference falls back. Plan dates remain live and are not affected.
+    """
+    checked_at = datetime.now().isoformat(timespec="seconds")
+    empty = pd.DataFrame()
+    if not api_url or not api_key:
+        return empty, "", checked_at, "не указан URL или ключ Apps Script"
+
+    try:
+        import requests
+
+        session = requests.Session()
+        sheet_response = session.get(
+            api_url,
+            params={"key": api_key, "action": "sheet", "name": MATRIX_ENTITY_SHEET},
+            timeout=90,
+            allow_redirects=True,
+        )
+        sheet_response.raise_for_status()
+        payload = sheet_response.json()
+        if not payload.get("ok"):
+            raise RuntimeError(
+                f"{MATRIX_ENTITY_SHEET}: {payload.get('error') or 'Apps Script вернул ошибку'}"
+            )
+        values = payload.get("values")
+        if not isinstance(values, list):
+            raise RuntimeError(f"{MATRIX_ENTITY_SHEET}: Apps Script не вернул массив values")
+
+        raw = pd.DataFrame(values)
+        frame = _parse_entity_reference_raw(raw)
+        if frame.empty:
+            raise RuntimeError(f"{MATRIX_ENTITY_SHEET}: справочник пуст")
+        return (
+            frame,
+            f"Apps Script · 2.3 Матрица КОМБО · лист «{MATRIX_ENTITY_SHEET}»",
+            checked_at,
+            "",
+        )
+    except Exception as error:
+        return empty, "", checked_at, f"Apps Script (справочник): {error}"
 
 
 def get_current_combo_matrix_snapshot() -> tuple[bytes, str, str, str]:
-    """Return current Apps Script matrix; fall back to last cache or bundled workbook."""
+    """Return current PLAN snapshot; entity-reference failures are isolated from this path."""
     google_bytes, google_source, checked_at, google_error = _fetch_apps_script_matrix_snapshot(
         MATRIX_APPS_SCRIPT_URL,
         MATRIX_APPS_SCRIPT_KEY,
@@ -588,47 +648,46 @@ def _entity_reference_signature(frame: pd.DataFrame) -> str:
 
 
 def get_current_entity_reference() -> tuple[pd.DataFrame, str, str, str, str]:
-    """Use the live 2.3 Matrix reference first; keep local/legacy files only as emergency fallback."""
-    matrix_bytes, matrix_source, checked_at, matrix_error = get_current_combo_matrix_snapshot()
+    """Load SKU/category/entity mapping independently from the live plan snapshot."""
+    live_frame, live_source, checked_at, live_error = _fetch_apps_script_entity_reference(
+        MATRIX_APPS_SCRIPT_URL,
+        MATRIX_APPS_SCRIPT_KEY,
+    )
     errors: list[str] = []
-    if matrix_error:
-        errors.append(matrix_error)
+    if live_error:
+        errors.append(live_error)
 
-    if matrix_bytes:
-        try:
-            frame = load_entities_from_matrix_bytes(matrix_bytes)
-            return (
-                frame,
-                f"{matrix_source} · лист «{MATRIX_ENTITY_SHEET}»",
-                checked_at,
-                "; ".join(errors),
-                _entity_reference_signature(frame),
-            )
-        except Exception as error:
-            errors.append(f"текущая матрица: {error}")
+    if live_frame is not None and not live_frame.empty:
+        return (
+            live_frame,
+            live_source,
+            checked_at,
+            "",
+            _entity_reference_signature(live_frame),
+        )
 
-    # If Apps Script returned a reduced snapshot without the reference sheet,
-    # try the bundled full 2.3 Matrix before ever touching the old entities.xlsx.
+    # Reference fallback is independent: it may be old while PLAN sheets stay live.
+    # This branch must never replace the current plan snapshot.
     if COMBO_MATRIX_FILE.exists():
         try:
             local_bytes = COMBO_MATRIX_FILE.read_bytes()
             frame = load_entities_from_matrix_bytes(local_bytes)
             return (
                 frame,
-                f"Резерв · {COMBO_MATRIX_FILE.name} · лист «{MATRIX_ENTITY_SHEET}»",
+                f"Резерв справочника · {COMBO_MATRIX_FILE.name} · лист «{MATRIX_ENTITY_SHEET}»",
                 checked_at,
                 "; ".join(errors),
                 _entity_reference_signature(frame),
             )
         except Exception as error:
-            errors.append(f"локальная матрица: {error}")
+            errors.append(f"локальная матрица справочника: {error}")
 
     if ENTITY_FILE.exists():
         try:
             frame = load_entities(str(ENTITY_FILE), ENTITY_FILE.stat().st_mtime)
             return (
                 frame,
-                f"Аварийный резерв · {ENTITY_FILE.name}",
+                f"Аварийный резерв справочника · {ENTITY_FILE.name}",
                 checked_at,
                 "; ".join(errors),
                 _entity_reference_signature(frame),
@@ -6071,11 +6130,11 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.11.8 · MATRIX ENTITY SOURCE")
+    st.caption("Аналитика спроса · версия 75.11.9 · SEPARATE PLAN / ENTITY SOURCES")
     st.caption("Автозагрузка данных · SEPARATE-MENU")
     st.caption(f"SKU / категории / сущности · {entity_reference_source}")
     if entity_reference_warning and not entity_reference_source.startswith("Apps Script"):
-        st.caption(f"Автоисточник временно недоступен: {entity_reference_warning}")
+        st.caption(f"Автоисточник справочника временно недоступен: {entity_reference_warning}. Планы загружаются отдельно.")
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
         pg_host = st.text_input(
             "Сервер",
@@ -10216,6 +10275,7 @@ if tab_sales_time.open:
                 key="refresh_google_matrix_now_v761",
             ):
                 _fetch_apps_script_matrix_snapshot.clear()
+                _fetch_apps_script_entity_reference.clear()
                 st.rerun()
 
         if not matrix_snapshot_bytes:
