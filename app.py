@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.23-FORECAST-THURSDAY-X1-POINTS"
+BUILD_ID = "75.11.24-SYSTEM-MENU-ARCHIVE"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -122,6 +122,28 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 load_dotenv(APP_DIR / ".env", override=True)
+
+
+def _read_runtime_secret(name: str, default: str = "") -> str:
+    """Read a sensitive runtime value without hard-coding it into app.py."""
+    env_value = str(os.getenv(name, "") or "").strip()
+    if env_value:
+        return env_value
+    try:
+        secret_value = st.secrets.get(name, default)
+    except Exception:
+        secret_value = default
+    return str(secret_value or "").strip()
+
+
+MENU_ARCHIVE_APPS_SCRIPT_URL = _read_runtime_secret(
+    "MENU_ARCHIVE_APPS_SCRIPT_URL",
+    "https://script.google.com/macros/s/AKfycbzZgzZoalMe64P96i5NhQ3aLuT3r_rgJrStxLgT3JP8At2qnYMX1cPBvvSWu-FsueWr/exec",
+)
+# Ключ намеренно НЕ зашит в исходник. На Streamlit Cloud задайте
+# MENU_ARCHIVE_APPS_SCRIPT_KEY в Secrets.
+MENU_ARCHIVE_APPS_SCRIPT_KEY = _read_runtime_secret("MENU_ARCHIVE_APPS_SCRIPT_KEY")
+MENU_ARCHIVE_CACHE_SECONDS = 5 * 60
 
 REMEMBERED_PG_FILE = APP_DIR / ".remembered_pg.json"
 REMEMBERED_PG_DAYS = 30
@@ -346,6 +368,227 @@ def get_current_combo_matrix_snapshot() -> tuple[bytes, str, str, str]:
             google_error = f"{google_error}; локальная матрица: {error}".strip("; ")
 
     return b"", "Матрица недоступна", checked_at, google_error
+
+
+@st.cache_data(ttl=MENU_ARCHIVE_CACHE_SECONDS, show_spinner=False)
+def _fetch_system_menu_archive_dates(
+    api_url: str,
+    api_key: str,
+) -> tuple[list[str], str]:
+    """Return all menu dates already preserved by the system archive."""
+    if not api_url:
+        return [], "не указан URL системного архива"
+    if not api_key:
+        return [], "не указан MENU_ARCHIVE_APPS_SCRIPT_KEY"
+    try:
+        import requests
+
+        response = requests.get(
+            api_url,
+            params={"action": "dates", "key": api_key},
+            timeout=60,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise RuntimeError(payload.get("error") or "архив вернул ошибку")
+        dates = []
+        for value in payload.get("dates") or []:
+            iso_value = str(value or "").strip()
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", iso_value):
+                dates.append(iso_value)
+        return sorted(set(dates)), ""
+    except Exception as error:
+        return [], str(error)
+
+
+@st.cache_data(ttl=MENU_ARCHIVE_CACHE_SECONDS, show_spinner=False)
+def _fetch_system_menu_archive_day(
+    api_url: str,
+    api_key: str,
+    menu_date_iso: str,
+) -> tuple[str, pd.DataFrame, str]:
+    """Load the latest archived snapshot for one historical menu date."""
+    if not api_url:
+        return "", pd.DataFrame(), "не указан URL системного архива"
+    if not api_key:
+        return "", pd.DataFrame(), "не указан MENU_ARCHIVE_APPS_SCRIPT_KEY"
+    try:
+        import requests
+
+        response = requests.get(
+            api_url,
+            params={"action": "menu", "date": menu_date_iso, "key": api_key},
+            timeout=90,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise RuntimeError(payload.get("error") or "архив вернул ошибку")
+
+        snapshot_id = str(payload.get("snapshot_id") or "").strip()
+        rows = payload.get("rows") or []
+        if not isinstance(rows, list):
+            raise RuntimeError("архив вернул некорректный массив rows")
+
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return snapshot_id, frame, ""
+
+        rename_map = {
+            "snapshot_id": "Снимок ID",
+            "saved_at": "Сохранено",
+            "source_sheet": "Лист",
+            "menu_date": "Дата меню",
+            "weekday": "День недели",
+            "sku": "SKU",
+            "price": "Цена",
+            "category": "Категория",
+            "product_name": "Название блюда",
+            "point": "Точка",
+            "plan": "План",
+        }
+        frame = frame.rename(columns=rename_map)
+        for column in rename_map.values():
+            if column not in frame.columns:
+                frame[column] = ""
+
+        frame["SKU"] = frame["SKU"].astype(str).str.strip()
+        frame["Точка"] = (
+            frame["Точка"].astype(str).str.strip().str.upper().str.replace("T", "Т", regex=False)
+        )
+        frame["План"] = pd.to_numeric(frame["План"], errors="coerce").fillna(0)
+        frame["Цена"] = pd.to_numeric(frame["Цена"], errors="coerce")
+        frame["Категория"] = frame["Категория"].fillna("").astype(str).str.strip()
+        frame["Название блюда"] = frame["Название блюда"].fillna("").astype(str).str.strip()
+        frame["Дата меню"] = frame["Дата меню"].fillna(menu_date_iso).astype(str)
+        return snapshot_id, frame[list(rename_map.values())].copy(), ""
+    except Exception as error:
+        return "", pd.DataFrame(), str(error)
+
+
+def _archive_point_sort_key(value: object) -> tuple[int, str]:
+    label = str(value or "").strip().upper().replace("T", "Т")
+    match = re.fullmatch(r"Т(\d+)", label)
+    return (int(match.group(1)), label) if match else (10_000, label)
+
+
+def _archive_sku_matrix(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build SKU x point matrix with an explicit grand-total row/column."""
+    if frame.empty:
+        return pd.DataFrame()
+    work = frame.copy()
+    index_columns = ["Категория", "SKU", "Название блюда", "Цена"]
+    matrix = work.pivot_table(
+        index=index_columns,
+        columns="Точка",
+        values="План",
+        aggfunc="sum",
+        fill_value=0,
+        observed=False,
+    ).reset_index()
+    point_columns = sorted(
+        [column for column in matrix.columns if str(column).startswith("Т")],
+        key=_archive_point_sort_key,
+    )
+    matrix = matrix[index_columns + point_columns]
+    matrix["Итого"] = matrix[point_columns].sum(axis=1) if point_columns else 0
+    matrix = matrix.sort_values(
+        ["Категория", "Название блюда", "SKU"],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    total_row: dict[str, object] = {
+        "Категория": "ВСЕГО",
+        "SKU": "",
+        "Название блюда": "",
+        "Цена": "",
+        "Итого": float(matrix["Итого"].sum()),
+    }
+    for column in point_columns:
+        total_row[column] = float(matrix[column].sum())
+    return pd.concat([matrix, pd.DataFrame([total_row])], ignore_index=True)
+
+
+def _archive_category_matrix(frame: pd.DataFrame) -> pd.DataFrame:
+    """Build category x point totals with total by category and by point."""
+    if frame.empty:
+        return pd.DataFrame()
+    work = frame.copy()
+    work["Категория"] = work["Категория"].replace("", "Не задана")
+    matrix = work.pivot_table(
+        index="Категория",
+        columns="Точка",
+        values="План",
+        aggfunc="sum",
+        fill_value=0,
+        observed=False,
+    ).reset_index()
+    point_columns = sorted(
+        [column for column in matrix.columns if str(column).startswith("Т")],
+        key=_archive_point_sort_key,
+    )
+    matrix = matrix[["Категория"] + point_columns]
+    matrix["Итого"] = matrix[point_columns].sum(axis=1) if point_columns else 0
+    matrix = matrix.sort_values("Категория", kind="stable").reset_index(drop=True)
+
+    total_row: dict[str, object] = {
+        "Категория": "ВСЕГО",
+        "Итого": float(matrix["Итого"].sum()),
+    }
+    for column in point_columns:
+        total_row[column] = float(matrix[column].sum())
+    return pd.concat([matrix, pd.DataFrame([total_row])], ignore_index=True)
+
+
+def _export_system_menu_archive_excel(
+    frame: pd.DataFrame,
+    menu_date_iso: str,
+    snapshot_id: str,
+) -> bytes:
+    """Export both matrices and the raw long archive rows to one XLSX."""
+    output = io.BytesIO()
+    sku_matrix = _archive_sku_matrix(frame)
+    category_matrix = _archive_category_matrix(frame)
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        sku_matrix.to_excel(writer, sheet_name="Меню по SKU", index=False)
+        category_matrix.to_excel(writer, sheet_name="Итоги категорий", index=False)
+        frame.to_excel(writer, sheet_name="Данные архива", index=False)
+
+        workbook = writer.book
+        for sheet_name in ["Меню по SKU", "Итоги категорий", "Данные архива"]:
+            ws = workbook[sheet_name]
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            for cell in ws[1]:
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            for column_cells in ws.columns:
+                letter = get_column_letter(column_cells[0].column)
+                max_length = max(
+                    len(str(cell.value or ""))
+                    for cell in list(column_cells)[:300]
+                )
+                ws.column_dimensions[letter].width = min(max(max_length + 2, 10), 42)
+
+        info = workbook.create_sheet("Информация", 0)
+        info.append(["Параметр", "Значение"])
+        info.append(["Дата меню", menu_date_iso])
+        info.append(["Снимок ID", snapshot_id])
+        info.append(["Строк архива", len(frame)])
+        info.append(["SKU", int(frame["SKU"].nunique()) if not frame.empty else 0])
+        info.append(["Точек", int(frame["Точка"].nunique()) if not frame.empty else 0])
+        info.append(["План, шт.", float(frame["План"].sum()) if not frame.empty else 0])
+        for cell in info[1]:
+            cell.font = Font(bold=True)
+        info.column_dimensions["A"].width = 24
+        info.column_dimensions["B"].width = 42
+
+    output.seek(0)
+    return output.getvalue()
 
 def _combo_matrix_signature(matrix_bytes: bytes, source: str) -> str:
     digest = hashlib.sha256(matrix_bytes).hexdigest() if matrix_bytes else "empty"
@@ -7117,6 +7360,7 @@ MENU_ITEMS = [
     ("Анализ категории", ":material/bar_chart:"),
     ("Окно свежести", ":material/calendar_month:"),
     ("Списания категорий", ":material/delete:"),
+    ("Архив меню", ":material/history:"),
     ("Прогноз плана", ":material/track_changes:"),
     ("Проверка", ":material/fact_check:"),
 ]
@@ -7499,7 +7743,7 @@ class _MainSection:
         return False
 
 
-tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_forecast, tab_plan_check = [
+tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_plan_check = [
     _MainSection(label) for label, _ in MENU_ITEMS
 ]
 
@@ -13522,6 +13766,140 @@ if tab_plan_check.open:
                         "В Excel сохраняется только выбранный блок меню. Текущие значения остаются как у категорийщика; "
                         "цвет показывает оценку системы, а в примечании каждой проверенной ячейки Т находится причина анализа. "
                         "Отсчёт свежести начинается на следующий день после даты отгрузки/плана."
+                    )
+
+
+if tab_menu_archive.open:
+    with tab_menu_archive:
+        st.subheader("Системный архив меню")
+        st.caption(
+            "История хранится отдельно от рабочих листов матрицы. Если старый месяц или неделя "
+            "удалены из текущей матрицы, уже сохранённая копия остаётся в системном архиве. "
+            "Приложение показывает последнюю сохранённую версию выбранной даты меню."
+        )
+
+        if not MENU_ARCHIVE_APPS_SCRIPT_URL:
+            st.error("Не указан MENU_ARCHIVE_APPS_SCRIPT_URL.")
+        elif not MENU_ARCHIVE_APPS_SCRIPT_KEY:
+            st.error(
+                "Архив подключён в приложении, но не задан секрет MENU_ARCHIVE_APPS_SCRIPT_KEY. "
+                "Добавьте ключ в Streamlit Secrets — в исходный app.py ключ специально не записывается."
+            )
+        else:
+            with st.spinner("Получаю сохранённые даты меню…"):
+                archive_dates, archive_dates_error = _fetch_system_menu_archive_dates(
+                    MENU_ARCHIVE_APPS_SCRIPT_URL,
+                    MENU_ARCHIVE_APPS_SCRIPT_KEY,
+                )
+
+            if archive_dates_error:
+                st.error(f"Не удалось получить список дат архива: {archive_dates_error}")
+            elif not archive_dates:
+                st.info("В системном архиве пока нет сохранённых дат меню.")
+            else:
+                st.success(
+                    f"Архив подключён · сохранено дат: {len(archive_dates)} · "
+                    f"{archive_dates[0]} — {archive_dates[-1]}"
+                )
+
+                archive_date_iso = st.selectbox(
+                    "Дата сохранённого меню",
+                    options=list(reversed(archive_dates)),
+                    format_func=lambda value: datetime.strptime(value, "%Y-%m-%d").strftime("%d.%m.%Y"),
+                    key="system_menu_archive_date_v751124",
+                )
+
+                with st.spinner("Загружаю меню из архива…"):
+                    archive_snapshot_id, archive_frame, archive_menu_error = _fetch_system_menu_archive_day(
+                        MENU_ARCHIVE_APPS_SCRIPT_URL,
+                        MENU_ARCHIVE_APPS_SCRIPT_KEY,
+                        archive_date_iso,
+                    )
+
+                if archive_menu_error:
+                    st.error(f"Не удалось загрузить меню за {archive_date_iso}: {archive_menu_error}")
+                elif archive_frame.empty:
+                    st.warning("Для выбранной даты архив не вернул строк меню.")
+                else:
+                    archive_metrics = st.columns(5)
+                    archive_metrics[0].metric("Дата меню", datetime.strptime(archive_date_iso, "%Y-%m-%d").strftime("%d.%m.%Y"))
+                    archive_metrics[1].metric("SKU", int(archive_frame["SKU"].nunique()))
+                    archive_metrics[2].metric("Категорий", int(archive_frame["Категория"].nunique()))
+                    archive_metrics[3].metric("Точек", int(archive_frame["Точка"].nunique()))
+                    archive_metrics[4].metric(
+                        "План, шт.",
+                        f"{archive_frame['План'].sum():,.0f}".replace(",", " "),
+                    )
+                    st.caption(f"Снимок: {archive_snapshot_id}")
+
+                    category_options = sorted(
+                        [value for value in archive_frame["Категория"].dropna().astype(str).unique() if value]
+                    )
+                    point_options = sorted(
+                        archive_frame["Точка"].dropna().astype(str).unique().tolist(),
+                        key=_archive_point_sort_key,
+                    )
+                    archive_filter_cols = st.columns(2)
+                    with archive_filter_cols[0]:
+                        archive_categories = st.multiselect(
+                            "Категории",
+                            options=category_options,
+                            default=category_options,
+                            key=f"system_menu_archive_categories_v751124_{archive_date_iso}",
+                        )
+                    with archive_filter_cols[1]:
+                        archive_points = st.multiselect(
+                            "Точки",
+                            options=point_options,
+                            default=point_options,
+                            key=f"system_menu_archive_points_v751124_{archive_date_iso}",
+                        )
+
+                    visible_archive = archive_frame[
+                        archive_frame["Категория"].isin(archive_categories)
+                        & archive_frame["Точка"].isin(archive_points)
+                    ].copy()
+
+                    if visible_archive.empty:
+                        st.info("По выбранным фильтрам строк нет.")
+                    else:
+                        st.markdown("#### Меню по SKU и точкам")
+                        st.dataframe(
+                            _archive_sku_matrix(visible_archive),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                        st.markdown("#### Итоги категорий по точкам")
+                        st.dataframe(
+                            _archive_category_matrix(visible_archive),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                        with st.expander("Исходные строки системного архива"):
+                            st.dataframe(
+                                visible_archive,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                    archive_excel = _export_system_menu_archive_excel(
+                        archive_frame,
+                        archive_date_iso,
+                        archive_snapshot_id,
+                    )
+                    st.download_button(
+                        "Скачать сохранённое меню (Excel)",
+                        data=archive_excel,
+                        file_name=f"архив_меню_{archive_date_iso}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        key="system_menu_archive_download_v751124",
+                    )
+                    st.caption(
+                        "В Excel: «Меню по SKU», «Итоги категорий» и исходные строки архива. "
+                        "Файл формируется из сохранённой копии и не зависит от того, что сейчас находится в матрице."
                     )
 
 
