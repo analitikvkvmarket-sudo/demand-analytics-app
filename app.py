@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.22-FORECAST-WEEKDAY-FRESHNESS-LOGIC"
+BUILD_ID = "75.11.23-FORECAST-THURSDAY-X1-POINTS"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -934,6 +934,7 @@ def forecast_coverage_days(category: object) -> int:
 
 
 FORECAST_UNCHANGED_FRESHNESS_POINTS = {3, 10, 20, 23, 27, 29}
+FORECAST_THURSDAY_X1_POINTS = {7, 8, 9, 12, 13, 15, 16, 18, 19, 21, 26, 28}
 
 
 def forecast_coverage_days_for_date(
@@ -947,10 +948,13 @@ def forecast_coverage_days_for_date(
     - воскресенье и понедельник: базовое окно свежести;
     - вторник и среда: базовое окно свежести минус 1 день;
     - четверг: полный жизненный цикл товара;
+    - в четверг для Т7, Т8, Т9, Т12, Т13, Т15, Т16, Т18, Т19, Т21, Т26 и Т28
+      используется множитель 1 вместо полного жизненного цикла;
     - пятница и суббота: базовое окно свежести (защитная логика для редких меню).
 
     Для Т3, Т10, Т20, Т23, Т27 и Т29 сохраняется прежняя логика: базовое
-    окно свежести не меняется в зависимости от дня недели.
+    окно свежести не меняется в зависимости от дня недели. Это правило имеет
+    приоритет над четверговым множителем 1.
     """
     base_freshness_days = forecast_coverage_days(category)
     lifecycle_days = product_lifecycle_days(category)
@@ -975,6 +979,11 @@ def forecast_coverage_days_for_date(
             f"{WEEKDAY_RU.get(weekday, '')}: окно свежести {base_freshness_days} дн. − 1 = {adjusted_days} дн.",
         )
     if weekday == 3:  # Чт
+        if point_number in FORECAST_THURSDAY_X1_POINTS:
+            return (
+                1,
+                f"Четверг · Т{point_number}: исключение — среднее SKU × 1.",
+            )
         return (
             lifecycle_days,
             f"Четверг: полный жизненный цикл товара {lifecycle_days} дн.",
