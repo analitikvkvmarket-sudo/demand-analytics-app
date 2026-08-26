@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.16-CATEGORY-SKU-ACTIVE-DAY-AVG"
+BUILD_ID = "75.11.17-WRITEOFF-CATEGORY-SKU-POINT-DRILLDOWN"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -10651,6 +10651,7 @@ if tab_sales_time.open:
             _load_matrix_context_for_active_tab()
         )
         st.session_state["freshness_category_source_v62"] = pd.DataFrame()
+        st.session_state["freshness_category_source_by_point_v63"] = pd.DataFrame()
         st.session_state["freshness_category_context_v62"] = None
         st.subheader("Окно свежести партии SKU")
         st.caption(
@@ -11348,6 +11349,9 @@ if tab_sales_time.open:
                         sales_time_menu["Количество для скорости"],
                     ).round(1)
                     sales_time_menu.insert(0, "Точка", ", ".join(selected_time_points))
+                # Для вкладки «Списания» сохраняем также несуммированную детализацию по каждой точке.
+                # Это позволяет раскрыть категорию до SKU, а SKU — до конкретных Т1–Т29.
+                st.session_state["freshness_category_source_by_point_v63"] = sales_time_menu_by_point.copy()
                 st.session_state["freshness_category_source_v62"] = sales_time_menu.copy()
                 st.session_state["freshness_category_context_v62"] = {
                     "start": shipment_start,
@@ -12146,10 +12150,14 @@ if tab_category_writeoffs.open:
         st.subheader("Списания по категориям и SKU")
         st.caption(
             "Расчёт использует период и точки из вкладки «Окно свежести». "
-            "Выберите одну, несколько или все категории."
+            "Нажмите категорию, чтобы увидеть суммарные списания по SKU; затем нажмите SKU, "
+            "чтобы раскрыть его в разрезе точек."
         )
         category_writeoff_source = st.session_state.get(
             "freshness_category_source_v62", pd.DataFrame()
+        )
+        category_writeoff_source_by_point = st.session_state.get(
+            "freshness_category_source_by_point_v63", pd.DataFrame()
         )
         category_writeoff_context = st.session_state.get("freshness_category_context_v62")
         if category_writeoff_source.empty:
@@ -12164,6 +12172,13 @@ if tab_category_writeoffs.open:
                     f"{category_writeoff_context['end']:%d.%m.%Y}; точки: "
                     f"{', '.join(category_writeoff_context['points'])}."
                 )
+
+            # В старой сессии отдельной детализации по точкам может ещё не быть.
+            # Для одной точки агрегированный источник эквивалентен; для нескольких точек
+            # пользователь получит полноценный разрез после повторного расчёта «Окна свежести».
+            if category_writeoff_source_by_point.empty:
+                category_writeoff_source_by_point = category_writeoff_source.copy()
+
             writeoff_category_options = sorted(
                 category_writeoff_source["Категория"].dropna().astype(str).unique().tolist()
             )
@@ -12184,9 +12199,14 @@ if tab_category_writeoffs.open:
                 key="writeoff_categories_v62",
                 placeholder="Выберите категории",
             )
+
             category_writeoff_detail = category_writeoff_source[
                 category_writeoff_source["Категория"].isin(selected_writeoff_categories)
             ].copy()
+            category_writeoff_by_point = category_writeoff_source_by_point[
+                category_writeoff_source_by_point["Категория"].isin(selected_writeoff_categories)
+            ].copy()
+
             if category_writeoff_detail.empty:
                 st.warning("Выберите хотя бы одну категорию.")
             else:
@@ -12203,6 +12223,7 @@ if tab_category_writeoffs.open:
                         }
                     )
                     .sort_values(["Списано, шт.", "Категория"], ascending=[False, True])
+                    .reset_index(drop=True)
                 )
                 category_writeoff_summary["Доля списания, %"] = (
                     safe_ratio(
@@ -12211,9 +12232,11 @@ if tab_category_writeoffs.open:
                     ) * 100
                 ).fillna(0.0).round(1)
 
-                writeoff_sku_summary = (
-                    category_writeoff_detail.groupby(
-                        ["Категория", "SKU", "Название товара"], as_index=False
+                # Суммарный SKU-уровень строим из исходной детализации по точкам,
+                # чтобы значения не зависели от экранного суммирования в «Окне свежести».
+                writeoff_sku_summary_all = (
+                    category_writeoff_by_point.groupby(
+                        ["Категория", "SKU", "Название товара"], as_index=False, dropna=False
                     )
                     .agg(
                         **{
@@ -12224,17 +12247,35 @@ if tab_category_writeoffs.open:
                             "Сумма списания, ₽": ("Убыток от списания, ₽", "sum"),
                         }
                     )
-                    .sort_values(
-                        ["Категория", "Списано, шт.", "Сумма списания, ₽"],
-                        ascending=[True, False, False],
-                    )
                 )
-                writeoff_sku_summary["Доля списания, %"] = (
+                writeoff_sku_summary_all["Доля списания, %"] = (
                     safe_ratio(
-                        writeoff_sku_summary["Списано, шт."],
-                        writeoff_sku_summary["Отгружено, шт."],
+                        writeoff_sku_summary_all["Списано, шт."],
+                        writeoff_sku_summary_all["Отгружено, шт."],
                     ) * 100
                 ).fillna(0.0).round(1)
+                writeoff_sku_summary = writeoff_sku_summary_all[
+                    pd.to_numeric(writeoff_sku_summary_all["Списано, шт."], errors="coerce").fillna(0) > 0
+                ].copy()
+                writeoff_sku_summary = writeoff_sku_summary.sort_values(
+                    ["Категория", "Списано, шт.", "Сумма списания, ₽"],
+                    ascending=[True, False, False],
+                ).reset_index(drop=True)
+
+                sku_with_writeoff_counts = (
+                    writeoff_sku_summary.groupby("Категория")["SKU"].nunique()
+                    if not writeoff_sku_summary.empty else pd.Series(dtype="int64")
+                )
+                category_writeoff_summary["SKU со списанием"] = (
+                    category_writeoff_summary["Категория"].map(sku_with_writeoff_counts).fillna(0).astype(int)
+                )
+                # Ставим показатель рядом с общим числом SKU.
+                category_cols = list(category_writeoff_summary.columns)
+                if "SKU со списанием" in category_cols:
+                    category_cols.remove("SKU со списанием")
+                    sku_pos = category_cols.index("SKU") + 1 if "SKU" in category_cols else 1
+                    category_cols.insert(sku_pos, "SKU со списанием")
+                    category_writeoff_summary = category_writeoff_summary[category_cols]
 
                 total_plan_quantity = category_writeoff_summary["Отгружено, шт."].sum()
                 total_writeoff_quantity = category_writeoff_summary["Списано, шт."].sum()
@@ -12263,34 +12304,179 @@ if tab_category_writeoffs.open:
                     color_continuous_scale=["#70AD47", "#FFD966", "#F8696B", "#C00000"],
                     text_auto=".0f",
                     title="Количество и доля списаний по категориям",
-                    hover_data=["Отгружено, шт.", "Сумма списания, ₽"],
+                    hover_data=["Отгружено, шт.", "Сумма списания, ₽", "SKU со списанием"],
                 )
                 writeoff_chart.update_layout(height=440)
                 st.plotly_chart(writeoff_chart, use_container_width=True)
 
                 st.markdown("#### Итог по категориям")
-                st.dataframe(
+                st.caption(
+                    "Нажмите строку категории — ниже откроется суммарный список SKU, по которым было списание."
+                )
+                category_writeoff_selection = st.dataframe(
                     category_writeoff_summary,
                     use_container_width=True,
                     hide_index=True,
+                    height=min(620, 38 * len(category_writeoff_summary) + 80),
+                    on_select="rerun",
+                    selection_mode="single-row",
+                    key="writeoff_category_select_v63",
                     column_config={
+                        "SKU": st.column_config.NumberColumn(format="%d"),
+                        "SKU со списанием": st.column_config.NumberColumn(format="%d"),
                         "Доля списания, %": st.column_config.NumberColumn(format="%.1f%%"),
                         "Выручка, ₽": st.column_config.NumberColumn(format="%.2f"),
                         "Сумма списания, ₽": st.column_config.NumberColumn(format="%.2f"),
                     },
                 )
-                st.markdown("#### SKU внутри выбранных категорий")
-                st.dataframe(
-                    writeoff_sku_summary,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=min(760, 36 * len(writeoff_sku_summary) + 80),
-                    column_config={
-                        "Доля списания, %": st.column_config.NumberColumn(format="%.1f%%"),
-                        "Выручка, ₽": st.column_config.NumberColumn(format="%.2f"),
-                        "Сумма списания, ₽": st.column_config.NumberColumn(format="%.2f"),
-                    },
+
+                selected_category_rows = list(
+                    getattr(category_writeoff_selection.selection, "rows", []) or []
                 )
+                selected_writeoff_category = None
+                selected_writeoff_sku = None
+                if selected_category_rows:
+                    selected_category_index = int(selected_category_rows[0])
+                    if 0 <= selected_category_index < len(category_writeoff_summary):
+                        selected_writeoff_category = str(
+                            category_writeoff_summary.iloc[selected_category_index]["Категория"]
+                        )
+
+                if selected_writeoff_category:
+                    selected_category_sku = writeoff_sku_summary[
+                        writeoff_sku_summary["Категория"].astype(str).eq(selected_writeoff_category)
+                    ].copy().reset_index(drop=True)
+                    st.markdown(
+                        f"#### SKU списания категории «{selected_writeoff_category}» · суммарно"
+                    )
+                    if selected_category_sku.empty:
+                        st.info("В выбранной категории за этот период фактических списаний нет.")
+                    else:
+                        st.caption(
+                            "Значения SKU суммированы по всем выбранным точкам. Нажмите SKU — ниже появится разрез по точкам."
+                        )
+                        sku_writeoff_selection = st.dataframe(
+                            selected_category_sku,
+                            use_container_width=True,
+                            hide_index=True,
+                            height=min(650, 38 * len(selected_category_sku) + 80),
+                            on_select="rerun",
+                            selection_mode="single-row",
+                            key="writeoff_sku_select_v63",
+                            column_config={
+                                "Доля списания, %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "Выручка, ₽": st.column_config.NumberColumn(format="%.2f"),
+                                "Сумма списания, ₽": st.column_config.NumberColumn(format="%.2f"),
+                            },
+                        )
+                        selected_sku_rows = list(
+                            getattr(sku_writeoff_selection.selection, "rows", []) or []
+                        )
+                        if selected_sku_rows:
+                            selected_sku_index = int(selected_sku_rows[0])
+                            if 0 <= selected_sku_index < len(selected_category_sku):
+                                selected_writeoff_sku = str(
+                                    selected_category_sku.iloc[selected_sku_index]["SKU"]
+                                )
+                                selected_writeoff_name = str(
+                                    selected_category_sku.iloc[selected_sku_index]["Название товара"]
+                                )
+
+                                sku_point_detail = category_writeoff_by_point[
+                                    category_writeoff_by_point["Категория"].astype(str).eq(selected_writeoff_category)
+                                    & category_writeoff_by_point["SKU"].astype(str).eq(selected_writeoff_sku)
+                                ].copy()
+                                if not sku_point_detail.empty:
+                                    point_group_columns = ["Точка"]
+                                    sku_point_summary = (
+                                        sku_point_detail.groupby(
+                                            point_group_columns, as_index=False, dropna=False
+                                        )
+                                        .agg(
+                                            **{
+                                                "Отгружено, шт.": ("Отгружено по плану", "sum"),
+                                                "Продано за срок, шт.": ("Продано за срок", "sum"),
+                                                "Списано, шт.": ("Списания", "sum"),
+                                                "Выручка, ₽": ("Выручка SKU, ₽", "sum"),
+                                                "Сумма списания, ₽": ("Убыток от списания, ₽", "sum"),
+                                            }
+                                        )
+                                    )
+                                    sku_point_summary["Доля списания, %"] = (
+                                        safe_ratio(
+                                            sku_point_summary["Списано, шт."],
+                                            sku_point_summary["Отгружено, шт."],
+                                        ) * 100
+                                    ).fillna(0.0).round(1)
+                                    sku_point_summary = sku_point_summary.sort_values(
+                                        ["Списано, шт.", "Сумма списания, ₽", "Точка"],
+                                        ascending=[False, False, True],
+                                    ).reset_index(drop=True)
+
+                                    st.markdown(
+                                        f"#### SKU {selected_writeoff_sku} · {selected_writeoff_name} · по точкам"
+                                    )
+                                    st.caption(
+                                        "Показаны все выбранные точки, где этот SKU был в плане. "
+                                        "Нулевое списание оставлено для сравнения между точками."
+                                    )
+                                    st.dataframe(
+                                        sku_point_summary,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        height=min(560, 38 * len(sku_point_summary) + 80),
+                                        column_config={
+                                            "Доля списания, %": st.column_config.NumberColumn(format="%.1f%%"),
+                                            "Выручка, ₽": st.column_config.NumberColumn(format="%.2f"),
+                                            "Сумма списания, ₽": st.column_config.NumberColumn(format="%.2f"),
+                                        },
+                                    )
+                                else:
+                                    st.info("Для выбранного SKU нет детализации по точкам.")
+
+                # Полная выгрузка сохраняет иерархию: категории -> SKU со списанием -> точки.
+                writeoff_point_export = (
+                    category_writeoff_by_point.groupby(
+                        ["Категория", "SKU", "Название товара", "Точка"],
+                        as_index=False,
+                        dropna=False,
+                    )
+                    .agg(
+                        **{
+                            "Отгружено, шт.": ("Отгружено по плану", "sum"),
+                            "Продано за срок, шт.": ("Продано за срок", "sum"),
+                            "Списано, шт.": ("Списания", "sum"),
+                            "Выручка, ₽": ("Выручка SKU, ₽", "sum"),
+                            "Сумма списания, ₽": ("Убыток от списания, ₽", "sum"),
+                        }
+                    )
+                )
+                writeoff_point_export["Доля списания, %"] = (
+                    safe_ratio(
+                        writeoff_point_export["Списано, шт."],
+                        writeoff_point_export["Отгружено, шт."],
+                    ) * 100
+                ).fillna(0.0).round(1)
+                if not writeoff_sku_summary.empty and not writeoff_point_export.empty:
+                    affected_keys = set(
+                        zip(
+                            writeoff_sku_summary["Категория"].astype(str),
+                            writeoff_sku_summary["SKU"].astype(str),
+                        )
+                    )
+                    writeoff_point_export = writeoff_point_export[
+                        [
+                            (str(category), str(sku)) in affected_keys
+                            for category, sku in zip(
+                                writeoff_point_export["Категория"],
+                                writeoff_point_export["SKU"],
+                            )
+                        ]
+                    ].copy()
+                writeoff_point_export = writeoff_point_export.sort_values(
+                    ["Категория", "SKU", "Списано, шт.", "Точка"],
+                    ascending=[True, True, False, True],
+                ).reset_index(drop=True)
 
                 writeoff_export_buffer = io.BytesIO()
                 with pd.ExcelWriter(writeoff_export_buffer, engine="openpyxl") as writer:
@@ -12298,7 +12484,10 @@ if tab_category_writeoffs.open:
                         writer, sheet_name="Итог по категориям", index=False
                     )
                     writeoff_sku_summary.to_excel(
-                        writer, sheet_name="SKU внутри категорий", index=False
+                        writer, sheet_name="SKU списания суммарно", index=False
+                    )
+                    writeoff_point_export.to_excel(
+                        writer, sheet_name="SKU по точкам", index=False
                     )
                     for worksheet in writer.book.worksheets:
                         worksheet.freeze_panes = "A2"
@@ -12307,16 +12496,16 @@ if tab_category_writeoffs.open:
                             width = min(max(len(str(cell.value or "")) for cell in cells) + 2, 42)
                             worksheet.column_dimensions[cells[0].column_letter].width = width
                 st.download_button(
-                    "Скачать списания по категориям и SKU (Excel)",
+                    "Скачать списания: категории, SKU и точки (Excel)",
                     data=writeoff_export_buffer.getvalue(),
                     file_name=(
-                        f"списания_по_категориям_"
+                        f"списания_категории_SKU_точки_"
                         f"{category_writeoff_context['start']:%Y-%m-%d}_"
                         f"{category_writeoff_context['end']:%Y-%m-%d}.xlsx"
-                        if category_writeoff_context else "списания_по_категориям.xlsx"
+                        if category_writeoff_context else "списания_категории_SKU_точки.xlsx"
                     ),
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_category_writeoffs_v62",
+                    key="download_category_writeoffs_v63",
                 )
 
 
