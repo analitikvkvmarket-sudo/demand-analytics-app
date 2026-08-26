@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.21-CATEGORY-POINT-AVG-TITLE-PERIOD-WEEKDAY"
+BUILD_ID = "75.11.22-FORECAST-WEEKDAY-FRESHNESS-LOGIC"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -922,7 +922,7 @@ def product_green_days(category: object) -> int:
 
 
 def forecast_coverage_days(category: object) -> int:
-    """Возвращает множитель среднего SKU, используемый только в прогнозе плана."""
+    """Базовое окно свежести для прогноза плана (прежняя логика)."""
     normalized = normalize_matrix_category(category)
     if normalized == "Япония":
         return 1
@@ -931,6 +931,59 @@ def forecast_coverage_days(category: object) -> int:
     if normalized == "Напитки":
         return 4
     return 2
+
+
+FORECAST_UNCHANGED_FRESHNESS_POINTS = {3, 10, 20, 23, 27, 29}
+
+
+def forecast_coverage_days_for_date(
+    category: object,
+    target_date: date,
+    point_number: int,
+) -> tuple[int, str]:
+    """Возвращает дни покрытия для прогноза с учётом дня недели и точки.
+
+    Новая логика для обычных точек:
+    - воскресенье и понедельник: базовое окно свежести;
+    - вторник и среда: базовое окно свежести минус 1 день;
+    - четверг: полный жизненный цикл товара;
+    - пятница и суббота: базовое окно свежести (защитная логика для редких меню).
+
+    Для Т3, Т10, Т20, Т23, Т27 и Т29 сохраняется прежняя логика: базовое
+    окно свежести не меняется в зависимости от дня недели.
+    """
+    base_freshness_days = forecast_coverage_days(category)
+    lifecycle_days = product_lifecycle_days(category)
+    point_number = int(point_number)
+
+    if point_number in FORECAST_UNCHANGED_FRESHNESS_POINTS:
+        return (
+            base_freshness_days,
+            f"Т{point_number}: исключение — прежнее окно свежести {base_freshness_days} дн.",
+        )
+
+    weekday = target_date.weekday()
+    if weekday in (6, 0):  # Вс, Пн
+        return (
+            base_freshness_days,
+            f"{WEEKDAY_RU.get(weekday, '')}: окно свежести {base_freshness_days} дн.",
+        )
+    if weekday in (1, 2):  # Вт, Ср
+        adjusted_days = max(1, base_freshness_days - 1)
+        return (
+            adjusted_days,
+            f"{WEEKDAY_RU.get(weekday, '')}: окно свежести {base_freshness_days} дн. − 1 = {adjusted_days} дн.",
+        )
+    if weekday == 3:  # Чт
+        return (
+            lifecycle_days,
+            f"Четверг: полный жизненный цикл товара {lifecycle_days} дн.",
+        )
+
+    return (
+        base_freshness_days,
+        f"{WEEKDAY_RU.get(weekday, '')}: используется базовое окно свежести {base_freshness_days} дн.",
+    )
 
 
 def parse_excel_date(value: object) -> date | None:
@@ -2003,14 +2056,19 @@ def calculate_sku_daily_forecast(
             low_sales_day_count = sale_days in (1, 2)
             average_per_sale_day = sold_total / sale_days if sale_days else 1.0
             lifecycle_days = product_lifecycle_days(item["category"])
-            coverage_days = forecast_coverage_days(item["category"])
+            base_freshness_days = forecast_coverage_days(item["category"])
+            coverage_days, weekday_coverage_rule = forecast_coverage_days_for_date(
+                item["category"],
+                target_date,
+                point_number,
+            )
             average_rule = (
                 "продаж не было, принято базовое среднее 1 шт./день"
                 if used_default_average
                 else "среднее рассчитано по фактическим дням продаж"
             )
             coverage_rule = (
-                f"{average_rule}; загрузка по категории: "
+                f"{average_rule}; {weekday_coverage_rule}; "
                 f"среднее SKU × {coverage_days} дн."
             )
 
@@ -2045,8 +2103,10 @@ def calculate_sku_daily_forecast(
                         else pd.NA
                     ),
                     "Жизненный цикл, дней": lifecycle_days,
+                    "Базовое окно свежести, дней": base_freshness_days,
                     "Дней покрытия поставкой": coverage_days,
                     "Идеальный жизненный цикл для плана, дней": coverage_days,
+                    "Правило дня недели": weekday_coverage_rule,
                     "Правило расчёта": coverage_rule,
                     "Расчётная потребность": (
                         round(float(calculated_need), 2)
@@ -2650,6 +2710,7 @@ def fill_forecast_into_matrix(
                         f"Дней с продажами за период ({period_label}): {sale_days}\n"
                         f"Основание среднего: {record['Статус прогноза']}\n"
                         f"Идеальный цикл поставки: {int(record['Дней покрытия поставкой'])} дн.\n"
+                        f"Правило дня: {record.get('Правило дня недели', '')}\n"
                         f"Срок категории: {int(record['Жизненный цикл, дней'])} дн.\n"
                         f"Расчёт: {float(record['Расчётная потребность']):.2f} → "
                         f"{int(record['Рекомендованный план'])}"
@@ -13621,6 +13682,11 @@ if tab_forecast.open:
                         f"Период среднего: {int(lookback_weeks)} нед. ({int(lookback_weeks) * 7} дн.). "
                         "Для каждой даты используется меню именно её блока и отдельное историческое окно "
                         "непосредственно перед этой датой."
+                    )
+                    st.caption(
+                        "Цикл прогноза: Вс/Пн — окно свежести; Вт/Ср — окно свежести − 1 день "
+                        "(минимум 1 день); Чт — полный жизненный цикл товара. "
+                        "Исключения Т3, Т10, Т20, Т23, Т27, Т29: прежнее окно свежести без изменения."
                     )
 
                     forecast_button = st.button(
