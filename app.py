@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.27-FRESHNESS-CATEGORY-MENU"
+BUILD_ID = "75.11.28-FRESHNESS-CATEGORY-ALL-POINTS"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -4087,6 +4087,97 @@ def prepare_freshness_category_menu_view(
         .drop(columns=["_point_sort", "_category_sort"])
         .reset_index(drop=True)
     )
+
+def prepare_freshness_category_all_points_view(
+    point_rows: pd.DataFrame,
+    as_of_date: date | None = None,
+) -> pd.DataFrame:
+    """Агрегирует окно свежести до уровня дата меню + категория по всем выбранным точкам."""
+    as_of_date = as_of_date or date.today()
+    if point_rows is None or point_rows.empty:
+        return pd.DataFrame()
+
+    work = point_rows.copy()
+    work["Отгружено по плану"] = pd.to_numeric(
+        work.get("Отгружено по плану"), errors="coerce"
+    ).fillna(0.0)
+    work = work[work["Отгружено по плану"] > 0].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    for column in FRESHNESS_POINT_DAY_COLUMNS:
+        work[column] = pd.to_numeric(work.get(column), errors="coerce").fillna(0.0)
+    for column in [
+        "Продано в зелёный период", "Продано за срок", "Расчётный остаток",
+    ]:
+        work[column] = pd.to_numeric(work.get(column), errors="coerce").fillna(0.0)
+
+    work["Дата меню"] = pd.to_datetime(work.get("Дата отгрузки"), errors="coerce")
+    work["Категория"] = work.get(
+        "Категория", pd.Series(index=work.index, dtype=object)
+    ).fillna("Не сопоставлено").astype(str)
+    work["SKU"] = work.get("SKU", pd.Series(index=work.index, dtype=object)).fillna("").astype(str)
+    work["Точка"] = work.get("Точка", pd.Series(index=work.index, dtype=object)).fillna("").astype(str)
+
+    agg_map: dict[str, tuple[str, str]] = {
+        "Точек с меню": ("Точка", "nunique"),
+        "Позиций в меню": ("SKU", "nunique"),
+        "План, шт.": ("Отгружено по плану", "sum"),
+        "Продано в свежесть, шт.": ("Продано в зелёный период", "sum"),
+        "Продано за срок, шт.": ("Продано за срок", "sum"),
+        "Остаток, шт.": ("Расчётный остаток", "sum"),
+    }
+    for column in FRESHNESS_POINT_DAY_COLUMNS:
+        agg_map[column] = (column, "sum")
+
+    grouped = (
+        work.groupby(["Дата меню", "Категория"], as_index=False, dropna=False)
+        .agg(**agg_map)
+    )
+    grouped["Реализация в свежесть, %"] = safe_ratio(
+        grouped["Продано в свежесть, шт."], grouped["План, шт."]
+    ).mul(100).round(1)
+    grouped["Реализация за срок, %"] = safe_ratio(
+        grouped["Продано за срок, шт."], grouped["План, шт."]
+    ).mul(100).round(1)
+    grouped["Остаток, %"] = safe_ratio(
+        grouped["Остаток, шт."], grouped["План, шт."]
+    ).mul(100).round(1)
+
+    display = grouped.copy()
+    for column in FRESHNESS_POINT_DAY_COLUMNS:
+        display[column] = display[column].map(
+            lambda value: f"{float(value):,.0f}".replace(",", " ")
+        ).astype(object)
+
+    for row_index, row in display.iterrows():
+        category = row.get("Категория", "")
+        shelf_days = product_lifecycle_days(category)
+        menu_date_ts = pd.to_datetime(row.get("Дата меню"), errors="coerce")
+        for day_number, column in enumerate(FRESHNESS_POINT_DAY_COLUMNS, start=1):
+            if day_number > shelf_days:
+                display.at[row_index, column] = "—"
+                continue
+            if pd.notna(menu_date_ts):
+                fact_date = menu_date_ts.date() + timedelta(days=day_number)
+                if fact_date > as_of_date:
+                    display.at[row_index, column] = "—"
+
+    display["_category_sort"] = display["Категория"].map(
+        {
+            "Завтраки": 0, "Салаты": 1, "Супы": 2, "Вторые блюда": 3,
+            "Сэндвичи": 4, "Япония": 5, "Десерты": 6, "Напитки": 7, "Хлеб": 8,
+        }
+    ).fillna(99)
+    return (
+        display.sort_values(
+            ["Дата меню", "_category_sort", "Категория"],
+            kind="stable",
+        )
+        .drop(columns=["_category_sort"])
+        .reset_index(drop=True)
+    )
+
 
 def build_freshness_point_menu_excel(
     point_rows: pd.DataFrame,
@@ -12204,6 +12295,9 @@ if tab_sales_time.open:
                 selected_shop_numbers = tuple(
                     point_to_shop[label] for label in selected_time_points
                 )
+                # Для общей таблицы категорий нужны все доступные точки, независимо от фильтра "Точки".
+                all_time_point_numbers = [int(label[1:]) for label in available_point_labels]
+                all_time_shop_numbers = tuple(point_to_shop[label] for label in available_point_labels)
                 selected_plan_rows = period_plans[
                     period_plans["point_number"].isin(selected_point_numbers)
                 ].copy()
@@ -12540,7 +12634,7 @@ if tab_sales_time.open:
                                 },
                             )
 
-                if selected_shop_numbers:
+                if all_time_shop_numbers:
                     try:
                         history_start_for_freshness = shipment_start - timedelta(days=8)
                         history_end_for_freshness = shipment_end + timedelta(days=8)
@@ -12551,10 +12645,12 @@ if tab_sales_time.open:
                             history_end_for_freshness = max(
                                 history_end_for_freshness, selected_stock_date + timedelta(days=1)
                             )
+                        # История загружается сразу по всем доступным точкам: она нужна для общей
+                        # таблицы категорий, даже если в фильтре для детализации выбрана одна точка.
                         time_sales = load_forecast_history(
                             history_start_for_freshness,
                             history_end_for_freshness,
-                            selected_shop_numbers,
+                            all_time_shop_numbers,
                         )
                     except Exception as error:
                         st.error(f"Не удалось загрузить продажи партии: {error}")
@@ -12563,8 +12659,10 @@ if tab_sales_time.open:
                     time_sales = pd.DataFrame()
 
                 point_results: list[pd.DataFrame] = []
+                all_point_results: list[pd.DataFrame] = []
+                selected_time_point_set = set(selected_time_points)
                 for point_label, point_number, shop_number in zip(
-                    selected_time_points, selected_point_numbers, selected_shop_numbers
+                    available_point_labels, all_time_point_numbers, all_time_shop_numbers
                 ):
                     point_plan_rows = sales_time_plans[
                         (sales_time_plans["point_number"] == point_number)
@@ -12584,11 +12682,17 @@ if tab_sales_time.open:
                     )
                     if not point_result.empty:
                         point_result.insert(0, "Точка", point_label)
-                        point_results.append(point_result)
+                        all_point_results.append(point_result)
+                        if point_label in selected_time_point_set:
+                            point_results.append(point_result.copy())
 
                 sales_time_menu = (
                     pd.concat(point_results, ignore_index=True)
                     if point_results else pd.DataFrame()
+                )
+                sales_time_menu_all_points = (
+                    pd.concat(all_point_results, ignore_index=True)
+                    if all_point_results else pd.DataFrame()
                 )
                 # Сохраняем исходную детализацию по каждой точке до суммирования.
                 # Верхняя таблица партий по-прежнему показывает общий итог по выбранным точкам,
@@ -12637,6 +12741,47 @@ if tab_sales_time.open:
                                 styles[position] = "background-color: #F2F2F2; color: #B7B7B7"
                         return styles
 
+                    # 75.11.28: отдельная сводка по категориям суммарно по всем выбранным точкам.
+                    category_all_points_view = prepare_freshness_category_all_points_view(
+                        sales_time_menu_all_points,
+                        as_of_date=date.today(),
+                    )
+                    st.markdown("##### Все точки · суммарно по категориям")
+                    st.caption(
+                        "Таблица всегда суммирует все доступные точки меню, независимо от фильтра «Точки» выше. "
+                        "Каждая строка — категория и дата меню; план, продажи по дням свежести, продажи за срок "
+                        "и остаток — общий итог по всем точкам без детализации SKU."
+                    )
+                    if category_all_points_view.empty:
+                        st.info("Нет данных для общей сводки категорий по выбранным точкам.")
+                    else:
+                        all_points_screen, all_points_limit, all_points_truncated = styler_safe_preview(
+                            category_all_points_view
+                        )
+                        if all_points_truncated:
+                            st.info(
+                                f"Показаны первые {all_points_limit:,} строк из {len(category_all_points_view):,}.".replace(",", " ")
+                            )
+                        st.dataframe(
+                            all_points_screen.style.apply(style_freshness_category_menu, axis=1),
+                            use_container_width=True,
+                            hide_index=True,
+                            height=min(620, 38 * len(all_points_screen) + 80),
+                            column_config={
+                                "Дата меню": st.column_config.DateColumn("Дата меню", format="DD.MM.YYYY"),
+                                "Точек с меню": st.column_config.NumberColumn("Точек с меню", format="%d"),
+                                "Позиций в меню": st.column_config.NumberColumn("Позиций в меню", format="%d"),
+                                "План, шт.": st.column_config.NumberColumn("План, шт.", format="%.0f"),
+                                "Продано в свежесть, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                "Продано за срок, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                "Остаток, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                "Реализация в свежесть, %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "Реализация за срок, %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "Остаток, %": st.column_config.NumberColumn(format="%.1f%%"),
+                            },
+                        )
+
+                    st.markdown("##### По каждой точке отдельно")
                     category_point_order = [
                         point for point in selected_time_points
                         if point in set(category_menu_view["Точка"].dropna().astype(str))
