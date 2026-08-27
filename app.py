@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.25-SYSTEM-MENU-ARCHIVE-HISTORICAL-IMPORT"
+BUILD_ID = "75.11.26-ABC-CATEGORY-ENTITY"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -4467,11 +4467,12 @@ def calculate_product_abc(sales: pd.DataFrame, entities: pd.DataFrame) -> pd.Dat
     ).fillna(0.0)
     source["revenue"] = pd.to_numeric(source["revenue"], errors="coerce").fillna(0.0)
     source = source.merge(
-        entities[["sku", "category"]], on="sku", how="left", validate="many_to_one"
+        entities[["sku", "category", "entity"]], on="sku", how="left", validate="many_to_one"
     )
     source["category"] = source["category"].fillna("Не сопоставлено")
+    source["entity"] = source["entity"].fillna("Не задана")
     summary = (
-        source.groupby(["category", "sku"], as_index=False, dropna=False)
+        source.groupby(["category", "entity", "sku"], as_index=False, dropna=False)
         .agg(
             product_name=("product_name", "last"),
             sold_quantity=("sold_quantity", "sum"),
@@ -4521,11 +4522,11 @@ def calculate_product_abc(sales: pd.DataFrame, entities: pd.DataFrame) -> pd.Dat
     result = quantity_rank.merge(
         revenue_rank[
             [
-                "category", "sku", "revenue_share_category", "revenue_cumulative_share",
+                "category", "entity", "sku", "revenue_share_category", "revenue_cumulative_share",
                 "abc_revenue", "revenue_rank",
             ]
         ],
-        on=["category", "sku"],
+        on=["category", "entity", "sku"],
         how="left",
         validate="one_to_one",
     )
@@ -10875,6 +10876,7 @@ if tab_abc.open:
                 abc_display = abc_linked_filtered.rename(
                     columns={
                         "category": "Категория",
+                        "entity": "Сущность",
                         "sku": "SKU",
                         "product_name": "Наименование продукции",
                         "sold_quantity": "Количество продаж, шт.",
@@ -10896,7 +10898,7 @@ if tab_abc.open:
                 ]:
                     abc_display[abc_percent_column] = abc_display[abc_percent_column] * 100
                 abc_display_columns = [
-                    "Категория", "SKU", "Наименование продукции", "Количество продаж, шт.",
+                    "Категория", "Сущность", "SKU", "Наименование продукции", "Количество продаж, шт.",
                     "Сумма дохода, ₽", "Ранг по количеству", "Доля количества в категории",
                     "Накопительная доля количества", "ABC количество", "Ранг по доходу",
                     "Доля дохода в категории", "Накопительная доля дохода", "ABC доход",
@@ -10905,7 +10907,8 @@ if tab_abc.open:
                 st.markdown("#### ABC продукции внутри категорий")
                 st.caption(
                     "Таблица связана с плашкой «Категории для отдельного анализа». "
-                    "Она показывает конкретные SKU только из выбранных категорий."
+                    "Она показывает конкретные SKU только из выбранных категорий; "
+                    "сущность берётся из актуального листа «Справочник + атрибуты» матрицы 2.3."
                 )
                 def abc_cell_style(value: object) -> str:
                     text = str(value).strip().upper()
