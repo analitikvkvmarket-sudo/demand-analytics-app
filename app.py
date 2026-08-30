@@ -99,7 +99,7 @@ COMBO_MATRIX_FILE = resolve_app_file("combo_matrix.xlsx", "матрица", "к�
 AUTO_UNIT_FILE = resolve_app_file("auto_unit_points_vm.xlsx", "авто юнит", "auto_unit", "точки вм")
 MATRIX_APPS_SCRIPT_URL = os.getenv(
     "MATRIX_APPS_SCRIPT_URL",
-    "https://script.google.com/macros/s/AKfycbxzpVJGvkHTn8YogBOLO4PtvdQqmkoMx-chNCZ2ijmMIRc_-kcd2WUQ283PNyo5hCo/exec",
+    "https://script.google.com/macros/s/AKfycbyer2zkKceEFHggByDZncQjpYRNFwZJmvZ3-82PYxV2vbDeUvNY2WriHGBklSZuMbpc/exec",
 ).strip()
 MATRIX_APPS_SCRIPT_KEY = os.getenv(
     "MATRIX_APPS_SCRIPT_KEY",
@@ -1525,8 +1525,7 @@ def forecast_coverage_days_for_date(
 
     Новая логика для обычных точек:
     - воскресенье и понедельник: базовое окно свежести;
-    - вторник: базовое окно свежести минус 1 день;
-    - среда: базовое окно свежести без уменьшения;
+    - вторник и среда: базовое окно свежести минус 1 день;
     - четверг: полный жизненный цикл товара;
     - в четверг для Т7, Т8, Т9, Т12, Т13, Т15, Т16, Т18, Т19, Т21, Т26 и Т28
       используется множитель 1 вместо полного жизненного цикла;
@@ -1552,16 +1551,11 @@ def forecast_coverage_days_for_date(
             base_freshness_days,
             f"{WEEKDAY_RU.get(weekday, '')}: окно свежести {base_freshness_days} дн.",
         )
-    if weekday == 1:  # Вт
+    if weekday in (1, 2):  # Вт, Ср
         adjusted_days = max(1, base_freshness_days - 1)
         return (
             adjusted_days,
-            f"Вторник: окно свежести {base_freshness_days} дн. − 1 = {adjusted_days} дн.",
-        )
-    if weekday == 2:  # Ср
-        return (
-            base_freshness_days,
-            f"Среда: обычное окно свежести {base_freshness_days} дн.",
+            f"{WEEKDAY_RU.get(weekday, '')}: окно свежести {base_freshness_days} дн. − 1 = {adjusted_days} дн.",
         )
     if weekday == 3:  # Чт
         if point_number in FORECAST_THURSDAY_X1_POINTS:
@@ -11140,28 +11134,40 @@ if tab_abc.open:
 
 if tab_category_analysis.open:
     with tab_category_analysis:
-        st.subheader("Категории за 4 недели от выбранной даты")
+        st.subheader("Категории по неделям месяца")
         st.caption(
-            "Укажите дату начала отчёта. Она входит в Неделю 1. Далее строятся ровно "
-            "четыре последовательные недели по 7 дней, поэтому каждая новая неделя "
-            "начинается в тот же день недели. В ячейке показаны количество и выручка "
-            "по всем точкам суммарно; нажмите на значение, чтобы открыть детализацию по точкам."
+            "Выберите месяц. Каждая строка — категория, колонки — недели 1–4. "
+            "В ячейке показаны продажи и выручка по всем точкам суммарно. "
+            "Недели считаются так: 1-я — 1–7, 2-я — 8–14, 3-я — 15–21, "
+            "4-я — с 22-го числа до конца месяца. Нажмите на сумму недели, "
+            "чтобы открыть детализацию по каждой точке."
         )
 
-        four_week_default_start = period[1] - timedelta(days=27)
-        selected_four_week_start = st.date_input(
-            "Дата начала отчёта",
-            value=four_week_default_start,
-            key="category_four_weeks_start_v2",
-            help="Выбранная дата включается в Неделю 1. Отчёт охватывает 28 календарных дней.",
+        month_week_anchor = date.today().replace(day=1)
+        month_week_options = [
+            (pd.Timestamp(month_week_anchor) - pd.DateOffset(months=offset)).date()
+            for offset in range(24)
+        ]
+        month_week_default = date(period[1].year, period[1].month, 1)
+        if month_week_default not in month_week_options:
+            month_week_options.append(month_week_default)
+            month_week_options = sorted(set(month_week_options), reverse=True)
+        try:
+            month_week_default_index = month_week_options.index(month_week_default)
+        except ValueError:
+            month_week_default_index = 0
+
+        selected_month_week = st.selectbox(
+            "Месяц",
+            month_week_options,
+            index=month_week_default_index,
+            format_func=lambda value: f"{MONTH_NAMES_RU.get(value.month, value.month)} {value.year}",
+            key="category_month_week_month_v1",
         )
-        four_week_end = selected_four_week_start + timedelta(days=27)
-        four_week_end_exclusive = four_week_end + timedelta(days=1)
-        weekday_short_ru = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
-        st.info(
-            f"Период отчёта: {selected_four_week_start:%d.%m.%Y}–{four_week_end:%d.%m.%Y} · "
-            f"каждая неделя начинается в {weekday_short_ru[selected_four_week_start.weekday()]}."
-        )
+        month_week_next_month = (
+            pd.Timestamp(selected_month_week) + pd.DateOffset(months=1)
+        ).date()
+        month_week_end = month_week_next_month - timedelta(days=1)
 
         month_week_point_mapping: dict[int, str] = {}
         month_week_sales = pd.DataFrame()
@@ -11175,7 +11181,7 @@ if tab_category_analysis.open:
                 and int(shop_number) != 11
             }
             month_week_available_shops = ensure_required_shops(
-                load_available_shops(selected_four_week_start, four_week_end_exclusive)
+                load_available_shops(selected_month_week, month_week_next_month)
             )
             if not month_week_available_shops.empty:
                 month_week_available_shops = month_week_available_shops.copy()
@@ -11197,8 +11203,8 @@ if tab_category_analysis.open:
             }
             if month_week_shop_numbers:
                 month_week_sales = load_forecast_history(
-                    selected_four_week_start,
-                    four_week_end_exclusive,
+                    selected_month_week,
+                    month_week_next_month,
                     month_week_shop_numbers,
                 )
         except Exception as error:
@@ -11224,9 +11230,9 @@ if tab_category_analysis.open:
         )
 
         if month_week_error:
-            st.error(f"Не удалось загрузить сводку категорий за 4 недели: {month_week_error}")
+            st.error(f"Не удалось загрузить месячную сводку категорий: {month_week_error}")
         elif not month_week_point_mapping:
-            st.info("За выбранные 4 недели не найдены рабочие точки Т1–Т29.")
+            st.info("За выбранный месяц не найдены рабочие точки Т1–Т29.")
         else:
             if month_week_sales.empty:
                 month_week_sales = pd.DataFrame(
@@ -11269,17 +11275,9 @@ if tab_category_analysis.open:
                 month_week_sales["business_date"].notna()
                 & month_week_sales["point"].notna()
             ].copy()
-            month_week_sales = month_week_sales[
-                month_week_sales["business_date"].between(
-                    selected_four_week_start, four_week_end, inclusive="both"
-                )
-            ].copy()
-            month_week_sales["week_number"] = month_week_sales["business_date"].map(
-                lambda value: ((value - selected_four_week_start).days // 7) + 1
-            )
-            month_week_sales = month_week_sales[
-                month_week_sales["week_number"].between(1, 4)
-            ].copy()
+            month_week_sales["week_number"] = (
+                ((month_week_sales["business_date"].map(lambda value: value.day) - 1) // 7) + 1
+            ).clip(upper=4)
 
             if "Не сопоставлено" in month_week_sales["category"].astype(str).unique():
                 if "Не сопоставлено" not in month_week_categories:
@@ -11303,12 +11301,17 @@ if tab_category_analysis.open:
 
             month_week_ranges: dict[int, tuple[date, date]] = {}
             for week_number in range(1, 5):
-                week_start = selected_four_week_start + timedelta(days=(week_number - 1) * 7)
-                week_end = week_start + timedelta(days=6)
+                week_start = selected_month_week + timedelta(days=(week_number - 1) * 7)
+                if week_number < 4:
+                    week_end = min(
+                        month_week_end,
+                        selected_month_week + timedelta(days=week_number * 7 - 1),
+                    )
+                else:
+                    week_end = month_week_end
                 month_week_ranges[week_number] = (week_start, week_end)
 
-            st.markdown("<div style='height: 10px'></div>", unsafe_allow_html=True)
-            header_columns = st.columns([1.45, 1.0, 1.0, 1.0, 1.0], gap="large")
+            header_columns = st.columns([1.45, 1.0, 1.0, 1.0, 1.0])
             with header_columns[0]:
                 st.markdown("**Категория**")
             for week_number in range(1, 5):
@@ -11316,12 +11319,11 @@ if tab_category_analysis.open:
                 with header_columns[week_number]:
                     st.markdown(
                         f"**Неделя {week_number}**  \n"
-                        f"{week_start:%d.%m} ({weekday_short_ru[week_start.weekday()]})–"
-                        f"{week_end:%d.%m} ({weekday_short_ru[week_end.weekday()]})"
+                        f"{week_start:%d.%m}–{week_end:%d.%m}"
                     )
 
             for category_index, category_name in enumerate(month_week_categories):
-                row_columns = st.columns([1.45, 1.0, 1.0, 1.0, 1.0], gap="large")
+                row_columns = st.columns([1.45, 1.0, 1.0, 1.0, 1.0])
                 with row_columns[0]:
                     st.markdown(f"**{category_name}**")
                 for week_number in range(1, 5):
@@ -11334,26 +11336,25 @@ if tab_category_analysis.open:
                         if st.button(
                             f"{quantity_label} шт. · {revenue_label} ₽",
                             key=(
-                                f"category_four_weeks_cell_v2_"
-                                f"{selected_four_week_start:%Y%m%d}_{category_index}_{week_number}"
+                                f"category_month_week_cell_v1_"
+                                f"{selected_month_week:%Y%m}_{category_index}_{week_number}"
                             ),
                             use_container_width=True,
                         ):
-                            st.session_state["category_four_weeks_detail_v2"] = {
-                                "start": selected_four_week_start.isoformat(),
+                            st.session_state["category_month_week_detail_v1"] = {
+                                "month": selected_month_week.isoformat(),
                                 "category": category_name,
                                 "week": week_number,
                             }
-                st.markdown("<div style='height: 14px'></div>", unsafe_allow_html=True)
 
             selected_month_week_detail = st.session_state.get(
-                "category_four_weeks_detail_v2", {}
+                "category_month_week_detail_v1", {}
             )
-            detail_matches_start = (
+            detail_matches_month = (
                 isinstance(selected_month_week_detail, dict)
-                and selected_month_week_detail.get("start") == selected_four_week_start.isoformat()
+                and selected_month_week_detail.get("month") == selected_month_week.isoformat()
             )
-            if detail_matches_start:
+            if detail_matches_month:
                 detail_category = str(selected_month_week_detail.get("category", ""))
                 detail_week = int(selected_month_week_detail.get("week", 1))
                 detail_start, detail_end = month_week_ranges.get(
@@ -11436,7 +11437,7 @@ if tab_category_analysis.open:
                     f"#### {detail_category} · Неделя {detail_week} "
                     f"({detail_start:%d.%m.%Y}–{detail_end:%d.%m.%Y})"
                 )
-                detail_metrics = st.columns(3, gap="large")
+                detail_metrics = st.columns(3)
                 detail_metrics[0].metric(
                     "Все точки · количество",
                     f"{detail_quantity_total:,.0f} шт.".replace(",", " "),
@@ -11503,10 +11504,10 @@ if tab_category_analysis.open:
                     .apply(pd.to_numeric, errors="coerce")
                     .fillna(0.0)
                 )
-                all_weeks_display["4 недели · шт."] = all_weeks_display[
+                all_weeks_display["Месяц · шт."] = all_weeks_display[
                     [f"Неделя {week_number} · шт." for week_number in range(1, 5)]
                 ].sum(axis=1)
-                all_weeks_display["4 недели · ₽"] = all_weeks_display[
+                all_weeks_display["Месяц · ₽"] = all_weeks_display[
                     [f"Неделя {week_number} · ₽" for week_number in range(1, 5)]
                 ].sum(axis=1)
                 all_weeks_total = {"Точка": "ИТОГО"}
