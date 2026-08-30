@@ -11134,6 +11134,403 @@ if tab_abc.open:
 
 if tab_category_analysis.open:
     with tab_category_analysis:
+        st.subheader("Категории по неделям месяца")
+        st.caption(
+            "Выберите месяц. Каждая строка — категория, колонки — недели 1–4. "
+            "В ячейке показаны продажи и выручка по всем точкам суммарно. "
+            "Недели считаются так: 1-я — 1–7, 2-я — 8–14, 3-я — 15–21, "
+            "4-я — с 22-го числа до конца месяца. Нажмите на сумму недели, "
+            "чтобы открыть детализацию по каждой точке."
+        )
+
+        month_week_anchor = date.today().replace(day=1)
+        month_week_options = [
+            (pd.Timestamp(month_week_anchor) - pd.DateOffset(months=offset)).date()
+            for offset in range(24)
+        ]
+        month_week_default = date(period[1].year, period[1].month, 1)
+        if month_week_default not in month_week_options:
+            month_week_options.append(month_week_default)
+            month_week_options = sorted(set(month_week_options), reverse=True)
+        try:
+            month_week_default_index = month_week_options.index(month_week_default)
+        except ValueError:
+            month_week_default_index = 0
+
+        selected_month_week = st.selectbox(
+            "Месяц",
+            month_week_options,
+            index=month_week_default_index,
+            format_func=lambda value: f"{MONTH_NAMES_RU.get(value.month, value.month)} {value.year}",
+            key="category_month_week_month_v1",
+        )
+        month_week_next_month = (
+            pd.Timestamp(selected_month_week) + pd.DateOffset(months=1)
+        ).date()
+        month_week_end = month_week_next_month - timedelta(days=1)
+
+        month_week_point_mapping: dict[int, str] = {}
+        month_week_sales = pd.DataFrame()
+        month_week_error = ""
+        try:
+            month_week_shop_number_set = {
+                int(shop_number)
+                for shop_number in st.session_state.get("point_mapping", {})
+                if str(shop_number).isdigit()
+                and 1 <= int(shop_number) <= 29
+                and int(shop_number) != 11
+            }
+            month_week_available_shops = ensure_required_shops(
+                load_available_shops(selected_month_week, month_week_next_month)
+            )
+            if not month_week_available_shops.empty:
+                month_week_available_shops = month_week_available_shops.copy()
+                month_week_available_shops["shop_number"] = pd.to_numeric(
+                    month_week_available_shops["shop_number"], errors="coerce"
+                )
+                month_week_available_shops = month_week_available_shops[
+                    month_week_available_shops["shop_number"].notna()
+                    & month_week_available_shops["shop_number"].between(1, 29)
+                    & month_week_available_shops["shop_number"].ne(11)
+                ].copy()
+                month_week_shop_number_set.update(
+                    month_week_available_shops["shop_number"].astype(int).tolist()
+                )
+            month_week_shop_numbers = tuple(sorted(month_week_shop_number_set))
+            month_week_point_mapping = {
+                shop_number: f"Т{shop_number}"
+                for shop_number in month_week_shop_numbers
+            }
+            if month_week_shop_numbers:
+                month_week_sales = load_forecast_history(
+                    selected_month_week,
+                    month_week_next_month,
+                    month_week_shop_numbers,
+                )
+        except Exception as error:
+            month_week_error = str(error)
+
+        month_week_entity_map = (
+            entities[["sku", "category"]]
+            .copy()
+            .drop_duplicates("sku", keep="last")
+        )
+        month_week_entity_map["sku"] = month_week_entity_map["sku"].map(normalize_sku)
+        month_week_entity_map = (
+            month_week_entity_map[month_week_entity_map["sku"].notna()]
+            .drop_duplicates("sku", keep="last")
+        )
+        month_week_categories = sorted(
+            {
+                str(value).strip()
+                for value in entities["category"].dropna().astype(str)
+                if str(value).strip()
+            },
+            key=lambda value: (value == "Не сопоставлено", value.casefold()),
+        )
+
+        if month_week_error:
+            st.error(f"Не удалось загрузить месячную сводку категорий: {month_week_error}")
+        elif not month_week_point_mapping:
+            st.info("За выбранный месяц не найдены рабочие точки Т1–Т29.")
+        else:
+            if month_week_sales.empty:
+                month_week_sales = pd.DataFrame(
+                    columns=[
+                        "business_date", "shop_number", "sku", "sold_quantity", "revenue"
+                    ]
+                )
+
+            month_week_sales = month_week_sales.copy()
+            month_week_sales["business_date"] = pd.to_datetime(
+                month_week_sales.get("business_date"), errors="coerce"
+            ).dt.date
+            month_week_sales["shop_number"] = pd.to_numeric(
+                month_week_sales.get("shop_number"), errors="coerce"
+            )
+            month_week_sales["sku"] = month_week_sales.get(
+                "sku", pd.Series(index=month_week_sales.index, dtype=object)
+            ).map(normalize_sku)
+            month_week_sales["sold_quantity"] = pd.to_numeric(
+                month_week_sales.get("sold_quantity", 0), errors="coerce"
+            ).fillna(0.0)
+            month_week_sales["revenue"] = pd.to_numeric(
+                month_week_sales.get("revenue", 0), errors="coerce"
+            ).fillna(0.0)
+            month_week_sales = month_week_sales.merge(
+                month_week_entity_map,
+                on="sku",
+                how="left",
+                validate="many_to_one",
+            )
+            month_week_sales["category"] = month_week_sales["category"].fillna(
+                "Не сопоставлено"
+            )
+            month_week_sales["point"] = (
+                month_week_sales["shop_number"]
+                .astype("Int64")
+                .map(month_week_point_mapping)
+            )
+            month_week_sales = month_week_sales[
+                month_week_sales["business_date"].notna()
+                & month_week_sales["point"].notna()
+            ].copy()
+            month_week_sales["week_number"] = (
+                ((month_week_sales["business_date"].map(lambda value: value.day) - 1) // 7) + 1
+            ).clip(upper=4)
+
+            if "Не сопоставлено" in month_week_sales["category"].astype(str).unique():
+                if "Не сопоставлено" not in month_week_categories:
+                    month_week_categories.append("Не сопоставлено")
+
+            month_week_summary = (
+                month_week_sales.groupby(
+                    ["category", "week_number"], as_index=False, dropna=False
+                )
+                .agg(
+                    quantity=("sold_quantity", "sum"),
+                    revenue=("revenue", "sum"),
+                )
+            )
+            month_week_summary_lookup = {
+                (str(row.category), int(row.week_number)): (
+                    float(row.quantity), float(row.revenue)
+                )
+                for row in month_week_summary.itertuples(index=False)
+            }
+
+            month_week_ranges: dict[int, tuple[date, date]] = {}
+            for week_number in range(1, 5):
+                week_start = selected_month_week + timedelta(days=(week_number - 1) * 7)
+                if week_number < 4:
+                    week_end = min(
+                        month_week_end,
+                        selected_month_week + timedelta(days=week_number * 7 - 1),
+                    )
+                else:
+                    week_end = month_week_end
+                month_week_ranges[week_number] = (week_start, week_end)
+
+            header_columns = st.columns([1.45, 1.0, 1.0, 1.0, 1.0])
+            with header_columns[0]:
+                st.markdown("**Категория**")
+            for week_number in range(1, 5):
+                week_start, week_end = month_week_ranges[week_number]
+                with header_columns[week_number]:
+                    st.markdown(
+                        f"**Неделя {week_number}**  \n"
+                        f"{week_start:%d.%m}–{week_end:%d.%m}"
+                    )
+
+            for category_index, category_name in enumerate(month_week_categories):
+                row_columns = st.columns([1.45, 1.0, 1.0, 1.0, 1.0])
+                with row_columns[0]:
+                    st.markdown(f"**{category_name}**")
+                for week_number in range(1, 5):
+                    quantity_value, revenue_value = month_week_summary_lookup.get(
+                        (category_name, week_number), (0.0, 0.0)
+                    )
+                    quantity_label = f"{quantity_value:,.0f}".replace(",", " ")
+                    revenue_label = f"{revenue_value:,.0f}".replace(",", " ")
+                    with row_columns[week_number]:
+                        if st.button(
+                            f"{quantity_label} шт. · {revenue_label} ₽",
+                            key=(
+                                f"category_month_week_cell_v1_"
+                                f"{selected_month_week:%Y%m}_{category_index}_{week_number}"
+                            ),
+                            use_container_width=True,
+                        ):
+                            st.session_state["category_month_week_detail_v1"] = {
+                                "month": selected_month_week.isoformat(),
+                                "category": category_name,
+                                "week": week_number,
+                            }
+
+            selected_month_week_detail = st.session_state.get(
+                "category_month_week_detail_v1", {}
+            )
+            detail_matches_month = (
+                isinstance(selected_month_week_detail, dict)
+                and selected_month_week_detail.get("month") == selected_month_week.isoformat()
+            )
+            if detail_matches_month:
+                detail_category = str(selected_month_week_detail.get("category", ""))
+                detail_week = int(selected_month_week_detail.get("week", 1))
+                detail_start, detail_end = month_week_ranges.get(
+                    detail_week, month_week_ranges[1]
+                )
+                detail_source = month_week_sales[
+                    (month_week_sales["category"] == detail_category)
+                    & (month_week_sales["week_number"] == detail_week)
+                ].copy()
+                detail_grouped = (
+                    detail_source.groupby("point", as_index=False)
+                    .agg(
+                        **{
+                            "Продано, шт.": ("sold_quantity", "sum"),
+                            "Выручка, ₽": ("revenue", "sum"),
+                            "Активных SKU": ("sku", "nunique"),
+                            "Дней с продажами": ("business_date", "nunique"),
+                        }
+                    )
+                    if not detail_source.empty
+                    else pd.DataFrame(
+                        columns=[
+                            "point", "Продано, шт.", "Выручка, ₽",
+                            "Активных SKU", "Дней с продажами"
+                        ]
+                    )
+                )
+                all_month_week_points = pd.DataFrame(
+                    {
+                        "point": sorted(
+                            month_week_point_mapping.values(),
+                            key=lambda label: int(str(label).lstrip("Тт")),
+                        )
+                    }
+                )
+                detail_display = all_month_week_points.merge(
+                    detail_grouped, on="point", how="left"
+                ).fillna(0)
+                detail_display = detail_display.rename(columns={"point": "Точка"})
+                for numeric_column in [
+                    "Продано, шт.", "Выручка, ₽", "Активных SKU", "Дней с продажами"
+                ]:
+                    detail_display[numeric_column] = pd.to_numeric(
+                        detail_display[numeric_column], errors="coerce"
+                    ).fillna(0.0)
+
+                detail_quantity_total = float(detail_display["Продано, шт."].sum())
+                detail_revenue_total = float(detail_display["Выручка, ₽"].sum())
+                detail_display["Доля количества, %"] = (
+                    detail_display["Продано, шт."] / detail_quantity_total * 100
+                    if detail_quantity_total > 0
+                    else 0.0
+                )
+                detail_display["Доля выручки, %"] = (
+                    detail_display["Выручка, ₽"] / detail_revenue_total * 100
+                    if detail_revenue_total > 0
+                    else 0.0
+                )
+
+                total_row = pd.DataFrame(
+                    [
+                        {
+                            "Точка": "ИТОГО",
+                            "Продано, шт.": detail_quantity_total,
+                            "Выручка, ₽": detail_revenue_total,
+                            "Активных SKU": int(detail_source["sku"].nunique())
+                            if not detail_source.empty else 0,
+                            "Дней с продажами": int(detail_source["business_date"].nunique())
+                            if not detail_source.empty else 0,
+                            "Доля количества, %": 100.0 if detail_quantity_total > 0 else 0.0,
+                            "Доля выручки, %": 100.0 if detail_revenue_total > 0 else 0.0,
+                        }
+                    ]
+                )
+                detail_display = pd.concat(
+                    [detail_display, total_row], ignore_index=True
+                )
+
+                st.markdown(
+                    f"#### {detail_category} · Неделя {detail_week} "
+                    f"({detail_start:%d.%m.%Y}–{detail_end:%d.%m.%Y})"
+                )
+                detail_metrics = st.columns(3)
+                detail_metrics[0].metric(
+                    "Все точки · количество",
+                    f"{detail_quantity_total:,.0f} шт.".replace(",", " "),
+                )
+                detail_metrics[1].metric(
+                    "Все точки · выручка",
+                    f"{detail_revenue_total:,.0f} ₽".replace(",", " "),
+                )
+                detail_metrics[2].metric(
+                    "Точек с продажами",
+                    int((detail_display.iloc[:-1]["Продано, шт."] > 0).sum()),
+                )
+                st.dataframe(
+                    detail_display,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
+                        "Выручка, ₽": st.column_config.NumberColumn(format="%.0f"),
+                        "Активных SKU": st.column_config.NumberColumn(format="%.0f"),
+                        "Дней с продажами": st.column_config.NumberColumn(format="%.0f"),
+                        "Доля количества, %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Доля выручки, %": st.column_config.NumberColumn(format="%.1f%%"),
+                    },
+                )
+
+                category_all_weeks_source = month_week_sales[
+                    month_week_sales["category"] == detail_category
+                ].copy()
+                category_all_weeks_grouped = (
+                    category_all_weeks_source.groupby(
+                        ["point", "week_number"], as_index=False
+                    )
+                    .agg(
+                        quantity=("sold_quantity", "sum"),
+                        revenue=("revenue", "sum"),
+                    )
+                    if not category_all_weeks_source.empty
+                    else pd.DataFrame(
+                        columns=["point", "week_number", "quantity", "revenue"]
+                    )
+                )
+                all_weeks_display = all_month_week_points.rename(
+                    columns={"point": "Точка"}
+                ).copy()
+                for week_number in range(1, 5):
+                    week_values = category_all_weeks_grouped[
+                        category_all_weeks_grouped["week_number"] == week_number
+                    ][["point", "quantity", "revenue"]].rename(
+                        columns={
+                            "point": "Точка",
+                            "quantity": f"Неделя {week_number} · шт.",
+                            "revenue": f"Неделя {week_number} · ₽",
+                        }
+                    )
+                    all_weeks_display = all_weeks_display.merge(
+                        week_values, on="Точка", how="left"
+                    )
+                all_weeks_numeric_columns = [
+                    column for column in all_weeks_display.columns if column != "Точка"
+                ]
+                all_weeks_display[all_weeks_numeric_columns] = (
+                    all_weeks_display[all_weeks_numeric_columns]
+                    .apply(pd.to_numeric, errors="coerce")
+                    .fillna(0.0)
+                )
+                all_weeks_display["Месяц · шт."] = all_weeks_display[
+                    [f"Неделя {week_number} · шт." for week_number in range(1, 5)]
+                ].sum(axis=1)
+                all_weeks_display["Месяц · ₽"] = all_weeks_display[
+                    [f"Неделя {week_number} · ₽" for week_number in range(1, 5)]
+                ].sum(axis=1)
+                all_weeks_total = {"Точка": "ИТОГО"}
+                for column in all_weeks_display.columns:
+                    if column != "Точка":
+                        all_weeks_total[column] = float(all_weeks_display[column].sum())
+                all_weeks_display = pd.concat(
+                    [all_weeks_display, pd.DataFrame([all_weeks_total])],
+                    ignore_index=True,
+                )
+                st.markdown("**По каждой точке · сравнение недель 1–4**")
+                st.dataframe(
+                    all_weeks_display,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        column: st.column_config.NumberColumn(format="%.0f")
+                        for column in all_weeks_display.columns
+                        if column != "Точка"
+                    },
+                )
+
+        st.divider()
         st.subheader("Анализ категории по дням недели")
         st.caption(
             "Выберите категорию, один или несколько дней недели и до четырёх периодов для сравнения. "
