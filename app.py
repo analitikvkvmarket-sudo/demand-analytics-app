@@ -99,7 +99,7 @@ COMBO_MATRIX_FILE = resolve_app_file("combo_matrix.xlsx", "матрица", "к�
 AUTO_UNIT_FILE = resolve_app_file("auto_unit_points_vm.xlsx", "авто юнит", "auto_unit", "точки вм")
 MATRIX_APPS_SCRIPT_URL = os.getenv(
     "MATRIX_APPS_SCRIPT_URL",
-    "https://script.google.com/macros/s/AKfycbyer2zkKceEFHggByDZncQjpYRNFwZJmvZ3-82PYxV2vbDeUvNY2WriHGBklSZuMbpc/exec",
+    "https://script.google.com/macros/s/AKfycbxzpVJGvkHTn8YogBOLO4PtvdQqmkoMx-chNCZ2ijmMIRc_-kcd2WUQ283PNyo5hCo/exec",
 ).strip()
 MATRIX_APPS_SCRIPT_KEY = os.getenv(
     "MATRIX_APPS_SCRIPT_KEY",
