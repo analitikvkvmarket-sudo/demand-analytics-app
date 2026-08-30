@@ -1525,7 +1525,8 @@ def forecast_coverage_days_for_date(
 
     Новая логика для обычных точек:
     - воскресенье и понедельник: базовое окно свежести;
-    - вторник и среда: базовое окно свежести минус 1 день;
+    - вторник: базовое окно свежести минус 1 день;
+    - среда: базовое окно свежести без уменьшения;
     - четверг: полный жизненный цикл товара;
     - в четверг для Т7, Т8, Т9, Т12, Т13, Т15, Т16, Т18, Т19, Т21, Т26 и Т28
       используется множитель 1 вместо полного жизненного цикла;
@@ -1551,11 +1552,16 @@ def forecast_coverage_days_for_date(
             base_freshness_days,
             f"{WEEKDAY_RU.get(weekday, '')}: окно свежести {base_freshness_days} дн.",
         )
-    if weekday in (1, 2):  # Вт, Ср
+    if weekday == 1:  # Вт
         adjusted_days = max(1, base_freshness_days - 1)
         return (
             adjusted_days,
-            f"{WEEKDAY_RU.get(weekday, '')}: окно свежести {base_freshness_days} дн. − 1 = {adjusted_days} дн.",
+            f"Вторник: окно свежести {base_freshness_days} дн. − 1 = {adjusted_days} дн.",
+        )
+    if weekday == 2:  # Ср
+        return (
+            base_freshness_days,
+            f"Среда: обычное окно свежести {base_freshness_days} дн.",
         )
     if weekday == 3:  # Чт
         if point_number in FORECAST_THURSDAY_X1_POINTS:
