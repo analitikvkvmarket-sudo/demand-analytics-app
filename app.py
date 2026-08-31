@@ -12668,6 +12668,118 @@ if tab_sales_time.open:
             period_plans = sales_time_plans[
                 sales_time_plans["plan_date"].isin(selected_plan_dates)
             ].copy()
+
+            # Краткая сводка плана по категориям за выбранные даты.
+            # Всегда суммирует ВСЕ точки Т1-Т29 (кроме отсутствующей Т11),
+            # независимо от фильтра точек ниже.
+            plan_category_summary_source = period_plans.copy()
+            plan_category_summary_source["point_number"] = pd.to_numeric(
+                plan_category_summary_source.get("point_number"), errors="coerce"
+            )
+            plan_category_summary_source = plan_category_summary_source[
+                plan_category_summary_source["point_number"].between(1, 29)
+                & plan_category_summary_source["point_number"].ne(11)
+            ].copy()
+
+            plan_category_reference = (
+                entities[["sku", "category"]]
+                .copy()
+                .drop_duplicates("sku", keep="last")
+            )
+            plan_category_summary_source = plan_category_summary_source.merge(
+                plan_category_reference, on="sku", how="left", validate="many_to_one"
+            )
+            plan_category_summary_source["category"] = plan_category_summary_source[
+                "category"
+            ].fillna(plan_category_summary_source.get("matrix_category")).map(
+                normalize_matrix_category
+            )
+            plan_category_summary_source["category"] = plan_category_summary_source[
+                "category"
+            ].fillna("Не сопоставлено")
+            plan_category_summary_source["analyst_plan"] = pd.to_numeric(
+                plan_category_summary_source.get("analyst_plan"), errors="coerce"
+            ).fillna(0.0)
+
+            plan_category_summary = plan_category_summary_source.pivot_table(
+                index="category",
+                columns="plan_date",
+                values="analyst_plan",
+                aggfunc="sum",
+                fill_value=0.0,
+            )
+            plan_category_summary = plan_category_summary.reindex(
+                columns=selected_plan_dates, fill_value=0.0
+            )
+
+            plan_summary_category_order = [
+                "Завтраки", "Салаты", "Супы", "Вторые блюда", "Сэндвичи",
+                "Япония", "Десерты", "Напитки", "Хлеб",
+            ]
+            plan_summary_rank = {
+                category: index for index, category in enumerate(plan_summary_category_order)
+            }
+            if not plan_category_summary.empty:
+                plan_category_summary = (
+                    plan_category_summary
+                    .reset_index()
+                    .assign(
+                        _category_order=lambda frame: frame["category"]
+                        .map(plan_summary_rank)
+                        .fillna(99)
+                    )
+                    .sort_values(["_category_order", "category"], kind="stable")
+                    .drop(columns="_category_order")
+                    .set_index("category")
+                )
+
+            plan_date_labels = {
+                plan_date: f"{plan_date:%d.%m} {weekday_short.get(plan_date.weekday(), '')}"
+                for plan_date in selected_plan_dates
+            }
+            plan_category_summary = plan_category_summary.rename(columns=plan_date_labels)
+            plan_day_columns = [plan_date_labels[plan_date] for plan_date in selected_plan_dates]
+            plan_category_summary["ВСЕГО"] = (
+                plan_category_summary[plan_day_columns].sum(axis=1)
+                if plan_day_columns
+                else 0.0
+            )
+            plan_category_summary = plan_category_summary.reset_index().rename(
+                columns={"category": "Категория"}
+            )
+
+            total_plan_row = {"Категория": "ВСЕГО"}
+            for column in [*plan_day_columns, "ВСЕГО"]:
+                total_plan_row[column] = float(
+                    pd.to_numeric(plan_category_summary.get(column), errors="coerce")
+                    .fillna(0.0)
+                    .sum()
+                )
+            plan_category_summary = pd.concat(
+                [plan_category_summary, pd.DataFrame([total_plan_row])],
+                ignore_index=True,
+            )
+
+            st.markdown("#### План по категориям · все точки")
+            st.caption(
+                "Краткая сводка по выбранному периоду плана. Строки — категории, "
+                "колонки — выбранные даты; значения — план по всем точкам суммарно. "
+                "Последний столбец и последняя строка — итоги."
+            )
+            st.dataframe(
+                plan_category_summary,
+                use_container_width=True,
+                hide_index=True,
+                height=min(470, 38 * len(plan_category_summary) + 80),
+                column_config={
+                    "Категория": st.column_config.TextColumn(width="medium"),
+                    **{
+                        column: st.column_config.NumberColumn(format="%.0f")
+                        for column in [*plan_day_columns, "ВСЕГО"]
+                    },
+                },
+            )
+
             current_mapping = st.session_state.get("point_mapping", {})
             point_to_shop = {
                 label: int(shop_number)
