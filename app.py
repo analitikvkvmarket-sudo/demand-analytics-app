@@ -1883,20 +1883,34 @@ def parse_analyst_plan_history(file_bytes: bytes) -> pd.DataFrame:
 
 @st.cache_data(show_spinner="Читаю сводку СДАЛИ по категориям из матрицы 2.3…")
 def parse_matrix_category_surrender_totals(file_bytes: bytes) -> pd.DataFrame:
-    """Читает только Категорию и итоговую колонку СДАЛИ из 2.3 Матрица КОМБО.
+    """Читает Категорию и СДАЛИ только из одного актуального блока матрицы на дату.
 
-    Эта сводка намеренно не использует PostgreSQL, entities/справочник SKU или
-    сопоставление точек. Значение берётся непосредственно из колонки «СДАЛИ»
-    основного блока «План на день кухня», поэтому итог совпадает с самой матрицей.
+    Одна и та же дата иногда физически присутствует в нескольких листах/старых
+    блоках «План 1–4 недели». Их нельзя складывать между собой: иначе СДАЛИ
+    задваивается. Для каждой даты выбирается один полный блок — с наибольшим
+    итогом в строке «ИТОГО» колонки «СДАЛИ» (при равенстве берётся более поздний
+    блок в книге). PostgreSQL, entities и сопоставление точек не используются.
     """
     workbook = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=False)
-    rows: list[dict[str, object]] = []
+    block_candidates: list[dict[str, object]] = []
     plan_sheets = [
         name for name in workbook.sheetnames
         if name.lower().startswith("план ") and "недел" in name.lower()
     ]
 
-    for sheet_name in plan_sheets:
+    production_categories = {
+        "завтрак", "завтраки",
+        "салат", "салаты",
+        "суп", "супы",
+        "второе", "вторые блюда",
+        "сэндвич", "сэндвичи",
+        "япония",
+        "десерт", "десерты", "выпечка",
+        "напиток", "напитки",
+        "хлеб",
+    }
+
+    for sheet_order, sheet_name in enumerate(plan_sheets):
         sheet = workbook[sheet_name]
         main_blocks: list[tuple[int, date]] = []
         for excel_row in range(1, sheet.max_row + 1):
@@ -1922,6 +1936,10 @@ def parse_matrix_category_surrender_totals(file_bytes: bytes) -> pd.DataFrame:
             }
             category_column = normalized_headers.get("КАТЕГОРИЯ")
             surrender_column = normalized_headers.get("СДАЛИ")
+            code_column = next(
+                (column for header, column in normalized_headers.items() if header.startswith("КОД")),
+                None,
+            )
             if category_column is None or surrender_column is None:
                 continue
 
@@ -1940,13 +1958,26 @@ def parse_matrix_category_surrender_totals(file_bytes: bytes) -> pd.DataFrame:
                     end_row = candidate_row - 1
                     break
 
+            block_rows: list[dict[str, object]] = []
+            matrix_total: float | None = None
             for excel_row in range(header_row + 1, end_row + 1):
-                # Не включаем итоговую строку самой матрицы, иначе СДАЛИ удвоится.
-                if any(
-                    str(sheet.cell(excel_row, column).value or "").strip().upper() == "ИТОГО"
+                row_text = [
+                    str(sheet.cell(excel_row, column).value or "").strip().upper()
                     for column in range(1, sheet.max_column + 1)
-                ):
+                ]
+                if "ИТОГО" in row_text:
+                    total_value = pd.to_numeric(
+                        sheet.cell(excel_row, surrender_column).value, errors="coerce"
+                    )
+                    if pd.notna(total_value):
+                        matrix_total = max(0.0, float(total_value))
                     continue
+
+                # Служебные/пустые строки основного блока в категорийную сводку не входят.
+                if code_column is not None:
+                    raw_code = str(sheet.cell(excel_row, code_column).value or "").strip()
+                    if not raw_code:
+                        continue
 
                 raw_surrender = pd.to_numeric(
                     sheet.cell(excel_row, surrender_column).value, errors="coerce"
@@ -1958,7 +1989,7 @@ def parse_matrix_category_surrender_totals(file_bytes: bytes) -> pd.DataFrame:
                     sheet.cell(excel_row, category_column).value or ""
                 ).strip()
                 category = raw_category if raw_category else "Без категории"
-                rows.append(
+                block_rows.append(
                     {
                         "plan_date": target_date,
                         "matrix_category": category,
@@ -1966,11 +1997,65 @@ def parse_matrix_category_surrender_totals(file_bytes: bytes) -> pd.DataFrame:
                     }
                 )
 
-    if not rows:
+            if not block_rows:
+                continue
+
+            raw_sum = float(sum(float(row["matrix_surrender"]) for row in block_rows))
+
+            # В самой матрице строка ИТОГО может сознательно не включать служебную
+            # категорию «Премиум». Если исключение нестандартных категорий ровно
+            # приводит к матричному ИТОГО, используем именно такой набор строк.
+            if matrix_total is not None and abs(raw_sum - matrix_total) > 0.5:
+                production_rows = [
+                    row for row in block_rows
+                    if str(row["matrix_category"]).strip().casefold() in production_categories
+                    or str(row["matrix_category"]).strip() == "Без категории"
+                ]
+                production_sum = float(
+                    sum(float(row["matrix_surrender"]) for row in production_rows)
+                )
+                if abs(production_sum - matrix_total) <= 0.5:
+                    block_rows = production_rows
+                    raw_sum = production_sum
+
+            block_candidates.append(
+                {
+                    "plan_date": target_date,
+                    "sheet_order": sheet_order,
+                    "block_index": block_index,
+                    "matrix_total": matrix_total,
+                    "row_sum": raw_sum,
+                    "rows": block_rows,
+                }
+            )
+
+    if not block_candidates:
         return pd.DataFrame(columns=["plan_date", "matrix_category", "matrix_surrender"])
 
+    # Одна дата может встречаться в нескольких недельных листах. Выбираем один
+    # наиболее полный блок и НЕ суммируем копии одной даты между собой.
+    selected_rows: list[dict[str, object]] = []
+    candidate_frame = pd.DataFrame(block_candidates)
+    for _, date_candidates in candidate_frame.groupby("plan_date", sort=False):
+        def candidate_score(row: pd.Series) -> tuple[float, float, int, int]:
+            matrix_total = row.get("matrix_total")
+            explicit_total = (
+                float(matrix_total)
+                if matrix_total is not None and not pd.isna(matrix_total)
+                else -1.0
+            )
+            return (
+                1.0 if explicit_total >= 0 else 0.0,
+                explicit_total if explicit_total >= 0 else float(row.get("row_sum", 0.0) or 0.0),
+                int(row.get("sheet_order", 0) or 0),
+                int(row.get("block_index", 0) or 0),
+            )
+
+        best_index = max(date_candidates.index, key=lambda idx: candidate_score(date_candidates.loc[idx]))
+        selected_rows.extend(candidate_frame.loc[best_index, "rows"])
+
     return (
-        pd.DataFrame(rows)
+        pd.DataFrame(selected_rows)
         .groupby(["plan_date", "matrix_category"], as_index=False, dropna=False)["matrix_surrender"]
         .sum()
         .sort_values(["plan_date", "matrix_category"], kind="stable")
