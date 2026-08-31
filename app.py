@@ -1881,6 +1881,103 @@ def parse_analyst_plan_history(file_bytes: bytes) -> pd.DataFrame:
     ).sort_values(["plan_date", "point_number", "matrix_category", "product_name"]).reset_index(drop=True)
 
 
+@st.cache_data(show_spinner="Читаю сводку СДАЛИ по категориям из матрицы 2.3…")
+def parse_matrix_category_surrender_totals(file_bytes: bytes) -> pd.DataFrame:
+    """Читает только Категорию и итоговую колонку СДАЛИ из 2.3 Матрица КОМБО.
+
+    Эта сводка намеренно не использует PostgreSQL, entities/справочник SKU или
+    сопоставление точек. Значение берётся непосредственно из колонки «СДАЛИ»
+    основного блока «План на день кухня», поэтому итог совпадает с самой матрицей.
+    """
+    workbook = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=False)
+    rows: list[dict[str, object]] = []
+    plan_sheets = [
+        name for name in workbook.sheetnames
+        if name.lower().startswith("план ") and "недел" in name.lower()
+    ]
+
+    for sheet_name in plan_sheets:
+        sheet = workbook[sheet_name]
+        main_blocks: list[tuple[int, date]] = []
+        for excel_row in range(1, sheet.max_row + 1):
+            row_values = [
+                sheet.cell(excel_row, column).value
+                for column in range(1, min(sheet.max_column, 12) + 1)
+            ]
+            row_label = " ".join(str(value or "").strip().lower() for value in row_values)
+            if "план на день кухня" not in row_label:
+                continue
+            target_date = next(
+                (parsed for value in row_values if (parsed := parse_excel_date(value)) is not None),
+                None,
+            )
+            if target_date is not None:
+                main_blocks.append((excel_row, target_date))
+
+        for block_index, (date_row, target_date) in enumerate(main_blocks):
+            header_row = date_row + 1
+            normalized_headers = {
+                str(sheet.cell(header_row, column).value or "").replace(" ", "").strip().upper(): column
+                for column in range(1, sheet.max_column + 1)
+            }
+            category_column = normalized_headers.get("КАТЕГОРИЯ")
+            surrender_column = normalized_headers.get("СДАЛИ")
+            if category_column is None or surrender_column is None:
+                continue
+
+            next_main_row = (
+                main_blocks[block_index + 1][0]
+                if block_index + 1 < len(main_blocks)
+                else sheet.max_row + 1
+            )
+            end_row = next_main_row - 1
+            for candidate_row in range(header_row + 1, next_main_row):
+                candidate_label = " ".join(
+                    str(sheet.cell(candidate_row, column).value or "").strip().lower()
+                    for column in range(1, min(sheet.max_column, 12) + 1)
+                )
+                if "участок комплектации" in candidate_label:
+                    end_row = candidate_row - 1
+                    break
+
+            for excel_row in range(header_row + 1, end_row + 1):
+                # Не включаем итоговую строку самой матрицы, иначе СДАЛИ удвоится.
+                if any(
+                    str(sheet.cell(excel_row, column).value or "").strip().upper() == "ИТОГО"
+                    for column in range(1, sheet.max_column + 1)
+                ):
+                    continue
+
+                raw_surrender = pd.to_numeric(
+                    sheet.cell(excel_row, surrender_column).value, errors="coerce"
+                )
+                if pd.isna(raw_surrender):
+                    continue
+
+                raw_category = str(
+                    sheet.cell(excel_row, category_column).value or ""
+                ).strip()
+                category = raw_category if raw_category else "Без категории"
+                rows.append(
+                    {
+                        "plan_date": target_date,
+                        "matrix_category": category,
+                        "matrix_surrender": max(0.0, float(raw_surrender)),
+                    }
+                )
+
+    if not rows:
+        return pd.DataFrame(columns=["plan_date", "matrix_category", "matrix_surrender"])
+
+    return (
+        pd.DataFrame(rows)
+        .groupby(["plan_date", "matrix_category"], as_index=False, dropna=False)["matrix_surrender"]
+        .sum()
+        .sort_values(["plan_date", "matrix_category"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
 @st.cache_data(show_spinner="Читаю матрицу 2.3 для окна свежести…")
 def parse_freshness_plan(file_bytes: bytes) -> pd.DataFrame:
     """Читает планы из матрицы 2.3; fallback оставлен для совместимости формата."""
@@ -12669,42 +12766,18 @@ if tab_sales_time.open:
                 sales_time_plans["plan_date"].isin(selected_plan_dates)
             ].copy()
 
-            # Краткая сводка плана по категориям за выбранные даты.
-            # Всегда суммирует ВСЕ точки Т1-Т29 (кроме отсутствующей Т11),
-            # независимо от фильтра точек ниже.
-            plan_category_summary_source = period_plans.copy()
-            plan_category_summary_source["point_number"] = pd.to_numeric(
-                plan_category_summary_source.get("point_number"), errors="coerce"
-            )
-            plan_category_summary_source = plan_category_summary_source[
-                plan_category_summary_source["point_number"].between(1, 29)
-                & plan_category_summary_source["point_number"].ne(11)
+            # Краткая сводка строится ТОЛЬКО по самой матрице 2.3.
+            # Категория берётся из колонки «Категория», значение — из итоговой
+            # колонки «СДАЛИ». PostgreSQL, entities и сопоставление SKU здесь не участвуют.
+            matrix_category_surrender = parse_matrix_category_surrender_totals(matrix_snapshot_bytes)
+            matrix_category_surrender = matrix_category_surrender[
+                matrix_category_surrender["plan_date"].isin(selected_plan_dates)
             ].copy()
 
-            plan_category_reference = (
-                entities[["sku", "category"]]
-                .copy()
-                .drop_duplicates("sku", keep="last")
-            )
-            plan_category_summary_source = plan_category_summary_source.merge(
-                plan_category_reference, on="sku", how="left", validate="many_to_one"
-            )
-            plan_category_summary_source["category"] = plan_category_summary_source[
-                "category"
-            ].fillna(plan_category_summary_source.get("matrix_category")).map(
-                normalize_matrix_category
-            )
-            plan_category_summary_source["category"] = plan_category_summary_source[
-                "category"
-            ].fillna("Не сопоставлено")
-            plan_category_summary_source["analyst_plan"] = pd.to_numeric(
-                plan_category_summary_source.get("analyst_plan"), errors="coerce"
-            ).fillna(0.0)
-
-            plan_category_summary = plan_category_summary_source.pivot_table(
-                index="category",
+            plan_category_summary = matrix_category_surrender.pivot_table(
+                index="matrix_category",
                 columns="plan_date",
-                values="analyst_plan",
+                values="matrix_surrender",
                 aggfunc="sum",
                 fill_value=0.0,
             )
@@ -12712,9 +12785,18 @@ if tab_sales_time.open:
                 columns=selected_plan_dates, fill_value=0.0
             )
 
+            # Порядок задаём по названиям, которые реально используются в матрице.
             plan_summary_category_order = [
-                "Завтраки", "Салаты", "Супы", "Вторые блюда", "Сэндвичи",
-                "Япония", "Десерты", "Напитки", "Хлеб",
+                "Завтрак", "Завтраки",
+                "Салат", "Салаты", "Премиум",
+                "Суп", "Супы",
+                "Второе", "Вторые блюда",
+                "Сэндвич", "Сэндвичи",
+                "Япония",
+                "Десерт", "Десерты", "Выпечка",
+                "Напиток", "Напитки",
+                "Хлеб",
+                "Без категории",
             ]
             plan_summary_rank = {
                 category: index for index, category in enumerate(plan_summary_category_order)
@@ -12724,13 +12806,13 @@ if tab_sales_time.open:
                     plan_category_summary
                     .reset_index()
                     .assign(
-                        _category_order=lambda frame: frame["category"]
+                        _category_order=lambda frame: frame["matrix_category"]
                         .map(plan_summary_rank)
                         .fillna(99)
                     )
-                    .sort_values(["_category_order", "category"], kind="stable")
+                    .sort_values(["_category_order", "matrix_category"], kind="stable")
                     .drop(columns="_category_order")
-                    .set_index("category")
+                    .set_index("matrix_category")
                 )
 
             plan_date_labels = {
@@ -12745,7 +12827,7 @@ if tab_sales_time.open:
                 else 0.0
             )
             plan_category_summary = plan_category_summary.reset_index().rename(
-                columns={"category": "Категория"}
+                columns={"matrix_category": "Категория"}
             )
 
             total_plan_row = {"Категория": "ВСЕГО"}
@@ -12760,11 +12842,12 @@ if tab_sales_time.open:
                 ignore_index=True,
             )
 
-            st.markdown("#### План по категориям · все точки")
+            st.markdown("#### Сдали по категориям · только Матрица КОМБО")
             st.caption(
-                "Краткая сводка по выбранному периоду плана. Строки — категории, "
-                "колонки — выбранные даты; значения — план по всем точкам суммарно. "
-                "Последний столбец и последняя строка — итоги."
+                "Источник этой таблицы — только «2.3 Матрица КОМБО». "
+                "Категория берётся напрямую из колонки «Категория», значение — напрямую "
+                "из итоговой колонки «СДАЛИ». PostgreSQL, БД и справочник сущностей не используются. "
+                "Строка «Без категории» сохраняет ненулевые значения СДАЛИ у строк матрицы без категории."
             )
             st.dataframe(
                 plan_category_summary,
