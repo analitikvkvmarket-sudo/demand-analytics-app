@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.28-FRESHNESS-CATEGORY-ALL-POINTS"
+BUILD_ID = "75.11.29-FRESHNESS-ARCHIVE-PLAN"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -467,6 +467,109 @@ def _fetch_system_menu_archive_day(
         return snapshot_id, frame[list(rename_map.values())].copy(), ""
     except Exception as error:
         return "", pd.DataFrame(), str(error)
+
+
+def _archive_menu_to_freshness_plan(
+    menu_date_value: date,
+    archive_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Convert one archived menu day to the same plan schema used by the freshness window."""
+    columns = [
+        "plan_date",
+        "plan_sheet",
+        "point_number",
+        "sku",
+        "product_name",
+        "matrix_category",
+        "unit_price",
+        "analyst_plan",
+    ]
+    if archive_frame is None or archive_frame.empty:
+        return pd.DataFrame(columns=columns)
+
+    work = archive_frame.copy()
+    for column in ["Точка", "SKU", "Название блюда", "Категория", "Цена", "План", "Лист"]:
+        if column not in work.columns:
+            work[column] = ""
+
+    work["point_number"] = pd.to_numeric(
+        work["Точка"].astype(str).str.upper().str.replace("T", "Т", regex=False)
+        .str.extract(r"Т\s*(\d+)", expand=False),
+        errors="coerce",
+    )
+    work["sku"] = work["SKU"].map(normalize_sku)
+    work["analyst_plan"] = pd.to_numeric(work["План"], errors="coerce").fillna(0.0).clip(lower=0)
+    work["unit_price"] = pd.to_numeric(work["Цена"], errors="coerce").fillna(0.0).clip(lower=0)
+    work["product_name"] = work["Название блюда"].fillna("").astype(str).str.strip()
+    work["matrix_category"] = work["Категория"].fillna("").astype(str).str.strip()
+    work["plan_sheet"] = work["Лист"].fillna("Архив меню").astype(str).str.strip()
+    work["plan_date"] = menu_date_value
+
+    work = work[
+        work["point_number"].between(1, 29)
+        & work["point_number"].ne(11)
+        & work["sku"].notna()
+        & work["product_name"].ne("")
+    ].copy()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+
+    work["point_number"] = work["point_number"].astype(int)
+    return (
+        work[columns]
+        .drop_duplicates(["plan_date", "point_number", "sku"], keep="last")
+        .sort_values(["plan_date", "point_number", "matrix_category", "product_name"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+def _load_archive_freshness_period(
+    menu_dates: list[date] | tuple[date, ...],
+) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """Load selected archive dates and return freshness-plan rows plus snapshot ids and warnings."""
+    columns = [
+        "plan_date",
+        "plan_sheet",
+        "point_number",
+        "sku",
+        "product_name",
+        "matrix_category",
+        "unit_price",
+        "analyst_plan",
+    ]
+    frames: list[pd.DataFrame] = []
+    snapshots: list[str] = []
+    warnings: list[str] = []
+
+    for menu_date_value in menu_dates:
+        menu_date_iso = menu_date_value.isoformat()
+        snapshot_id, archive_frame, error = _fetch_system_menu_archive_day(
+            MENU_ARCHIVE_APPS_SCRIPT_URL,
+            MENU_ARCHIVE_APPS_SCRIPT_KEY,
+            menu_date_iso,
+        )
+        if error:
+            warnings.append(f"{menu_date_value:%d.%m.%Y}: {error}")
+            continue
+        if snapshot_id:
+            snapshots.append(snapshot_id)
+        converted = _archive_menu_to_freshness_plan(menu_date_value, archive_frame)
+        if converted.empty:
+            warnings.append(f"{menu_date_value:%d.%m.%Y}: в архиве нет строк плана")
+            continue
+        frames.append(converted)
+
+    if not frames:
+        return pd.DataFrame(columns=columns), sorted(set(snapshots)), warnings
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(["plan_date", "point_number", "sku"], keep="last")
+        .sort_values(["plan_date", "point_number", "matrix_category", "product_name"], kind="stable")
+        .reset_index(drop=True),
+        sorted(set(snapshots)),
+        warnings,
+    )
 
 
 def _historical_menu_date_iso(value: object) -> str:
@@ -12730,81 +12833,180 @@ if tab_sales_time.open:
             "напитки: 4 зелёных + 3 серых дня. "
             "Скидка 40% применяется только в последний день срока."
         )
-        # Основной источник — Apps Script, связанный с Google Sheet «2.3 Матрица КОМБО».
-        # Снимок обновляется автоматически каждые 15 минут; локальный XLSX — только резерв.
-        matrix_status_columns = st.columns([4.0, 1.0])
-        with matrix_status_columns[0]:
-            if matrix_snapshot_source.startswith("Apps Script"):
-                st.success(
-                    f"Матрица: {matrix_snapshot_source}. Автообновление каждые 15 минут · "
-                    f"проверено {matrix_snapshot_checked_at.replace('T', ' ')}."
-                )
-            else:
-                st.warning(
-                    f"Матрица сейчас загружена из резерва: {matrix_snapshot_source}. "
-                    "Приложение продолжит пытаться получить актуальную матрицу через Apps Script каждые 15 минут."
-                )
-                if matrix_snapshot_error:
-                    st.caption(f"Причина: {matrix_snapshot_error}")
-        with matrix_status_columns[1]:
-            if st.button(
-                "Обновить матрицу сейчас",
-                use_container_width=True,
-                key="refresh_google_matrix_now_v761",
-            ):
-                _fetch_apps_script_matrix_snapshot.clear()
-                _fetch_apps_script_entity_reference.clear()
-                st.rerun()
+        st.markdown("#### Источник плана")
+        freshness_plan_source = st.radio(
+            "Откуда загрузить план в окно свежести",
+            ["Текущая Матрица КОМБО", "Архив меню"],
+            horizontal=True,
+            key="freshness_plan_source_v80",
+            help=(
+                "Матрица КОМБО — актуальные планы 1–4 недель. "
+                "Архив меню — сохранённые планы из системного архива datalens_menu."
+            ),
+        )
 
-        if not matrix_snapshot_bytes:
-            st.error("Матрица 2.3 недоступна ни через Apps Script, ни в резервной копии.")
-            sales_time_plans = pd.DataFrame()
-        else:
-            try:
-                sales_time_plans = parse_freshness_plan(matrix_snapshot_bytes)
-            except Exception as error:
-                st.error(f"Не удалось прочитать матрицу 2.3: {error}")
+        archive_available_dates: list[date] = []
+        archive_dates_error = ""
+
+        if freshness_plan_source == "Текущая Матрица КОМБО":
+            # Основной источник — Apps Script, связанный с Google Sheet «2.3 Матрица КОМБО».
+            # Снимок обновляется автоматически каждые 15 минут; локальный XLSX — только резерв.
+            matrix_status_columns = st.columns([4.0, 1.0])
+            with matrix_status_columns[0]:
+                if matrix_snapshot_source.startswith("Apps Script"):
+                    st.success(
+                        f"Матрица: {matrix_snapshot_source}. Автообновление каждые 15 минут · "
+                        f"проверено {matrix_snapshot_checked_at.replace('T', ' ')}."
+                    )
+                else:
+                    st.warning(
+                        f"Матрица сейчас загружена из резерва: {matrix_snapshot_source}. "
+                        "Приложение продолжит пытаться получить актуальную матрицу через Apps Script каждые 15 минут."
+                    )
+                    if matrix_snapshot_error:
+                        st.caption(f"Причина: {matrix_snapshot_error}")
+            with matrix_status_columns[1]:
+                if st.button(
+                    "Обновить матрицу сейчас",
+                    use_container_width=True,
+                    key="refresh_google_matrix_now_v761",
+                ):
+                    _fetch_apps_script_matrix_snapshot.clear()
+                    _fetch_apps_script_entity_reference.clear()
+                    st.rerun()
+
+            if not matrix_snapshot_bytes:
                 sales_time_plans = pd.DataFrame()
+                available_plan_dates: list[date] = []
+                st.error("Матрица 2.3 недоступна ни через Apps Script, ни в резервной копии.")
+            else:
+                try:
+                    sales_time_plans = parse_freshness_plan(matrix_snapshot_bytes)
+                except Exception as error:
+                    st.error(f"Не удалось прочитать матрицу 2.3: {error}")
+                    sales_time_plans = pd.DataFrame()
 
-        if sales_time_plans.empty:
-            st.warning(
-                "В матрице 2.3 не найдены основные блоки «План на день кухня» "
-                "с датами, SKU и колонками Т1–Т29 на листах 1–4 недели."
-            )
+                available_plan_dates = (
+                    sorted(sales_time_plans["plan_date"].dropna().unique())
+                    if not sales_time_plans.empty
+                    else []
+                )
+                if available_plan_dates:
+                    source_start = available_plan_dates[0]
+                    source_end = available_plan_dates[-1]
+                    st.success(
+                        f"Матрица 2.3 загружена: планы 1–4 недель; "
+                        f"дат — {len(available_plan_dates)}, SKU — {sales_time_plans['sku'].nunique()}; "
+                        f"период {source_start:%d.%m.%Y}–{source_end:%d.%m.%Y}."
+                    )
+                else:
+                    st.warning(
+                        "В матрице 2.3 не найдены основные блоки «План на день кухня» "
+                        "с датами, SKU и колонками Т1–Т29 на листах 1–4 недели."
+                    )
         else:
-            available_plan_dates = sorted(sales_time_plans["plan_date"].dropna().unique())
-            matrix_start = available_plan_dates[0]
-            matrix_end = available_plan_dates[-1]
-            st.success(
-                f"Матрица 2.3 загружена: планы 1–4 недель; "
-                f"дат — {len(available_plan_dates)}, SKU — {sales_time_plans['sku'].nunique()}; "
-                f"период {matrix_start:%d.%m.%Y}–{matrix_end:%d.%m.%Y}."
-            )
+            sales_time_plans = pd.DataFrame()
+            archive_status_columns = st.columns([4.0, 1.0])
+            with archive_status_columns[0]:
+                if not MENU_ARCHIVE_APPS_SCRIPT_KEY:
+                    archive_dates_error = "не указан MENU_ARCHIVE_APPS_SCRIPT_KEY"
+                    st.error(
+                        "Архив меню подключён, но в Streamlit Secrets нет "
+                        "MENU_ARCHIVE_APPS_SCRIPT_KEY."
+                    )
+                else:
+                    with st.spinner("Получаю даты плана из архива меню…"):
+                        archive_date_strings, archive_dates_error = _fetch_system_menu_archive_dates(
+                            MENU_ARCHIVE_APPS_SCRIPT_URL,
+                            MENU_ARCHIVE_APPS_SCRIPT_KEY,
+                        )
+                    for value in archive_date_strings:
+                        try:
+                            archive_available_dates.append(
+                                datetime.strptime(value, "%Y-%m-%d").date()
+                            )
+                        except ValueError:
+                            continue
+                    archive_available_dates = sorted(set(archive_available_dates))
+                    if archive_dates_error:
+                        st.error(f"Не удалось получить даты архива: {archive_dates_error}")
+                    elif archive_available_dates:
+                        st.success(
+                            f"Архив меню подключён: дат плана — {len(archive_available_dates)}; "
+                            f"период {archive_available_dates[0]:%d.%m.%Y}–"
+                            f"{archive_available_dates[-1]:%d.%m.%Y}. "
+                            "Источник количества — поле «План» из datalens_menu."
+                        )
+                    else:
+                        st.warning("В системном архиве пока нет сохранённых дат меню.")
+            with archive_status_columns[1]:
+                if st.button(
+                    "Обновить архив",
+                    use_container_width=True,
+                    key="refresh_menu_archive_freshness_v80",
+                ):
+                    _fetch_system_menu_archive_dates.clear()
+                    _fetch_system_menu_archive_day.clear()
+                    st.rerun()
 
-            start_key = "freshness_period_start_v75"
-            end_key = "freshness_period_end_v75"
-            anchor_key = "freshness_period_anchor_v75"
+            available_plan_dates = archive_available_dates
+
+        period_plans = pd.DataFrame(
+            columns=[
+                "plan_date", "plan_sheet", "point_number", "sku", "product_name",
+                "matrix_category", "unit_price", "analyst_plan",
+            ]
+        )
+        selected_plan_dates: list[date] = []
+
+        if available_plan_dates:
+            source_start = available_plan_dates[0]
+            source_end = available_plan_dates[-1]
+            source_suffix = (
+                "archive"
+                if freshness_plan_source == "Архив меню"
+                else "matrix"
+            )
+            start_key = f"freshness_period_start_v80_{source_suffix}"
+            end_key = f"freshness_period_end_v80_{source_suffix}"
+            anchor_key = f"freshness_period_anchor_v80_{source_suffix}"
+
             if (
                 st.session_state.get(start_key) not in available_plan_dates
                 or st.session_state.get(end_key) not in available_plan_dates
             ):
-                st.session_state[start_key] = matrix_start
-                st.session_state[end_key] = matrix_end
+                if freshness_plan_source == "Архив меню":
+                    # Архив может быть длинным, поэтому при первом открытии не загружаем всё сразу.
+                    st.session_state[start_key] = source_end
+                    st.session_state[end_key] = source_end
+                else:
+                    st.session_state[start_key] = source_start
+                    st.session_state[end_key] = source_end
                 st.session_state[anchor_key] = None
 
             st.markdown("#### Период плана")
-            st.caption(
-                "По умолчанию выбраны все даты из планов 1–4 недель. "
-                "Чтобы выбрать свой период, нажмите первую дату, затем последнюю."
-            )
+            if freshness_plan_source == "Архив меню":
+                st.caption(
+                    "Выберите одну архивную дату или диапазон: нажмите первую дату, затем последнюю. "
+                    "При расчёте приложение автоматически подгрузит также до 7 предыдущих архивных "
+                    "дат, если они нужны для живых партий в окне свежести."
+                )
+                all_dates_label = "Весь доступный архив"
+            else:
+                st.caption(
+                    "По умолчанию выбраны все даты из планов 1–4 недель. "
+                    "Чтобы выбрать свой период, нажмите первую дату, затем последнюю."
+                )
+                all_dates_label = "Все даты 1–4 недель"
+
             if st.button(
-                "Все даты 1–4 недель",
-                key="freshness_all_dates_v75",
+                all_dates_label,
+                key=f"freshness_all_dates_v80_{source_suffix}",
                 type="primary",
                 use_container_width=False,
             ):
-                st.session_state[start_key] = matrix_start
-                st.session_state[end_key] = matrix_end
+                st.session_state[start_key] = source_start
+                st.session_state[end_key] = source_end
                 st.session_state[anchor_key] = None
                 st.rerun()
 
@@ -12820,7 +13022,10 @@ if tab_sales_time.open:
                     is_selected = selected_start <= plan_date <= selected_end
                     if date_columns[offset].button(
                         f"{plan_date:%d.%m} · {weekday_short[plan_date.weekday()]}",
-                        key=f"freshness_date_button_v75_{plan_date.isoformat()}",
+                        key=(
+                            f"freshness_date_button_v80_{source_suffix}_"
+                            f"{plan_date.isoformat()}"
+                        ),
                         type="primary" if is_selected else "secondary",
                         use_container_width=True,
                     ):
@@ -12847,107 +13052,193 @@ if tab_sales_time.open:
                 f"Выбрано дат плана: {len(selected_plan_dates)} · "
                 f"{shipment_start:%d.%m.%Y}–{shipment_end:%d.%m.%Y}"
             )
-            period_plans = sales_time_plans[
-                sales_time_plans["plan_date"].isin(selected_plan_dates)
-            ].copy()
 
-            # Краткая сводка строится ТОЛЬКО по самой матрице 2.3.
-            # Категория берётся из колонки «Категория», значение — из итоговой
-            # колонки «СДАЛИ». PostgreSQL, entities и сопоставление SKU здесь не участвуют.
-            matrix_category_surrender = parse_matrix_category_surrender_totals(matrix_snapshot_bytes)
-            matrix_category_surrender = matrix_category_surrender[
-                matrix_category_surrender["plan_date"].isin(selected_plan_dates)
-            ].copy()
+            if freshness_plan_source == "Архив меню":
+                archive_context_start = shipment_start - timedelta(days=7)
+                archive_context_dates = [
+                    plan_date for plan_date in available_plan_dates
+                    if archive_context_start <= plan_date <= shipment_end
+                ]
+                with st.spinner(
+                    f"Загружаю план из архива: {len(archive_context_dates)} дат…"
+                ):
+                    sales_time_plans, archive_snapshot_ids, archive_load_warnings = (
+                        _load_archive_freshness_period(archive_context_dates)
+                    )
+                if archive_load_warnings:
+                    st.warning(
+                        "Часть архивных дат не загрузилась: "
+                        + "; ".join(archive_load_warnings[:5])
+                        + ("…" if len(archive_load_warnings) > 5 else "")
+                    )
+                if not sales_time_plans.empty:
+                    st.success(
+                        f"План из архива загружен: выбранных дат — {len(selected_plan_dates)}, "
+                        f"контекстных дат для свежести — {len(archive_context_dates)}, "
+                        f"SKU — {sales_time_plans['sku'].nunique()}, "
+                        f"снимков — {len(archive_snapshot_ids)}."
+                    )
 
-            plan_category_summary = matrix_category_surrender.pivot_table(
-                index="matrix_category",
-                columns="plan_date",
-                values="matrix_surrender",
-                aggfunc="sum",
-                fill_value=0.0,
-            )
-            plan_category_summary = plan_category_summary.reindex(
-                columns=selected_plan_dates, fill_value=0.0
-            )
+            if not sales_time_plans.empty:
+                period_plans = sales_time_plans[
+                    sales_time_plans["plan_date"].isin(selected_plan_dates)
+                ].copy()
 
-            # Порядок задаём по названиям, которые реально используются в матрице.
-            plan_summary_category_order = [
-                "Завтрак", "Завтраки",
-                "Салат", "Салаты", "Премиум",
-                "Суп", "Супы",
-                "Второе", "Вторые блюда",
-                "Сэндвич", "Сэндвичи",
-                "Япония",
-                "Десерт", "Десерты", "Выпечка",
-                "Напиток", "Напитки",
-                "Хлеб",
-                "Без категории",
-            ]
-            plan_summary_rank = {
-                category: index for index, category in enumerate(plan_summary_category_order)
-            }
-            if not plan_category_summary.empty:
+            if not period_plans.empty:
+                if freshness_plan_source == "Архив меню":
+                    category_metric_source = period_plans[
+                        ["plan_date", "matrix_category", "analyst_plan"]
+                    ].copy()
+                    category_metric_source["matrix_category"] = (
+                        category_metric_source["matrix_category"]
+                        .fillna("")
+                        .astype(str)
+                        .str.strip()
+                        .replace("", "Без категории")
+                    )
+                    category_metric_source = (
+                        category_metric_source
+                        .groupby(
+                            ["plan_date", "matrix_category"],
+                            as_index=False,
+                            dropna=False,
+                        )["analyst_plan"]
+                        .sum()
+                        .rename(columns={"analyst_plan": "category_metric"})
+                    )
+                    summary_title = "План по категориям · архив меню"
+                    summary_caption = (
+                        "Источник — системный архив datalens_menu. "
+                        "Категория и количество «План» берутся из сохранённого меню; "
+                        "PostgreSQL для этой сводки не используется."
+                    )
+                else:
+                    matrix_category_surrender = parse_matrix_category_surrender_totals(
+                        matrix_snapshot_bytes
+                    )
+                    matrix_category_surrender = matrix_category_surrender[
+                        matrix_category_surrender["plan_date"].isin(selected_plan_dates)
+                    ].copy()
+                    category_metric_source = matrix_category_surrender.rename(
+                        columns={"matrix_surrender": "category_metric"}
+                    )
+                    summary_title = "Сдали по категориям · только Матрица КОМБО"
+                    summary_caption = (
+                        "Источник этой таблицы — только «2.3 Матрица КОМБО». "
+                        "Категория берётся напрямую из колонки «Категория», значение — "
+                        "напрямую из итоговой колонки «СДАЛИ». PostgreSQL, БД и справочник "
+                        "сущностей не используются."
+                    )
+
+                plan_category_summary = category_metric_source.pivot_table(
+                    index="matrix_category",
+                    columns="plan_date",
+                    values="category_metric",
+                    aggfunc="sum",
+                    fill_value=0.0,
+                )
+                plan_category_summary = plan_category_summary.reindex(
+                    columns=selected_plan_dates, fill_value=0.0
+                )
+
+                plan_summary_category_order = [
+                    "Завтрак", "Завтраки",
+                    "Салат", "Салаты", "Премиум",
+                    "Суп", "Супы",
+                    "Второе", "Вторые блюда",
+                    "Сэндвич", "Сэндвичи",
+                    "Япония",
+                    "Десерт", "Десерты", "Выпечка",
+                    "Напиток", "Напитки",
+                    "Хлеб",
+                    "Без категории",
+                ]
+                plan_summary_rank = {
+                    category: index
+                    for index, category in enumerate(plan_summary_category_order)
+                }
+                if not plan_category_summary.empty:
+                    plan_category_summary = (
+                        plan_category_summary
+                        .reset_index()
+                        .assign(
+                            _category_order=lambda frame: frame["matrix_category"]
+                            .map(plan_summary_rank)
+                            .fillna(99)
+                        )
+                        .sort_values(
+                            ["_category_order", "matrix_category"],
+                            kind="stable",
+                        )
+                        .drop(columns="_category_order")
+                        .set_index("matrix_category")
+                    )
+
+                plan_date_labels = {
+                    plan_date: (
+                        f"{plan_date:%d.%m} "
+                        f"{weekday_short.get(plan_date.weekday(), '')}"
+                    )
+                    for plan_date in selected_plan_dates
+                }
+                plan_category_summary = plan_category_summary.rename(
+                    columns=plan_date_labels
+                )
+                plan_day_columns = [
+                    plan_date_labels[plan_date]
+                    for plan_date in selected_plan_dates
+                ]
+                plan_category_summary["ВСЕГО"] = (
+                    plan_category_summary[plan_day_columns].sum(axis=1)
+                    if plan_day_columns
+                    else 0.0
+                )
                 plan_category_summary = (
                     plan_category_summary
                     .reset_index()
-                    .assign(
-                        _category_order=lambda frame: frame["matrix_category"]
-                        .map(plan_summary_rank)
-                        .fillna(99)
+                    .rename(columns={"matrix_category": "Категория"})
+                )
+
+                total_plan_row = {"Категория": "ВСЕГО"}
+                for column in [*plan_day_columns, "ВСЕГО"]:
+                    total_plan_row[column] = float(
+                        pd.to_numeric(
+                            plan_category_summary.get(column),
+                            errors="coerce",
+                        )
+                        .fillna(0.0)
+                        .sum()
                     )
-                    .sort_values(["_category_order", "matrix_category"], kind="stable")
-                    .drop(columns="_category_order")
-                    .set_index("matrix_category")
+                plan_category_summary = pd.concat(
+                    [plan_category_summary, pd.DataFrame([total_plan_row])],
+                    ignore_index=True,
                 )
 
-            plan_date_labels = {
-                plan_date: f"{plan_date:%d.%m} {weekday_short.get(plan_date.weekday(), '')}"
-                for plan_date in selected_plan_dates
-            }
-            plan_category_summary = plan_category_summary.rename(columns=plan_date_labels)
-            plan_day_columns = [plan_date_labels[plan_date] for plan_date in selected_plan_dates]
-            plan_category_summary["ВСЕГО"] = (
-                plan_category_summary[plan_day_columns].sum(axis=1)
-                if plan_day_columns
-                else 0.0
-            )
-            plan_category_summary = plan_category_summary.reset_index().rename(
-                columns={"matrix_category": "Категория"}
-            )
-
-            total_plan_row = {"Категория": "ВСЕГО"}
-            for column in [*plan_day_columns, "ВСЕГО"]:
-                total_plan_row[column] = float(
-                    pd.to_numeric(plan_category_summary.get(column), errors="coerce")
-                    .fillna(0.0)
-                    .sum()
-                )
-            plan_category_summary = pd.concat(
-                [plan_category_summary, pd.DataFrame([total_plan_row])],
-                ignore_index=True,
-            )
-
-            st.markdown("#### Сдали по категориям · только Матрица КОМБО")
-            st.caption(
-                "Источник этой таблицы — только «2.3 Матрица КОМБО». "
-                "Категория берётся напрямую из колонки «Категория», значение — напрямую "
-                "из итоговой колонки «СДАЛИ». PostgreSQL, БД и справочник сущностей не используются. "
-                "Строка «Без категории» сохраняет ненулевые значения СДАЛИ у строк матрицы без категории."
-            )
-            st.dataframe(
-                plan_category_summary,
-                use_container_width=True,
-                hide_index=True,
-                height=min(470, 38 * len(plan_category_summary) + 80),
-                column_config={
-                    "Категория": st.column_config.TextColumn(width="medium"),
-                    **{
-                        column: st.column_config.NumberColumn(format="%.0f")
-                        for column in [*plan_day_columns, "ВСЕГО"]
+                st.markdown(f"#### {summary_title}")
+                st.caption(summary_caption)
+                st.dataframe(
+                    plan_category_summary,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(470, 38 * len(plan_category_summary) + 80),
+                    column_config={
+                        "Категория": st.column_config.TextColumn(width="medium"),
+                        **{
+                            column: st.column_config.NumberColumn(format="%.0f")
+                            for column in [*plan_day_columns, "ВСЕГО"]
+                        },
                     },
-                },
-            )
+                )
 
+        if period_plans.empty:
+            if freshness_plan_source == "Архив меню" and available_plan_dates:
+                st.warning(
+                    "Для выбранных архивных дат план не загрузился. "
+                    "Проверьте доступ к системному архиву и наличие строк datalens_menu."
+                )
+            elif freshness_plan_source == "Текущая Матрица КОМБО" and available_plan_dates:
+                st.warning("Для выбранного периода в Матрице КОМБО нет строк плана.")
+        else:
             current_mapping = st.session_state.get("point_mapping", {})
             point_to_shop = {
                 label: int(shop_number)
