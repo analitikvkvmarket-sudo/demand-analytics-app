@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.30-FRESHNESS-CATEGORY-MERGED"
+BUILD_ID = "75.11.31-FRESHNESS-PLAN-AMOUNT"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -8004,7 +8004,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.11.30 · FRESHNESS CATEGORY MERGED")
+    st.caption("Аналитика спроса · версия 75.11.31 · FRESHNESS PLAN AMOUNT")
     st.caption("Автозагрузка данных · SEPARATE-MENU")
     st.caption(f"SKU / категории / сущности · {entity_reference_source}")
     if entity_reference_warning and not entity_reference_source.startswith("Apps Script"):
@@ -13105,6 +13105,8 @@ if tab_sales_time.open:
                 summary_dates: list[date],
                 title: str,
                 caption: str,
+                amount_column: str | None = None,
+                amount_title: str = "Плановая сумма, ₽",
             ) -> None:
                 if metric_frame.empty or not summary_dates:
                     return
@@ -13147,6 +13149,23 @@ if tab_sales_time.open:
                     )
 
                 work["matrix_category"] = work["matrix_category"].map(_summary_category)
+
+                # Для плана дополнительно считаем деньги за весь выбранный период.
+                # Сумма считается на уровне исходной строки: план × цена SKU.
+                category_amount_totals = None
+                if amount_column and amount_column in work.columns:
+                    work[amount_column] = pd.to_numeric(
+                        work[amount_column],
+                        errors="coerce",
+                    ).fillna(0.0)
+                    category_amount_totals = (
+                        work.groupby(
+                            "matrix_category",
+                            dropna=False,
+                        )[amount_column]
+                        .sum()
+                    )
+
                 category_metric_source = (
                     work.groupby(
                         ["plan_date", "matrix_category"],
@@ -13218,6 +13237,14 @@ if tab_sales_time.open:
                     .rename(columns={"matrix_category": "Категория"})
                 )
 
+                if category_amount_totals is not None:
+                    # Добавляем денежный итог строго после колонки «ВСЕГО».
+                    plan_category_summary[amount_title] = (
+                        plan_category_summary["Категория"]
+                        .map(category_amount_totals)
+                        .fillna(0.0)
+                    )
+
                 total_row = {"Категория": "ВСЕГО"}
                 for column in [*day_columns, "ВСЕГО"]:
                     total_row[column] = float(
@@ -13228,6 +13255,16 @@ if tab_sales_time.open:
                         .fillna(0.0)
                         .sum()
                     )
+                if category_amount_totals is not None:
+                    total_row[amount_title] = float(
+                        pd.to_numeric(
+                            plan_category_summary.get(amount_title),
+                            errors="coerce",
+                        )
+                        .fillna(0.0)
+                        .sum()
+                    )
+
                 plan_category_summary = pd.concat(
                     [plan_category_summary, pd.DataFrame([total_row])],
                     ignore_index=True,
@@ -13246,6 +13283,16 @@ if tab_sales_time.open:
                             column: st.column_config.NumberColumn(format="%.0f")
                             for column in [*day_columns, "ВСЕГО"]
                         },
+                        **(
+                            {
+                                amount_title: st.column_config.NumberColumn(
+                                    format="%.0f",
+                                    width="medium",
+                                )
+                            }
+                            if category_amount_totals is not None
+                            else {}
+                        ),
                     },
                 )
 
@@ -13253,18 +13300,39 @@ if tab_sales_time.open:
             # datalens_menu, текущие даты — план из Матрицы КОМБО. Показатель одинаковый,
             # поэтому его можно честно суммировать за общий выбранный период.
             if not period_plans.empty:
+                plan_category_money_source = period_plans[
+                    [
+                        "plan_date",
+                        "matrix_category",
+                        "analyst_plan",
+                        "unit_price",
+                    ]
+                ].copy()
+                plan_category_money_source["planned_amount"] = (
+                    pd.to_numeric(
+                        plan_category_money_source["analyst_plan"],
+                        errors="coerce",
+                    ).fillna(0.0)
+                    * pd.to_numeric(
+                        plan_category_money_source["unit_price"],
+                        errors="coerce",
+                    ).fillna(0.0)
+                )
+
                 _render_freshness_category_summary(
-                    period_plans[
-                        ["plan_date", "matrix_category", "analyst_plan"]
-                    ].copy(),
+                    plan_category_money_source,
                     "analyst_plan",
                     selected_plan_dates,
                     "План по категориям · Матрица + архив",
                     (
                         "Архивные даты берутся из системного архива datalens_menu; "
-                        "текущие даты — из Матрицы КОМБО. Если дата присутствует в обоих "
-                        "источниках, используется текущая Матрица. PostgreSQL в эту сводку не входит."
+                        "текущие даты — из Матрицы КОМБО. Колонка «Плановая сумма, ₽» "
+                        "считается как план × цена SKU за весь выбранный период. "
+                        "Если дата присутствует в обоих источниках, используется текущая "
+                        "Матрица. PostgreSQL в эту сводку не входит."
                     ),
+                    amount_column="planned_amount",
+                    amount_title="Плановая сумма, ₽",
                 )
 
             # Сохраняем существующую таблицу СДАЛИ для тех выбранных дат,
