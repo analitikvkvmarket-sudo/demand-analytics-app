@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.29-FRESHNESS-ARCHIVE-PLAN"
+BUILD_ID = "75.11.30-FRESHNESS-CATEGORY-MERGED"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -8004,7 +8004,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.11.29 · FRESHNESS ARCHIVE PLAN")
+    st.caption("Аналитика спроса · версия 75.11.30 · FRESHNESS CATEGORY MERGED")
     st.caption("Автозагрузка данных · SEPARATE-MENU")
     st.caption(f"SKU / категории / сущности · {entity_reference_source}")
     if entity_reference_warning and not entity_reference_source.startswith("Apps Script"):
@@ -13109,13 +13109,44 @@ if tab_sales_time.open:
                 if metric_frame.empty or not summary_dates:
                     return
                 work = metric_frame.copy()
-                work["matrix_category"] = (
-                    work["matrix_category"]
-                    .fillna("")
-                    .astype(str)
-                    .str.strip()
-                    .replace("", "Без категории")
-                )
+
+                # Архив и текущая Матрица КОМБО исторически используют разные
+                # формы названий одних и тех же категорий. Нормализуем их ТОЛЬКО
+                # для этой объединённой сводки, не меняя исходные данные и
+                # бизнес-логику категорий в остальных разделах приложения.
+                # «Премиум» сохраняется отдельной категорией.
+                summary_category_aliases = {
+                    "завтрак": "Завтраки",
+                    "завтраки": "Завтраки",
+                    "салат": "Салаты",
+                    "салаты": "Салаты",
+                    "суп": "Супы",
+                    "супы": "Супы",
+                    "второе": "Вторые блюда",
+                    "вторые блюда": "Вторые блюда",
+                    "сэндвич": "Сэндвичи",
+                    "сэндвичи": "Сэндвичи",
+                    "десерт": "Десерты",
+                    "десерты": "Десерты",
+                    "напиток": "Напитки",
+                    "напитки": "Напитки",
+                    "япония": "Япония",
+                    "хлеб": "Хлеб",
+                    "выпечка": "Выпечка",
+                    "премиум": "Премиум",
+                    "без категории": "Без категории",
+                }
+
+                def _summary_category(value: object) -> str:
+                    category_text = str(value or "").strip()
+                    if not category_text:
+                        return "Без категории"
+                    return summary_category_aliases.get(
+                        category_text.casefold(),
+                        category_text,
+                    )
+
+                work["matrix_category"] = work["matrix_category"].map(_summary_category)
                 category_metric_source = (
                     work.groupby(
                         ["plan_date", "matrix_category"],
@@ -13137,14 +13168,16 @@ if tab_sales_time.open:
                 )
 
                 plan_summary_category_order = [
-                    "Завтрак", "Завтраки",
-                    "Салат", "Салаты", "Премиум",
-                    "Суп", "Супы",
-                    "Второе", "Вторые блюда",
-                    "Сэндвич", "Сэндвичи",
+                    "Завтраки",
+                    "Салаты",
+                    "Премиум",
+                    "Супы",
+                    "Вторые блюда",
+                    "Сэндвичи",
                     "Япония",
-                    "Десерт", "Десерты", "Выпечка",
-                    "Напиток", "Напитки",
+                    "Десерты",
+                    "Выпечка",
+                    "Напитки",
                     "Хлеб",
                     "Без категории",
                 ]
