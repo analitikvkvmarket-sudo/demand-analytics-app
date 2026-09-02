@@ -10,6 +10,10 @@ import math
 import os
 import re
 import tempfile
+import queue
+import threading
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -30,7 +34,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.33-ENTITY-REFRESH"
+BUILD_ID = "75.11.34-PERF-V1"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -245,8 +249,47 @@ def _fetch_apps_script_matrix_snapshot(
         if missing:
             raise RuntimeError("в Apps Script не найдены листы планов: " + ", ".join(missing))
 
+        def _fetch_plan_sheet(sheet_name: str) -> tuple[str, list[list[object]]]:
+            # requests.Session is not shared between worker threads. Each worker gets
+            # its own short-lived session, so the fetch stays thread-safe.
+            with requests.Session() as worker_session:
+                sheet_response = worker_session.get(
+                    api_url,
+                    params={"key": api_key, "action": "sheet", "name": sheet_name},
+                    timeout=90,
+                    allow_redirects=True,
+                )
+                sheet_response.raise_for_status()
+                payload = sheet_response.json()
+                if not payload.get("ok"):
+                    raise RuntimeError(
+                        f"{sheet_name}: {payload.get('error') or 'Apps Script вернул ошибку'}"
+                    )
+                values = payload.get("values")
+                if not isinstance(values, list):
+                    raise RuntimeError(f"{sheet_name}: Apps Script не вернул массив values")
+                return sheet_name, values
+
         sheet_payloads: dict[str, list[list[object]]] = {}
-        for sheet_name in MATRIX_PLAN_SHEETS:
+        failed_sheets: list[str] = []
+        max_workers = max(1, min(4, len(MATRIX_PLAN_SHEETS)))
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="matrix-plan") as executor:
+            future_to_sheet = {
+                executor.submit(_fetch_plan_sheet, sheet_name): sheet_name
+                for sheet_name in MATRIX_PLAN_SHEETS
+            }
+            for future in as_completed(future_to_sheet):
+                sheet_name = future_to_sheet[future]
+                try:
+                    fetched_name, values = future.result()
+                    sheet_payloads[fetched_name] = values
+                except Exception:
+                    # A transient Apps Script quota/network error should not force the
+                    # whole matrix to an old fallback. Retry only the failed sheet once
+                    # using the already-open main session.
+                    failed_sheets.append(sheet_name)
+
+        for sheet_name in failed_sheets:
             sheet_response = session.get(
                 api_url,
                 params={"key": api_key, "action": "sheet", "name": sheet_name},
@@ -336,10 +379,18 @@ def get_current_combo_matrix_snapshot() -> tuple[bytes, str, str, str]:
         MATRIX_APPS_SCRIPT_KEY,
     )
     if google_bytes:
-        try:
-            GOOGLE_MATRIX_CACHE_FILE.write_bytes(google_bytes)
-        except OSError:
-            pass
+        matrix_digest = hashlib.sha256(google_bytes).hexdigest()
+        digest_state_key = "google_matrix_cache_digest_perf_v1"
+        should_write_cache = (
+            not GOOGLE_MATRIX_CACHE_FILE.exists()
+            or st.session_state.get(digest_state_key) != matrix_digest
+        )
+        if should_write_cache:
+            try:
+                GOOGLE_MATRIX_CACHE_FILE.write_bytes(google_bytes)
+                st.session_state[digest_state_key] = matrix_digest
+            except OSError:
+                pass
         return google_bytes, google_source, checked_at, ""
 
     if GOOGLE_MATRIX_CACHE_FILE.exists():
@@ -1294,6 +1345,115 @@ def connection_settings() -> dict[str, object]:
     }
 
 
+class _PgConnectionPool:
+    """Small thread-safe pool that reuses PostgreSQL SSL connections.
+
+    It deliberately uses only psycopg + Python stdlib, so the optimized app.py
+    does not require a requirements.txt change. Connections run in autocommit
+    mode because all current pooled queries are read-only SELECTs.
+    """
+
+    def __init__(self, settings: dict[str, object], max_size: int = 4) -> None:
+        self.settings = dict(settings)
+        self.max_size = max(1, int(max_size))
+        self._idle: queue.LifoQueue = queue.LifoQueue(maxsize=self.max_size)
+        self._lock = threading.Lock()
+        self._created = 0
+
+    def _created_add(self, delta: int) -> None:
+        with self._lock:
+            self._created = max(0, self._created + delta)
+
+    def _new_connection(self):
+        return psycopg.connect(**self.settings, autocommit=True)
+
+    def _acquire(self):
+        try:
+            connection = self._idle.get_nowait()
+        except queue.Empty:
+            with self._lock:
+                can_create = self._created < self.max_size
+                if can_create:
+                    self._created += 1
+            if can_create:
+                try:
+                    connection = self._new_connection()
+                except Exception:
+                    self._created_add(-1)
+                    raise
+            else:
+                connection = self._idle.get(timeout=30)
+
+        if getattr(connection, "closed", False):
+            # Replace the dead connection in-place: its pool slot is already
+            # counted in _created, so no extra reservation is needed.
+            try:
+                connection = self._new_connection()
+            except Exception:
+                self._created_add(-1)
+                raise
+        return connection
+
+    def _discard(self, connection) -> None:
+        try:
+            connection.close()
+        except Exception:
+            pass
+        self._created_add(-1)
+
+    def _release(self, connection) -> None:
+        if getattr(connection, "closed", False):
+            self._created_add(-1)
+            return
+        try:
+            self._idle.put_nowait(connection)
+        except queue.Full:
+            self._discard(connection)
+
+    @contextmanager
+    def connection(self):
+        connection = self._acquire()
+        try:
+            yield connection
+        except Exception:
+            # A connection that failed mid-query is not returned to the pool.
+            self._discard(connection)
+            raise
+        else:
+            self._release(connection)
+
+
+def _pg_pool_signature() -> tuple[object, ...]:
+    settings = connection_settings()
+    password_fingerprint = hashlib.sha256(
+        str(settings.get("password", "")).encode("utf-8")
+    ).hexdigest()
+    return (
+        settings.get("host"),
+        settings.get("port"),
+        settings.get("dbname"),
+        settings.get("user"),
+        settings.get("sslmode"),
+        settings.get("connect_timeout"),
+        password_fingerprint,
+    )
+
+
+@st.cache_resource(show_spinner=False)
+def _get_pg_pool(signature: tuple[object, ...]) -> _PgConnectionPool:
+    del signature  # only used as the Streamlit cache key
+    max_size = int(os.getenv("PGPOOL_MAX_SIZE", "4"))
+    return _PgConnectionPool(connection_settings(), max_size=max_size)
+
+
+@contextmanager
+def pg_connection():
+    """Borrow a reusable PostgreSQL connection for one query."""
+    pool = _get_pg_pool(_pg_pool_signature())
+    with pool.connection() as connection:
+        yield connection
+
+
 @st.cache_data(ttl=900, show_spinner="Загружаю продажи из PostgreSQL…")
 def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]) -> pd.DataFrame:
     query = """
@@ -1332,7 +1492,7 @@ def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]
                      'БЕЗ_SKU'
                  )
     """
-    with psycopg.connect(**connection_settings()) as connection:
+    with pg_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 query,
@@ -1364,7 +1524,7 @@ def load_available_shops(date_from: date, date_to_exclusive: date) -> pd.DataFra
         GROUP BY shop_number
         ORDER BY shop_number
     """
-    with psycopg.connect(**connection_settings()) as connection:
+    with pg_connection() as connection:
         return pd.read_sql_query(
             query,
             connection,
@@ -1433,7 +1593,7 @@ def load_forecast_history(date_from: date, date_to_exclusive: date, points: tupl
                      'БЕЗ_SKU'
                  )
     """
-    with psycopg.connect(**connection_settings()) as connection:
+    with pg_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 query,
