@@ -30,7 +30,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.32-ENTITY-SOURCE-SPRAVOCHNIK"
+BUILD_ID = "75.11.33-ENTITY-REFRESH"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -7707,9 +7707,22 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.11.14 · CATEGORY SKU CALENDAR AVG SEPARATE")
+    st.caption("Аналитика спроса · версия 75.11.33 · ENTITY REFRESH")
     st.caption("Автозагрузка данных · SEPARATE-MENU")
     st.caption(f"SKU / категории / сущности · {entity_reference_source}")
+    if entity_reference_checked_at:
+        checked_label = str(entity_reference_checked_at).replace("T", " ")
+        st.caption(f"Справочник проверен: {checked_label}")
+    if st.button(
+        "Обновить справочник сейчас",
+        use_container_width=True,
+        key="refresh_entity_reference_now_v751133",
+        help="Сбрасывает только кэш SKU/категорий/сущностей и заново читает лист «Справочник» через Apps Script.",
+    ):
+        _fetch_apps_script_entity_reference.clear()
+        load_entities_from_matrix_bytes.clear()
+        load_entities.clear()
+        st.rerun()
     if entity_reference_warning and not entity_reference_source.startswith("Apps Script"):
         st.caption(f"Автоисточник справочника временно недоступен: {entity_reference_warning}. Планы загружаются отдельно.")
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
