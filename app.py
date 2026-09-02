@@ -34,7 +34,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.35-SQL-V2"
+BUILD_ID = "75.11.34-PERF-V1"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -1509,63 +1509,19 @@ def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]
     return frame
 
 
-@st.cache_data(ttl=900, show_spinner="Загружаю дневные продажи из PostgreSQL…")
-def load_daily_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]) -> pd.DataFrame:
-    """Load compact day + shop + SKU aggregates for reports that do not need sale time."""
-    query = """
-        SELECT
-            business_date,
-            shop_number,
-            COALESCE(
-                NULLIF(TRIM(erp_code), ''),
-                NULLIF(TRIM(product_code), ''),
-                NULLIF(TRIM(barcode), ''),
-                NULLIF(TRIM(product_hash), ''),
-                'БЕЗ_SKU'
-            ) AS sku,
-            MAX(product_name) AS product_name,
-            SUM(net_quantity)::numeric AS sold_quantity,
-            SUM(net_line_amount)::numeric AS revenue
-        FROM dwh.v_sales_item
-        WHERE business_date >= %(date_from)s
-          AND business_date < %(date_to)s
-          AND shop_number = ANY(%(points)s)
-        GROUP BY business_date, shop_number,
-                 COALESCE(
-                     NULLIF(TRIM(erp_code), ''),
-                     NULLIF(TRIM(product_code), ''),
-                     NULLIF(TRIM(barcode), ''),
-                     NULLIF(TRIM(product_hash), ''),
-                     'БЕЗ_SKU'
-                 )
-    """
-    with pg_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                query,
-                {"date_from": date_from, "date_to": date_to_exclusive, "points": list(points)},
-            )
-            records = cursor.fetchall()
-            columns = [description.name for description in cursor.description]
-    result = pd.DataFrame(records, columns=columns)
-    if result.empty:
-        return result
-    result["sku"] = result["sku"].map(normalize_sku)
-    result["business_date"] = pd.to_datetime(result["business_date"], errors="coerce").dt.date
-    result["sold_quantity"] = pd.to_numeric(result["sold_quantity"], errors="coerce").fillna(0.0)
-    result["revenue"] = pd.to_numeric(result["revenue"], errors="coerce").fillna(0.0)
-    return result
-
-
 @st.cache_data(ttl=300, show_spinner="Ищу магазины с продажами…")
 def load_available_shops(date_from: date, date_to_exclusive: date) -> pd.DataFrame:
-    """Return only shop identifiers; totals/receipts are not needed for point discovery."""
     query = """
-        SELECT DISTINCT shop_number
+        SELECT
+            shop_number,
+            COUNT(DISTINCT source_purchase_id) AS receipts,
+            SUM(net_quantity)::numeric AS sold_quantity,
+            MIN(business_date) AS first_sale_date,
+            MAX(business_date) AS last_sale_date
         FROM dwh.v_sales_item
         WHERE business_date >= %(date_from)s
           AND business_date < %(date_to)s
-          AND shop_number IS NOT NULL
+        GROUP BY shop_number
         ORDER BY shop_number
     """
     with pg_connection() as connection:
@@ -1591,7 +1547,15 @@ def ensure_required_shops(frame: pd.DataFrame) -> pd.DataFrame:
     missing_rows = []
     for shop_number in REQUIRED_POINT_SHOPS:
         if shop_number not in existing:
-            missing_rows.append({"shop_number": shop_number})
+            missing_rows.append(
+                {
+                    "shop_number": shop_number,
+                    "receipts": 0,
+                    "sold_quantity": 0.0,
+                    "first_sale_date": pd.NaT,
+                    "last_sale_date": pd.NaT,
+                }
+            )
     if missing_rows:
         result = pd.concat([result, pd.DataFrame(missing_rows)], ignore_index=True)
     if "shop_number" in result.columns:
@@ -8553,12 +8517,12 @@ if tab_report.open:
                     point_numbers = tuple(sorted(int(point[1:]) for point in report_points))
                     try:
                         with st.spinner("Загружаю продажи для двух периодов…"):
-                            raw_1 = load_daily_sales(
+                            raw_1 = load_sales(
                                 report_period_1[0],
                                 report_period_1[1] + timedelta(days=1),
                                 point_numbers,
                             )
-                            raw_2 = load_daily_sales(
+                            raw_2 = load_sales(
                                 report_period_2[0],
                                 report_period_2[1] + timedelta(days=1),
                                 point_numbers,
@@ -10806,7 +10770,7 @@ if tab_abc.open:
                     abc_point_to_shop[label] for label in abc_selected_points
                 )
                 try:
-                    abc_sales_source = load_daily_sales(
+                    abc_sales_source = load_forecast_history(
                         abc_start_date,
                         abc_end_date + timedelta(days=1),
                         abc_shop_numbers,
@@ -11411,7 +11375,7 @@ if tab_category_analysis.open:
                 for shop_number in month_week_shop_numbers
             }
             if month_week_shop_numbers:
-                month_week_sales = load_daily_sales(
+                month_week_sales = load_forecast_history(
                     selected_month_week,
                     month_week_next_month,
                     month_week_shop_numbers,
@@ -11845,7 +11809,7 @@ if tab_category_analysis.open:
                 category_sales_history = pd.DataFrame()
             else:
                 try:
-                    category_sales_history = load_daily_sales(
+                    category_sales_history = load_forecast_history(
                         min(range_start for _, range_start, _ in category_periods),
                         max(range_end for _, _, range_end in category_periods) + timedelta(days=1),
                         category_shop_numbers,
@@ -15516,7 +15480,7 @@ if tab_forecast.open:
                                 if number != 11
                             }
                         try:
-                            forecast_history = load_daily_sales(
+                            forecast_history = load_forecast_history(
                                 history_from,
                                 last_target_date,
                                 tuple(sorted(forecast_points)),
