@@ -34,7 +34,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.37-HANDOVER-CATEGORY-SUMMARY"
+BUILD_ID = "75.11.38-HANDOVER-CATEGORY-FALLBACK"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -13393,8 +13393,23 @@ if tab_sales_time.open:
                     handover_period["reference_category"] = (
                         handover_period["reference_category"].fillna("").astype(str).str.strip()
                     )
+                    # Если SKU уже есть в живом «Справочнике», но категория там ещё
+                    # не заполнена, не затираем корректную категорию из самого меню.
+                    # Это особенно важно для новых SKU: «Не сопоставлено» в справочнике
+                    # означает отсутствие категории, а не отдельную бизнес-категорию.
+                    reference_category_normalized = (
+                        handover_period["reference_category"]
+                        .str.casefold()
+                        .str.replace("ё", "е", regex=False)
+                    )
+                    reference_category_is_valid = (
+                        handover_period["reference_category"].ne("")
+                        & ~reference_category_normalized.isin(
+                            {"не сопоставлено", "не задана", "nan", "none"}
+                        )
+                    )
                     handover_period["category"] = handover_period["reference_category"].where(
-                        handover_period["reference_category"].ne(""),
+                        reference_category_is_valid,
                         handover_period["category"],
                     ).map(normalize_matrix_category)
                     handover_period = handover_period.drop(
