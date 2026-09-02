@@ -34,7 +34,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.34-PERF-V1"
+BUILD_ID = "75.11.42-PLANNING-TAB-FIX"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -518,6 +518,109 @@ def _fetch_system_menu_archive_day(
         return snapshot_id, frame[list(rename_map.values())].copy(), ""
     except Exception as error:
         return "", pd.DataFrame(), str(error)
+
+
+
+
+def _archive_menu_frame_to_freshness_plan(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert one archive API day to the same schema as parse_freshness_plan()."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    required = {"Дата меню", "Точка", "SKU", "Название блюда", "Категория", "Цена", "План"}
+    if not required.issubset(frame.columns):
+        return pd.DataFrame()
+
+    result = pd.DataFrame(index=frame.index)
+    result["plan_date"] = pd.to_datetime(frame["Дата меню"], errors="coerce").dt.date
+    point_text = (
+        frame["Точка"].fillna("").astype(str).str.strip().str.upper().str.replace("T", "Т", regex=False)
+    )
+    result["point_number"] = pd.to_numeric(
+        point_text.str.extract(r"^Т(\d+)$", expand=False), errors="coerce"
+    )
+    result["sku"] = frame["SKU"].map(normalize_sku)
+    result["product_name"] = frame["Название блюда"].fillna("").astype(str).str.strip()
+    result["matrix_category"] = frame["Категория"].map(normalize_matrix_category)
+    result["unit_price"] = pd.to_numeric(frame["Цена"], errors="coerce").fillna(0).clip(lower=0)
+    result["analyst_plan"] = pd.to_numeric(frame["План"], errors="coerce").fillna(0).clip(lower=0)
+    if "Лист" in frame.columns:
+        result["plan_sheet"] = frame["Лист"].fillna("Архив меню").astype(str).str.strip()
+    else:
+        result["plan_sheet"] = "Архив меню"
+
+    result = result[
+        result["plan_date"].notna()
+        & result["point_number"].notna()
+        & result["sku"].notna()
+        & result["point_number"].between(1, 29)
+        & result["point_number"].ne(11)
+    ].copy()
+    if result.empty:
+        return result
+
+    result["point_number"] = result["point_number"].astype(int)
+    result["sku"] = result["sku"].astype(str)
+    return (
+        result.drop_duplicates(["plan_date", "point_number", "sku"], keep="last")
+        .sort_values(["plan_date", "point_number", "matrix_category", "product_name"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(ttl=MENU_ARCHIVE_CACHE_SECONDS, show_spinner=False)
+def _fetch_system_menu_archive_freshness_range(
+    api_url: str,
+    api_key: str,
+    menu_date_isos: tuple[str, ...],
+) -> tuple[pd.DataFrame, str]:
+    """Load only archive dates needed by the freshness period, in parallel."""
+    if not menu_date_isos:
+        return pd.DataFrame(), ""
+    if not api_url:
+        return pd.DataFrame(), "не указан URL системного архива"
+    if not api_key:
+        return pd.DataFrame(), "не указан MENU_ARCHIVE_APPS_SCRIPT_KEY"
+
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+
+    def load_one(menu_date_iso: str) -> tuple[str, pd.DataFrame, str]:
+        _, day_frame, day_error = _fetch_system_menu_archive_day(
+            api_url,
+            api_key,
+            menu_date_iso,
+        )
+        return menu_date_iso, day_frame, day_error
+
+    max_workers = max(1, min(6, len(menu_date_isos)))
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="freshness-archive") as executor:
+        future_to_date = {
+            executor.submit(load_one, menu_date_iso): menu_date_iso
+            for menu_date_iso in menu_date_isos
+        }
+        for future in as_completed(future_to_date):
+            menu_date_iso = future_to_date[future]
+            try:
+                loaded_date, day_frame, day_error = future.result()
+            except Exception as error:
+                errors.append(f"{menu_date_iso}: {error}")
+                continue
+            if day_error:
+                errors.append(f"{loaded_date}: {day_error}")
+                continue
+            converted = _archive_menu_frame_to_freshness_plan(day_frame)
+            if not converted.empty:
+                frames.append(converted)
+
+    if not frames:
+        return pd.DataFrame(), "; ".join(errors[:5])
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.drop_duplicates(
+        ["plan_date", "point_number", "sku"], keep="last"
+    ).reset_index(drop=True)
+    return combined, "; ".join(errors[:5])
 
 
 def _historical_menu_date_iso(value: object) -> str:
@@ -1637,38 +1740,32 @@ def normalize_matrix_category(value: object) -> str:
 
 
 def product_lifecycle_days(category: object) -> int:
-    """Возвращает срок продажи партии, отсчитываемый со дня после отгрузки."""
+    """Полный срок продажи партии; день отгрузки считается D0 и не входит в срок."""
     normalized = normalize_matrix_category(category)
-    if normalized == "Вторые блюда":
+    if normalized in {"Вторые блюда", "Напитки"}:
         return 5
     if normalized == "Япония":
         return 2
-    if normalized == "Напитки":
-        return 7
     return 3
 
 
 def product_green_days(category: object) -> int:
-    """Возвращает число основных (зелёных) дней внутри срока продажи."""
+    """Оптимальное окно реализации внутри полного срока жизни партии."""
     normalized = normalize_matrix_category(category)
-    if normalized == "Вторые блюда":
+    if normalized in {"Вторые блюда", "Напитки"}:
         return 3
     if normalized == "Япония":
         return 1
-    if normalized == "Напитки":
-        return 4
     return 2
 
 
 def forecast_coverage_days(category: object) -> int:
-    """Базовое окно свежести для прогноза плана (прежняя логика)."""
+    """Базовое окно свежести для прогноза плана."""
     normalized = normalize_matrix_category(category)
+    if normalized in {"Вторые блюда", "Напитки"}:
+        return 3
     if normalized == "Япония":
         return 1
-    if normalized == "Вторые блюда":
-        return 3
-    if normalized == "Напитки":
-        return 4
     return 2
 
 
@@ -2078,6 +2175,188 @@ def parse_freshness_plan(file_bytes: bytes) -> pd.DataFrame:
         ["plan_date", "point_number", "sku"], keep="last"
     )
 
+
+@st.cache_data(show_spinner=False)
+def parse_matrix_handover_history(file_bytes: bytes) -> pd.DataFrame:
+    """Read category totals from the matrix fact columns «СДАЛИ» / «Ф.Цена».
+
+    One row in the result is one SKU for one real menu date. Quantity is taken
+    from the right-side «СДАЛИ» cell, i.e. the total actually handed over across
+    all points. Value is taken from «Ф.Цена» when it looks like a monetary total;
+    if that cell is blank or clearly broken, it safely falls back to
+    «СДАЛИ × Цена». Service blocks such as «Участок комплектации» are ignored.
+    """
+    output_columns = [
+        "plan_date", "sku", "product_name", "category",
+        "handed_qty", "handed_value", "fact_value_source",
+    ]
+    if not file_bytes or file_bytes[:2] != b"PK":
+        return pd.DataFrame(columns=output_columns)
+
+    workbook = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=False)
+    records: list[dict[str, object]] = []
+
+    def norm_header(value: object) -> str:
+        return (
+            str(value or "")
+            .strip()
+            .casefold()
+            .replace("ё", "е")
+            .replace(" ", "")
+            .replace("\n", "")
+            .replace("\r", "")
+        )
+
+    for sheet_name in workbook.sheetnames:
+        if not (sheet_name.lower().startswith("план ") and "недел" in sheet_name.lower()):
+            continue
+        sheet = workbook[sheet_name]
+        main_blocks: list[tuple[int, date]] = []
+        max_scan_column = min(sheet.max_column, 12)
+
+        for excel_row in range(1, sheet.max_row + 1):
+            values = [sheet.cell(excel_row, column).value for column in range(1, max_scan_column + 1)]
+            texts = [str(value or "").strip().casefold() for value in values if value is not None]
+            if any("участок комплектации" in text for text in texts):
+                continue
+            has_plan_label = any("план на день кухня" in text for text in texts)
+            if not has_plan_label:
+                continue
+            target_date = next(
+                (parsed for value in values if (parsed := parse_excel_date(value)) is not None),
+                None,
+            )
+            if target_date is not None:
+                main_blocks.append((excel_row, target_date))
+
+        for block_index, (date_row, target_date) in enumerate(main_blocks):
+            next_main_row = (
+                main_blocks[block_index + 1][0]
+                if block_index + 1 < len(main_blocks)
+                else sheet.max_row + 1
+            )
+
+            header_row: int | None = None
+            headers: dict[str, int] = {}
+            for candidate in range(date_row + 1, min(next_main_row, date_row + 7)):
+                candidate_headers: dict[str, int] = {}
+                for column in range(1, sheet.max_column + 1):
+                    key = norm_header(sheet.cell(candidate, column).value)
+                    if key and key not in candidate_headers:
+                        candidate_headers[key] = column
+                if (
+                    any(key in candidate_headers for key in ("код", "код№", "sku", "ску"))
+                    and any(key in candidate_headers for key in ("категория", "вид"))
+                    and "сдали" in candidate_headers
+                ):
+                    header_row = candidate
+                    headers = candidate_headers
+                    break
+
+            if header_row is None:
+                continue
+
+            code_column = next(
+                (headers[key] for key in ("код", "код№", "sku", "ску") if key in headers),
+                None,
+            )
+            category_column = next(
+                (headers[key] for key in ("категория", "вид") if key in headers),
+                None,
+            )
+            name_column = next(
+                (headers[key] for key in ("названиеблюда", "названиетовара", "наименование") if key in headers),
+                None,
+            )
+            price_column = headers.get("цена")
+            handed_column = headers.get("сдали")
+            fact_value_column = next(
+                (headers[key] for key in ("ф.цена", "фцена") if key in headers),
+                None,
+            )
+            if code_column is None or category_column is None or handed_column is None:
+                continue
+
+            end_row = next_main_row - 1
+            for candidate in range(header_row + 1, next_main_row):
+                candidate_label = " ".join(
+                    str(sheet.cell(candidate, column).value or "").strip().casefold()
+                    for column in range(1, max_scan_column + 1)
+                )
+                if "участок комплектации" in candidate_label:
+                    end_row = candidate - 1
+                    break
+
+            for excel_row in range(header_row + 1, end_row + 1):
+                sku = normalize_sku(sheet.cell(excel_row, code_column).value)
+                if sku is None:
+                    continue
+                raw_category = sheet.cell(excel_row, category_column).value
+                category = normalize_matrix_category(raw_category)
+                if not str(category or "").strip():
+                    continue
+                product_name = (
+                    str(sheet.cell(excel_row, name_column).value or "").strip()
+                    if name_column is not None
+                    else ""
+                )
+                handed_qty = pd.to_numeric(
+                    pd.Series([sheet.cell(excel_row, handed_column).value]), errors="coerce"
+                ).iloc[0]
+                if pd.isna(handed_qty):
+                    handed_qty = 0.0
+                handed_qty = max(0.0, float(handed_qty))
+
+                unit_price = pd.to_numeric(
+                    pd.Series([sheet.cell(excel_row, price_column).value if price_column else None]),
+                    errors="coerce",
+                ).iloc[0]
+                unit_price = 0.0 if pd.isna(unit_price) else max(0.0, float(unit_price))
+                calculated_value = handed_qty * unit_price
+
+                fact_value = pd.to_numeric(
+                    pd.Series([
+                        sheet.cell(excel_row, fact_value_column).value
+                        if fact_value_column is not None
+                        else None
+                    ]),
+                    errors="coerce",
+                ).iloc[0]
+                fact_value_source = "Ф.Цена"
+                # «Ф.Цена» in the matrix occasionally stays blank or contains a
+                # clearly non-monetary leftover value. In those cases quantity ×
+                # unit price is the only internally consistent monetary total.
+                if (
+                    pd.isna(fact_value)
+                    or float(fact_value) < 0
+                    or (calculated_value >= 100 and float(fact_value) < calculated_value * 0.20)
+                ):
+                    fact_value = calculated_value
+                    fact_value_source = "Сдали × Цена"
+                else:
+                    fact_value = max(0.0, float(fact_value))
+
+                records.append(
+                    {
+                        "plan_date": target_date,
+                        "sku": sku,
+                        "product_name": product_name,
+                        "category": category,
+                        "handed_qty": handed_qty,
+                        "handed_value": fact_value,
+                        "fact_value_source": fact_value_source,
+                    }
+                )
+
+    if not records:
+        return pd.DataFrame(columns=output_columns)
+
+    result = pd.DataFrame(records, columns=output_columns)
+    return (
+        result.drop_duplicates(["plan_date", "sku"], keep="last")
+        .sort_values(["plan_date", "category", "product_name", "sku"], kind="stable")
+        .reset_index(drop=True)
+    )
 
 
 WEEKDAY_RU = {
@@ -5605,6 +5884,829 @@ def plan_check_minimum(category: object) -> int:
     return 2
 
 
+# ============================================================
+# ПЛАНИРОВКА · модель загрузки по всем категориям
+# Источники: меню/планы Матрицы КОМБО + продажи PostgreSQL.
+# День отгрузки = D0. Срок жизни отсчитывается со следующего дня.
+# Ничего автоматически не записывает в Т1–Т29: сначала аналитическая проверка.
+# ============================================================
+
+PLANNING_V2_RULES = {
+    "Вторые блюда": {"life_days": 5, "optimal_days": 3, "minimum": 3},
+    "Напитки": {"life_days": 5, "optimal_days": 3, "minimum": 5},
+    "Завтраки": {"life_days": 3, "optimal_days": 2, "minimum": 2},
+    "Салаты": {"life_days": 3, "optimal_days": 2, "minimum": 2},
+    "Супы": {"life_days": 3, "optimal_days": 2, "minimum": 2},
+    "Сэндвичи": {"life_days": 3, "optimal_days": 2, "minimum": 2},
+    "Десерты": {"life_days": 3, "optimal_days": 2, "minimum": 2},
+    "Хлеб": {"life_days": 3, "optimal_days": 2, "minimum": 2},
+    "Япония": {"life_days": 2, "optimal_days": 1, "minimum": 1},
+}
+PLANNING_V2_SUPPORTED_CATEGORIES = tuple(PLANNING_V2_RULES)
+PLANNING_V2_LOOKBACK_DAYS = 60
+PLANNING_V2_PLAN_BUFFER_DAYS = 12
+PLANNING_V2_CANNIBALIZATION = 0.60
+PLANNING_V2_AGING_PENALTY_WEIGHT = 0.50
+
+
+def planning_v2_rule(category: object) -> dict[str, int]:
+    normalized = normalize_matrix_category(category)
+    return PLANNING_V2_RULES.get(
+        normalized,
+        {"life_days": 3, "optimal_days": 2, "minimum": 2},
+    )
+
+
+def planning_v2_clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def planning_v2_normalize_entity_value(value: object) -> str:
+    text = str(value or "").strip().casefold().replace("ё", "е")
+    text = re.sub(r"\s+", " ", text)
+    if text in {"", "nan", "none", "не задана", "не сопоставлено"}:
+        return ""
+    return text
+
+
+def planning_v2_entity_set_from_row(row: pd.Series | dict[str, object]) -> set[str]:
+    values: list[str] = []
+    for column in ("attribute_1", "attribute_2", "attribute_3"):
+        try:
+            value = row.get(column, "")
+        except AttributeError:
+            value = ""
+        normalized = planning_v2_normalize_entity_value(value)
+        if normalized:
+            values.append(normalized)
+    if not values:
+        try:
+            entity = str(row.get("entity", "") or "")
+        except AttributeError:
+            entity = ""
+        for part in re.split(r"[•;,|/+]+", entity):
+            normalized = planning_v2_normalize_entity_value(part)
+            if normalized:
+                values.append(normalized)
+    return set(values)
+
+
+def planning_v2_entity_similarity(new_entity: set[str], old_entity: set[str]) -> float:
+    if not new_entity or not old_entity:
+        return 0.40
+    intersection = len(new_entity & old_entity)
+    union = len(new_entity | old_entity)
+    if union == 0:
+        return 0.40
+    return planning_v2_clamp(intersection / union, 0.20, 1.00)
+
+
+def planning_v2_price_similarity(new_price: float, old_price: float) -> float:
+    new_price = float(new_price or 0.0)
+    old_price = float(old_price or 0.0)
+    if new_price <= 0 or old_price <= 0:
+        return 0.70
+    diff = abs(new_price - old_price) / old_price
+    if diff <= 0.10:
+        return 1.00
+    if diff <= 0.20:
+        return 0.80
+    if diff <= 0.30:
+        return 0.60
+    return 0.40
+
+
+def planning_v2_recency_weight(days_ago: int) -> float:
+    if days_ago <= 14:
+        return 1.00
+    if days_ago <= 28:
+        return 0.80
+    if days_ago <= 45:
+        return 0.65
+    return 0.50
+
+
+def planning_v2_stockout_multiplier(
+    sold_out: bool,
+    last_sale_age: int,
+    optimal_days: int,
+    repeated_early_stockout: bool,
+) -> float:
+    """Оценивает скрытый спрос, если партия закончилась раньше оптимального окна."""
+    if not sold_out:
+        return 1.00
+    optimal_days = max(1, int(optimal_days))
+    last_sale_age = max(0, int(last_sale_age))
+    if last_sale_age <= 0:
+        factor = 1.50
+    else:
+        progress = last_sale_age / optimal_days
+        if progress <= 0.35:
+            factor = 1.35
+        elif progress <= 0.70:
+            factor = 1.20
+        elif progress < 1.00:
+            factor = 1.10
+        else:
+            factor = 1.00
+    # Один всплеск не должен разгонять матрицу.
+    if not repeated_early_stockout:
+        factor = min(factor, 1.15)
+    return factor
+
+
+def planning_v2_age_risk(age_days: int, optimal_days: int, life_days: int) -> float:
+    """0 внутри оптимального окна; после него растёт риск залеживания/списания."""
+    age_days = max(0, int(age_days))
+    optimal_days = max(1, int(optimal_days))
+    life_days = max(optimal_days, int(life_days))
+    if age_days <= optimal_days:
+        return 0.0
+    if age_days < life_days:
+        return 0.50
+    if age_days == life_days:
+        return 1.00
+    return 1.25
+
+
+def planning_v2_trend_factor(last_14: float, previous_14: float) -> float:
+    if previous_14 <= 0:
+        return 1.00
+    return planning_v2_clamp(last_14 / previous_14, 0.85, 1.15)
+
+
+def planning_v2_combined_trend(category_trend: float, entity_trend: float) -> float:
+    return 0.60 * category_trend + 0.40 * entity_trend
+
+
+def planning_v2_enrich_menu(menu: pd.DataFrame, entities: pd.DataFrame) -> pd.DataFrame:
+    if menu is None or menu.empty:
+        return pd.DataFrame()
+    reference_columns = [
+        "sku", "category", "entity", "attribute_1", "attribute_2", "attribute_3"
+    ]
+    available_reference = [column for column in reference_columns if column in entities.columns]
+    result = menu.merge(entities[available_reference], on="sku", how="left")
+    if "category" not in result.columns:
+        result["category"] = ""
+    ref_category = result["category"].fillna("").astype(str).str.strip()
+    ref_category_norm = ref_category.str.casefold().str.replace("ё", "е", regex=False)
+    ref_valid = ref_category.ne("") & ~ref_category_norm.isin(
+        {"не сопоставлено", "не задана", "nan", "none"}
+    )
+    result["category"] = ref_category.where(
+        ref_valid,
+        result.get("matrix_category", ""),
+    ).map(normalize_matrix_category)
+    if "entity" not in result.columns:
+        result["entity"] = "Не задана"
+    result["entity"] = result["entity"].fillna("Не задана").astype(str).str.strip()
+    for column in ("attribute_1", "attribute_2", "attribute_3"):
+        if column not in result.columns:
+            result[column] = ""
+        result[column] = result[column].fillna("").astype(str).str.strip()
+    result["entity_set"] = result.apply(planning_v2_entity_set_from_row, axis=1)
+    result["price"] = pd.to_numeric(result.get("price", 0), errors="coerce").fillna(0.0).clip(lower=0)
+    result["target_date"] = pd.to_datetime(result["target_date"], errors="coerce").dt.date
+    return result
+
+
+def planning_v2_enrich_plans(plans: pd.DataFrame, entities: pd.DataFrame) -> pd.DataFrame:
+    if plans is None or plans.empty:
+        return pd.DataFrame()
+    reference_columns = [
+        "sku", "category", "entity", "attribute_1", "attribute_2", "attribute_3"
+    ]
+    available_reference = [column for column in reference_columns if column in entities.columns]
+    result = plans.merge(entities[available_reference], on="sku", how="left")
+    if "category" not in result.columns:
+        result["category"] = ""
+    reference_category = result["category"].fillna("").astype(str).str.strip()
+    reference_normalized = reference_category.str.casefold().str.replace("ё", "е", regex=False)
+    reference_valid = reference_category.ne("") & ~reference_normalized.isin(
+        {"не сопоставлено", "не задана", "nan", "none"}
+    )
+    result["category"] = reference_category.where(
+        reference_valid,
+        result.get("matrix_category", ""),
+    ).map(normalize_matrix_category)
+    if "entity" not in result.columns:
+        result["entity"] = "Не задана"
+    result["entity"] = result["entity"].fillna("Не задана").astype(str).str.strip()
+    for column in ("attribute_1", "attribute_2", "attribute_3"):
+        if column not in result.columns:
+            result[column] = ""
+        result[column] = result[column].fillna("").astype(str).str.strip()
+    result["entity_set"] = result.apply(planning_v2_entity_set_from_row, axis=1)
+    result["plan_date"] = pd.to_datetime(result["plan_date"], errors="coerce").dt.date
+    result["point_number"] = pd.to_numeric(result["point_number"], errors="coerce")
+    result["analyst_plan"] = pd.to_numeric(result["analyst_plan"], errors="coerce").fillna(0.0).clip(lower=0)
+    result["unit_price"] = pd.to_numeric(result.get("unit_price", 0), errors="coerce").fillna(0.0).clip(lower=0)
+    result = result[
+        result["plan_date"].notna()
+        & result["point_number"].notna()
+        & result["sku"].notna()
+    ].copy()
+    result["point_number"] = result["point_number"].astype(int)
+    result["life_days"] = result["category"].map(lambda value: planning_v2_rule(value)["life_days"])
+    result["optimal_days"] = result["category"].map(lambda value: planning_v2_rule(value)["optimal_days"])
+    result["minimum"] = result["category"].map(lambda value: planning_v2_rule(value)["minimum"])
+    return result
+
+
+def planning_v2_prepare_sales(
+    history: pd.DataFrame,
+    entities: pd.DataFrame,
+    shop_to_point: dict[int, int],
+    plan_reference: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if history is None or history.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    result = history.copy()
+    result["shop_number"] = pd.to_numeric(result["shop_number"], errors="coerce")
+    result = result[result["shop_number"].notna()].copy()
+    result["shop_number"] = result["shop_number"].astype(int)
+    result["point_number"] = result["shop_number"].map(shop_to_point)
+    result = result[result["point_number"].notna()].copy()
+    result["point_number"] = result["point_number"].astype(int)
+    result["sku"] = result["sku"].map(normalize_sku)
+    result["business_date"] = pd.to_datetime(result["business_date"], errors="coerce").dt.date
+    result["sale_datetime"] = pd.to_datetime(result.get("sale_datetime"), errors="coerce")
+    result["sold_quantity"] = pd.to_numeric(result["sold_quantity"], errors="coerce").fillna(0.0).clip(lower=0)
+    result["revenue"] = pd.to_numeric(result.get("revenue", 0), errors="coerce").fillna(0.0)
+    result = result[result["business_date"].notna() & result["sku"].notna()].copy()
+
+    reference_columns = [
+        "sku", "category", "entity", "attribute_1", "attribute_2", "attribute_3"
+    ]
+    available_reference = [column for column in reference_columns if column in entities.columns]
+    result = result.merge(entities[available_reference], on="sku", how="left")
+
+    if plan_reference is not None and not plan_reference.empty:
+        plan_ref = (
+            plan_reference.sort_values("plan_date", kind="stable")
+            .drop_duplicates("sku", keep="last")
+            [["sku", "category", "entity", "attribute_1", "attribute_2", "attribute_3"]]
+            .rename(columns={
+                "category": "plan_category",
+                "entity": "plan_entity",
+                "attribute_1": "plan_attribute_1",
+                "attribute_2": "plan_attribute_2",
+                "attribute_3": "plan_attribute_3",
+            })
+        )
+        result = result.merge(plan_ref, on="sku", how="left")
+        category_text = result.get("category", pd.Series("", index=result.index)).fillna("").astype(str).str.strip()
+        bad_category = category_text.eq("") | category_text.str.casefold().isin(
+            {"не сопоставлено", "не задана", "nan", "none"}
+        )
+        result.loc[bad_category, "category"] = result.loc[bad_category, "plan_category"]
+        entity_text = result.get("entity", pd.Series("", index=result.index)).fillna("").astype(str).str.strip()
+        bad_entity = entity_text.eq("") | entity_text.str.casefold().isin(
+            {"не сопоставлено", "не задана", "nan", "none"}
+        )
+        result.loc[bad_entity, "entity"] = result.loc[bad_entity, "plan_entity"]
+        for column in ("attribute_1", "attribute_2", "attribute_3"):
+            if column not in result.columns:
+                result[column] = ""
+            current = result[column].fillna("").astype(str).str.strip()
+            plan_column = f"plan_{column}"
+            if plan_column in result.columns:
+                result.loc[current.eq(""), column] = result.loc[current.eq(""), plan_column]
+
+    result["category"] = result.get("category", "").fillna("").map(normalize_matrix_category)
+    result["entity"] = result.get("entity", "Не задана").fillna("Не задана").astype(str).str.strip()
+    for column in ("attribute_1", "attribute_2", "attribute_3"):
+        if column not in result.columns:
+            result[column] = ""
+        result[column] = result[column].fillna("").astype(str).str.strip()
+    result["entity_set"] = result.apply(planning_v2_entity_set_from_row, axis=1)
+
+    daily = (
+        result.groupby(
+            ["business_date", "point_number", "shop_number", "sku", "category", "entity"],
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            sold_quantity=("sold_quantity", "sum"),
+            revenue=("revenue", "sum"),
+            product_name=("product_name", "last"),
+            last_sale_datetime=("sale_datetime", "max"),
+        )
+    )
+    entity_sets = (
+        result[["sku", "entity_set"]]
+        .drop_duplicates("sku", keep="last")
+        .set_index("sku")["entity_set"]
+        .to_dict()
+    )
+    daily["entity_set"] = daily["sku"].map(entity_sets).map(
+        lambda value: value if isinstance(value, set) else set()
+    )
+    return result, daily
+
+
+def planning_v2_sales_lookup(daily_sales: pd.DataFrame) -> dict[tuple[int, str], pd.DataFrame]:
+    if daily_sales is None or daily_sales.empty:
+        return {}
+    lookup: dict[tuple[int, str], pd.DataFrame] = {}
+    for (point_number, sku), group in daily_sales.groupby(["point_number", "sku"], sort=False):
+        lookup[(int(point_number), str(sku))] = group.sort_values("business_date", kind="stable").copy()
+    return lookup
+
+
+def planning_v2_sales_between(
+    sales_lookup: dict[tuple[int, str], pd.DataFrame],
+    point_number: int,
+    sku: str,
+    date_from: date,
+    date_to: date,
+) -> pd.DataFrame:
+    if date_to < date_from:
+        return pd.DataFrame()
+    group = sales_lookup.get((int(point_number), str(sku)))
+    if group is None or group.empty:
+        return pd.DataFrame()
+    return group[group["business_date"].between(date_from, date_to, inclusive="both")].copy()
+
+
+def planning_v2_fifo_batch_states(
+    plans: pd.DataFrame,
+    sales_lookup: dict[tuple[int, str], pd.DataFrame],
+    analysis_cutoff: date,
+) -> pd.DataFrame:
+    """Распределяет продажи SKU по его партиям FIFO и возвращает состояние каждой партии."""
+    if plans is None or plans.empty:
+        return pd.DataFrame()
+    source = plans[
+        plans["category"].isin(PLANNING_V2_SUPPORTED_CATEGORIES)
+        & plans["plan_date"].le(analysis_cutoff)
+        & plans["analyst_plan"].gt(0)
+    ].copy()
+    if source.empty:
+        return pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+    for (point_number, sku), group in source.groupby(["point_number", "sku"], sort=False):
+        group = group.sort_values("plan_date", kind="stable")
+        states: list[dict[str, object]] = []
+        for _, batch in group.iterrows():
+            category = normalize_matrix_category(batch.get("category", ""))
+            rule = planning_v2_rule(category)
+            shipment_date = batch["plan_date"]
+            plan_qty = max(0.0, float(batch.get("analyst_plan", 0.0) or 0.0))
+            entity_set = batch.get("entity_set")
+            if not isinstance(entity_set, set):
+                entity_set = set()
+            states.append({
+                "point_number": int(point_number),
+                "sku": str(sku),
+                "shipment_date": shipment_date,
+                "expiry_date": shipment_date + timedelta(days=int(rule["life_days"])),
+                "weekday": shipment_date.weekday(),
+                "price": float(batch.get("unit_price", 0.0) or 0.0),
+                "category": category,
+                "entity": batch.get("entity", "Не задана"),
+                "entity_set": entity_set,
+                "product_name": batch.get("product_name", ""),
+                "plan_qty": plan_qty,
+                "sold_qty": 0.0,
+                "remaining_qty": plan_qty,
+                "last_sale_date": None,
+                "life_days": int(rule["life_days"]),
+                "optimal_days": int(rule["optimal_days"]),
+                "minimum": int(rule["minimum"]),
+            })
+
+        sales = sales_lookup.get((int(point_number), str(sku)))
+        if sales is not None and not sales.empty:
+            sales = sales[
+                sales["business_date"].le(analysis_cutoff)
+                & sales["business_date"].ge(group["plan_date"].min())
+            ].sort_values("business_date", kind="stable")
+            for _, sale in sales.iterrows():
+                sale_date = sale["business_date"]
+                quantity = max(0.0, float(sale.get("sold_quantity", 0.0) or 0.0))
+                if quantity <= 0:
+                    continue
+                for state in states:
+                    if quantity <= 1e-9:
+                        break
+                    if state["remaining_qty"] <= 1e-9:
+                        continue
+                    if not (state["shipment_date"] <= sale_date <= state["expiry_date"]):
+                        continue
+                    allocated = min(quantity, float(state["remaining_qty"]))
+                    if allocated <= 0:
+                        continue
+                    state["remaining_qty"] = max(0.0, float(state["remaining_qty"]) - allocated)
+                    state["sold_qty"] = float(state["sold_qty"]) + allocated
+                    state["last_sale_date"] = sale_date
+                    quantity -= allocated
+
+        for state in states:
+            last_sale_date = state["last_sale_date"]
+            if isinstance(last_sale_date, date):
+                last_sale_age = max(0, int((last_sale_date - state["shipment_date"]).days))
+            else:
+                last_sale_age = int(state["life_days"])
+            sold_out = bool(float(state["remaining_qty"]) <= 0.01 and float(state["plan_qty"]) > 0)
+            completed = bool(analysis_cutoff >= state["expiry_date"] or sold_out)
+            entity_key = "|".join(sorted(state["entity_set"])) if state["entity_set"] else f"sku:{state['sku']}"
+            rows.append({
+                **state,
+                "last_sale_age": last_sale_age,
+                "sold_out": sold_out,
+                "completed": completed,
+                "early_stockout": bool(sold_out and last_sale_age < int(state["optimal_days"])),
+                "entity_key": entity_key,
+            })
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+    return result.sort_values(["point_number", "category", "shipment_date", "sku"], kind="stable").reset_index(drop=True)
+
+
+def planning_v2_build_batch_stats(
+    plans: pd.DataFrame,
+    daily_sales: pd.DataFrame,
+    analysis_cutoff: date,
+) -> pd.DataFrame:
+    return planning_v2_fifo_batch_states(
+        plans,
+        planning_v2_sales_lookup(daily_sales),
+        analysis_cutoff,
+    )
+
+
+def planning_v2_stock_frame_at_date(
+    point_plans: pd.DataFrame,
+    sales_lookup: dict[tuple[int, str], pd.DataFrame],
+    point_number: int,
+    category: str,
+    as_of_date: date,
+    actual_data_through: date,
+) -> pd.DataFrame:
+    if point_plans is None or point_plans.empty:
+        return pd.DataFrame()
+    category = normalize_matrix_category(category)
+    latest_confirmed_shipment = min(as_of_date - timedelta(days=1), actual_data_through)
+    candidates = point_plans[
+        point_plans["point_number"].eq(int(point_number))
+        & point_plans["category"].eq(category)
+        & point_plans["plan_date"].le(latest_confirmed_shipment)
+        & point_plans["analyst_plan"].gt(0)
+    ].copy()
+    if candidates.empty:
+        return pd.DataFrame()
+    sales_until = min(as_of_date - timedelta(days=1), actual_data_through)
+    states = planning_v2_fifo_batch_states(candidates, sales_lookup, sales_until)
+    if states.empty:
+        return states
+    states = states[
+        states["expiry_date"].ge(as_of_date)
+        & states["remaining_qty"].gt(0.01)
+    ].copy()
+    if states.empty:
+        return states
+    states["age_days"] = states["shipment_date"].map(
+        lambda shipment: max(0, int((as_of_date - shipment).days))
+    )
+    return states
+
+
+def planning_v2_effective_stock_at_date(
+    point_plans: pd.DataFrame,
+    sales_lookup: dict[tuple[int, str], pd.DataFrame],
+    point_number: int,
+    category: str,
+    as_of_date: date,
+    new_entity: set[str],
+    new_price: float,
+    actual_data_through: date,
+) -> dict[str, float]:
+    stock_frame = planning_v2_stock_frame_at_date(
+        point_plans,
+        sales_lookup,
+        point_number,
+        category,
+        as_of_date,
+        actual_data_through,
+    )
+    if stock_frame.empty:
+        return {"effective": 0.0, "physical": 0.0, "batches": 0.0, "aging_weighted": 0.0}
+    effective = 0.0
+    physical = 0.0
+    aging_weighted = 0.0
+    for _, batch in stock_frame.iterrows():
+        old_entity = batch.get("entity_set")
+        if not isinstance(old_entity, set):
+            old_entity = set()
+        entity_weight = planning_v2_entity_similarity(new_entity, old_entity)
+        price_weight = planning_v2_price_similarity(new_price, float(batch.get("price", 0.0) or 0.0))
+        component = float(batch.get("remaining_qty", 0.0) or 0.0) * entity_weight * price_weight
+        physical += float(batch.get("remaining_qty", 0.0) or 0.0)
+        effective += component
+        aging_weighted += component * planning_v2_age_risk(
+            int(batch.get("age_days", 0) or 0),
+            int(batch.get("optimal_days", 2) or 2),
+            int(batch.get("life_days", 3) or 3),
+        )
+    return {
+        "effective": float(effective),
+        "physical": float(physical),
+        "batches": float(len(stock_frame)),
+        "aging_weighted": float(aging_weighted),
+    }
+
+
+def planning_v2_normal_effective_stock(
+    point_plans: pd.DataFrame,
+    sales_lookup: dict[tuple[int, str], pd.DataFrame],
+    point_number: int,
+    category: str,
+    target_date: date,
+    new_entity: set[str],
+    new_price: float,
+    analysis_date: date,
+) -> float:
+    comparable_dates: list[date] = []
+    for offset in range(1, 43):
+        candidate = target_date - timedelta(days=offset)
+        if candidate > analysis_date:
+            continue
+        if candidate.weekday() == target_date.weekday():
+            comparable_dates.append(candidate)
+        if len(comparable_dates) >= 4:
+            break
+    values: list[float] = []
+    for comparable_date in comparable_dates:
+        stock = planning_v2_effective_stock_at_date(
+            point_plans,
+            sales_lookup,
+            point_number,
+            category,
+            comparable_date,
+            new_entity,
+            new_price,
+            comparable_date - timedelta(days=1),
+        )
+        values.append(float(stock["effective"]))
+    if not values:
+        return 0.0
+    return float(pd.Series(values, dtype=float).median())
+
+
+def planning_v2_compute_trends(
+    point_sales: pd.DataFrame,
+    target_entity: set[str],
+    analysis_date: date,
+    category: str,
+) -> tuple[float, float, dict[str, float]]:
+    empty_detail = {
+        "category_last14": 0.0,
+        "category_previous14": 0.0,
+        "entity_last14": 0.0,
+        "entity_previous14": 0.0,
+    }
+    if point_sales is None or point_sales.empty:
+        return 1.0, 1.0, empty_detail
+    category = normalize_matrix_category(category)
+    sales = point_sales[
+        point_sales["category"].eq(category)
+        & point_sales["business_date"].notna()
+        & point_sales["business_date"].le(analysis_date)
+    ].copy()
+    if sales.empty:
+        return 1.0, 1.0, empty_detail
+    last_start = analysis_date - timedelta(days=13)
+    previous_end = last_start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=13)
+    last = sales[sales["business_date"].between(last_start, analysis_date, inclusive="both")].copy()
+    previous = sales[sales["business_date"].between(previous_start, previous_end, inclusive="both")].copy()
+    category_last = float(last["sold_quantity"].sum())
+    category_previous = float(previous["sold_quantity"].sum())
+
+    def weighted_entity_total(frame: pd.DataFrame) -> float:
+        if frame.empty:
+            return 0.0
+        weights = frame["entity_set"].map(
+            lambda old: planning_v2_entity_similarity(
+                target_entity,
+                old if isinstance(old, set) else set(),
+            )
+        )
+        return float((frame["sold_quantity"] * weights).sum())
+
+    entity_last = weighted_entity_total(last)
+    entity_previous = weighted_entity_total(previous)
+    return (
+        planning_v2_trend_factor(category_last, category_previous),
+        planning_v2_trend_factor(entity_last, entity_previous),
+        {
+            "category_last14": category_last,
+            "category_previous14": category_previous,
+            "entity_last14": entity_last,
+            "entity_previous14": entity_previous,
+        },
+    )
+
+
+def planning_v2_recommend_load(
+    *,
+    point: int,
+    shipment_date: date,
+    category: str,
+    new_entity: set[str],
+    new_price: float,
+    analogs: pd.DataFrame,
+    current_stock: pd.DataFrame,
+    normal_effective_stock: float,
+    category_trend: float,
+    entity_trend: float,
+    previous_recommendation: int | None = None,
+) -> dict[str, object]:
+    category = normalize_matrix_category(category)
+    rule = planning_v2_rule(category)
+    life_days = int(rule["life_days"])
+    optimal_days = int(rule["optimal_days"])
+    minimum = int(rule["minimum"])
+
+    analog_meta: list[dict[str, object]] = []
+    if analogs is not None and not analogs.empty:
+        for _, row in analogs.iterrows():
+            old_entity = row.get("entity_set")
+            if not isinstance(old_entity, set):
+                old_entity = set()
+            similarity = planning_v2_entity_similarity(new_entity, old_entity)
+            price_weight = planning_v2_price_similarity(new_price, float(row.get("price", 0.0) or 0.0))
+            weekday_weight = 1.0 if int(row.get("weekday", -1)) == shipment_date.weekday() else 0.65
+            age_days = max(0, int((shipment_date - row["shipment_date"]).days))
+            recent_weight = planning_v2_recency_weight(age_days)
+            strong = bool(similarity >= 0.60 and price_weight >= 0.60)
+            early = bool(row.get("sold_out", False) and int(row.get("last_sale_age", life_days)) < optimal_days)
+            analog_meta.append({
+                "row": row,
+                "similarity": similarity,
+                "price_weight": price_weight,
+                "weekday_weight": weekday_weight,
+                "recent_weight": recent_weight,
+                "strong": strong,
+                "early": early,
+                "shipment_date": row["shipment_date"],
+            })
+
+    strong_recent = sorted(
+        [item for item in analog_meta if item["strong"]],
+        key=lambda item: item["shipment_date"],
+        reverse=True,
+    )[:3]
+    repeated_early_stockout = bool(
+        len(strong_recent) >= 3
+        and sum(1 for item in strong_recent if item["early"]) >= 2
+    )
+
+    analog_estimates: list[dict[str, float]] = []
+    strong_analogs = 0
+    early_analogs = 0
+    for item in analog_meta:
+        row = item["row"]
+        total_weight = (
+            float(item["similarity"])
+            * float(item["price_weight"])
+            * float(item["weekday_weight"])
+            * float(item["recent_weight"])
+        )
+        estimated_demand = float(row.get("sold_qty", 0.0) or 0.0)
+        estimated_demand *= planning_v2_stockout_multiplier(
+            sold_out=bool(row.get("sold_out", False)),
+            last_sale_age=int(row.get("last_sale_age", life_days)),
+            optimal_days=optimal_days,
+            repeated_early_stockout=repeated_early_stockout,
+        )
+        analog_estimates.append({"demand": estimated_demand, "weight": total_weight})
+        strong_analogs += int(bool(item["strong"]))
+        early_analogs += int(bool(item["early"]))
+
+    if not analog_estimates:
+        base_demand = float(minimum)
+        weight_sum = 0.0
+    else:
+        weight_sum = sum(item["weight"] for item in analog_estimates)
+        if weight_sum <= 0:
+            base_demand = float(minimum)
+        else:
+            base_demand = sum(
+                item["demand"] * item["weight"] for item in analog_estimates
+            ) / weight_sum
+
+    trend = planning_v2_combined_trend(category_trend, entity_trend)
+    demand_after_trend = base_demand * trend
+
+    effective_stock = 0.0
+    aging_weighted_stock = 0.0
+    physical_stock = 0.0
+    late_physical_stock = 0.0
+    if current_stock is not None and not current_stock.empty:
+        for _, stock in current_stock.iterrows():
+            old_entity = stock.get("entity_set")
+            if not isinstance(old_entity, set):
+                old_entity = set()
+            entity_weight = planning_v2_entity_similarity(new_entity, old_entity)
+            price_weight = planning_v2_price_similarity(new_price, float(stock.get("price", 0.0) or 0.0))
+            remaining = float(stock.get("remaining_qty", 0.0) or 0.0)
+            component = remaining * entity_weight * price_weight
+            age_days = int(stock.get("age_days", 0) or 0)
+            risk = planning_v2_age_risk(age_days, optimal_days, life_days)
+            physical_stock += remaining
+            effective_stock += component
+            aging_weighted_stock += component * risk
+            if age_days > optimal_days:
+                late_physical_stock += remaining
+
+    excess_stock = max(0.0, effective_stock - float(normal_effective_stock or 0.0))
+    stock_penalty = excess_stock * PLANNING_V2_CANNIBALIZATION
+    aging_penalty = aging_weighted_stock * PLANNING_V2_AGING_PENALTY_WEIGHT
+    raw_recommendation = max(
+        float(minimum),
+        demand_after_trend - stock_penalty - aging_penalty,
+    )
+    recommendation = int(math.ceil(raw_recommendation))
+
+    if previous_recommendation is not None and int(previous_recommendation) > 0:
+        minimum_allowed = max(minimum, int(previous_recommendation) - 2)
+        maximum_allowed = int(previous_recommendation) + 2
+        recommendation = int(planning_v2_clamp(recommendation, minimum_allowed, maximum_allowed))
+
+    analog_count = len(analog_estimates)
+    if analog_count >= 6 and strong_analogs >= 3:
+        confidence = "HIGH"
+    elif analog_count >= 3:
+        confidence = "MEDIUM"
+    else:
+        confidence = "LOW"
+
+    return {
+        "point": point,
+        "category": category,
+        "life_days": life_days,
+        "optimal_days": optimal_days,
+        "minimum": minimum,
+        "base_demand": round(base_demand, 2),
+        "trend": round(trend, 3),
+        "demand_after_trend": round(demand_after_trend, 2),
+        "physical_stock": round(physical_stock, 2),
+        "effective_stock": round(effective_stock, 2),
+        "normal_stock": round(float(normal_effective_stock or 0.0), 2),
+        "excess_stock": round(excess_stock, 2),
+        "stock_penalty": round(stock_penalty, 2),
+        "late_physical_stock": round(late_physical_stock, 2),
+        "aging_weighted_stock": round(aging_weighted_stock, 2),
+        "aging_penalty": round(aging_penalty, 2),
+        "raw_recommendation": round(raw_recommendation, 2),
+        "recommendation": recommendation,
+        "analog_count": analog_count,
+        "strong_analog_count": strong_analogs,
+        "early_analog_count": early_analogs,
+        "repeated_early_stockout": repeated_early_stockout,
+        "weight_sum": round(weight_sum, 3),
+        "confidence": confidence,
+    }
+
+
+def planning_v2_export_excel(result: pd.DataFrame) -> bytes:
+    buffer = io.BytesIO()
+    export = result.copy()
+    if "entity_set" in export.columns:
+        export = export.drop(columns="entity_set")
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        export.to_excel(writer, sheet_name="Планировка", index=False)
+        if not export.empty:
+            point_summary = (
+                export.groupby("Точка", as_index=False)
+                .agg(**{
+                    "Текущий план": ("Текущий план", "sum"),
+                    "Рекомендация": ("Рекомендация", "sum"),
+                    "Изменение": ("Изменение", "sum"),
+                    "Живой остаток": ("Живой остаток физический", "sum"),
+                })
+            )
+            point_summary.to_excel(writer, sheet_name="Итоги по точкам", index=False)
+            category_summary = (
+                export.groupby("Категория", as_index=False)
+                .agg(**{
+                    "Текущий план": ("Текущий план", "sum"),
+                    "Рекомендация": ("Рекомендация", "sum"),
+                    "Изменение": ("Изменение", "sum"),
+                })
+            )
+            category_summary.to_excel(writer, sheet_name="Итоги категорий", index=False)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 PLAN_CHECK_LIGHT_VEGETABLE_DEFAULT = (
     "овощ", "винегрет", "свекл", "морков", "капуст", "брокколи", "огур",
     "томат", "помидор", "зелень", "редис", "баклаж", "кабач", "тыкв",
@@ -8054,6 +9156,7 @@ MENU_ITEMS = [
     ("Списания категорий", ":material/delete:"),
     ("Архив меню", ":material/history:"),
     ("Прогноз плана", ":material/track_changes:"),
+    ("Планировка", ":material/route:"),
     ("Проверка", ":material/fact_check:"),
 ]
 SECTION_STATE_KEY = "main_section_v759"
@@ -8212,39 +9315,18 @@ if selected_main_section is None:
         unsafe_allow_html=True,
     )
     with st.container(key="main_menu_cards_v759"):
-        first_row = st.columns(4)
-        for column, (label, icon) in zip(first_row, MENU_ITEMS[:4]):
-            with column:
-                st.button(
-                    label,
-                    key=f"main_menu_card_v759_{MENU_LABELS.index(label)}",
-                    icon=icon,
-                    use_container_width=True,
-                    on_click=_open_main_section,
-                    args=(label,),
-                )
-        second_row = st.columns(4)
-        for column, (label, icon) in zip(second_row, MENU_ITEMS[4:8]):
-            with column:
-                st.button(
-                    label,
-                    key=f"main_menu_card_v759_{MENU_LABELS.index(label)}",
-                    icon=icon,
-                    use_container_width=True,
-                    on_click=_open_main_section,
-                    args=(label,),
-                )
-        third_row = st.columns(4)
-        for column, (label, icon) in zip(third_row, MENU_ITEMS[8:12]):
-            with column:
-                st.button(
-                    label,
-                    key=f"main_menu_card_v759_{MENU_LABELS.index(label)}",
-                    icon=icon,
-                    use_container_width=True,
-                    on_click=_open_main_section,
-                    args=(label,),
-                )
+        for row_start in range(0, len(MENU_ITEMS), 4):
+            menu_row = st.columns(4)
+            for column, (label, icon) in zip(menu_row, MENU_ITEMS[row_start : row_start + 4]):
+                with column:
+                    st.button(
+                        label,
+                        key=f"main_menu_card_v759_{MENU_LABELS.index(label)}",
+                        icon=icon,
+                        use_container_width=True,
+                        on_click=_open_main_section,
+                        args=(label,),
+                    )
     st.markdown('<div class="vk-footer-brand">ВКУСНО МАРКЕТ</div>', unsafe_allow_html=True)
     st.stop()
 
@@ -8435,7 +9517,7 @@ class _MainSection:
         return False
 
 
-tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_plan_check = [
+tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_planning, tab_plan_check = [
     _MainSection(label) for label, _ in MENU_ITEMS
 ]
 
@@ -12713,7 +13795,7 @@ if tab_sales_time.open:
             "Дата плана считается датой отгрузки. Отсчёт срока начинается на следующий день. "
             "Вторые блюда: 3 зелёных + 2 серых дня; салаты, супы, завтраки, сэндвичи, "
             "десерты и хлеб: 2 зелёных + 1 серый день; Япония: 1 зелёный + 1 серый день; "
-            "напитки: 4 зелёных + 3 серых дня. "
+            "напитки: 3 зелёных + 2 серых дня. "
             "Скидка 40% применяется только в последний день срока."
         )
         # Основной источник — Apps Script, связанный с Google Sheet «2.3 Матрица КОМБО».
@@ -12740,36 +13822,68 @@ if tab_sales_time.open:
             ):
                 _fetch_apps_script_matrix_snapshot.clear()
                 _fetch_apps_script_entity_reference.clear()
+                _fetch_system_menu_archive_dates.clear()
+                _fetch_system_menu_archive_day.clear()
+                _fetch_system_menu_archive_freshness_range.clear()
                 st.rerun()
 
         if not matrix_snapshot_bytes:
             st.error("Матрица 2.3 недоступна ни через Apps Script, ни в резервной копии.")
-            sales_time_plans = pd.DataFrame()
+            current_sales_time_plans = pd.DataFrame()
         else:
             try:
-                sales_time_plans = parse_freshness_plan(matrix_snapshot_bytes)
+                current_sales_time_plans = parse_freshness_plan(matrix_snapshot_bytes)
             except Exception as error:
                 st.error(f"Не удалось прочитать матрицу 2.3: {error}")
-                sales_time_plans = pd.DataFrame()
+                current_sales_time_plans = pd.DataFrame()
 
-        if sales_time_plans.empty:
+        archive_date_isos, archive_dates_error = _fetch_system_menu_archive_dates(
+            MENU_ARCHIVE_APPS_SCRIPT_URL,
+            MENU_ARCHIVE_APPS_SCRIPT_KEY,
+        )
+        archive_plan_dates = []
+        for archive_date_iso in archive_date_isos:
+            try:
+                archive_plan_dates.append(date.fromisoformat(archive_date_iso))
+            except ValueError:
+                continue
+
+        current_plan_dates = (
+            sorted(current_sales_time_plans["plan_date"].dropna().unique())
+            if not current_sales_time_plans.empty
+            else []
+        )
+        available_plan_dates = sorted(set(current_plan_dates) | set(archive_plan_dates))
+
+        if not available_plan_dates:
             st.warning(
-                "В матрице 2.3 не найдены основные блоки «План на день кухня» "
-                "с датами, SKU и колонками Т1–Т29 на листах 1–4 недели."
+                "Не найдены даты меню ни в текущей матрице 1–4 недель, ни в системном архиве."
             )
+            if archive_dates_error:
+                st.caption(f"Архив меню: {archive_dates_error}")
         else:
-            available_plan_dates = sorted(sales_time_plans["plan_date"].dropna().unique())
             matrix_start = available_plan_dates[0]
             matrix_end = available_plan_dates[-1]
-            st.success(
-                f"Матрица 2.3 загружена: планы 1–4 недель; "
-                f"дат — {len(available_plan_dates)}, SKU — {sales_time_plans['sku'].nunique()}; "
-                f"период {matrix_start:%d.%m.%Y}–{matrix_end:%d.%m.%Y}."
+            current_sku_count = (
+                current_sales_time_plans["sku"].nunique()
+                if not current_sales_time_plans.empty
+                else 0
             )
+            st.success(
+                f"Окно свежести · сборка {BUILD_ID}: доступно дат — {len(available_plan_dates)}; "
+                f"текущая матрица — {len(current_plan_dates)} дат / {current_sku_count} SKU; "
+                f"системный архив — {len(archive_plan_dates)} дат; "
+                f"общий период {matrix_start:%d.%m.%Y}–{matrix_end:%d.%m.%Y}."
+            )
+            if archive_dates_error:
+                st.warning(
+                    "Архивные даты загрузились не полностью: "
+                    f"{archive_dates_error}. Текущие планы продолжают работать."
+                )
 
-            start_key = "freshness_period_start_v75"
-            end_key = "freshness_period_end_v75"
-            anchor_key = "freshness_period_anchor_v75"
+            start_key = "freshness_period_start_v76"
+            end_key = "freshness_period_end_v76"
+            anchor_key = "freshness_period_anchor_v76"
             if (
                 st.session_state.get(start_key) not in available_plan_dates
                 or st.session_state.get(end_key) not in available_plan_dates
@@ -12780,12 +13894,12 @@ if tab_sales_time.open:
 
             st.markdown("#### Период плана")
             st.caption(
-                "По умолчанию выбраны все даты из планов 1–4 недель. "
+                "По умолчанию выбраны все доступные даты: текущие планы 1–4 недель и системный архив. "
                 "Чтобы выбрать свой период, нажмите первую дату, затем последнюю."
             )
             if st.button(
-                "Все даты 1–4 недель",
-                key="freshness_all_dates_v75",
+                "Все даты: архив + 1–4 недели",
+                key="freshness_all_dates_v76",
                 type="primary",
                 use_container_width=False,
             ):
@@ -12806,7 +13920,7 @@ if tab_sales_time.open:
                     is_selected = selected_start <= plan_date <= selected_end
                     if date_columns[offset].button(
                         f"{plan_date:%d.%m} · {weekday_short[plan_date.weekday()]}",
-                        key=f"freshness_date_button_v75_{plan_date.isoformat()}",
+                        key=f"freshness_date_button_v76_{plan_date.isoformat()}",
                         type="primary" if is_selected else "secondary",
                         use_container_width=True,
                     ):
@@ -12825,6 +13939,68 @@ if tab_sales_time.open:
             shipment_end = st.session_state[end_key]
             if shipment_start > shipment_end:
                 shipment_start, shipment_end = shipment_end, shipment_start
+
+            # Для FIFO нужны партии, отгруженные до начала выбранного периода.
+            # Максимальный срок сейчас у напитков — 7 дней, поэтому архив читаем
+            # от shipment_start - 7 дней до конца выбранного периода.
+            archive_buffer_start = shipment_start - timedelta(days=7)
+            archive_dates_needed = tuple(
+                archive_date.isoformat()
+                for archive_date in archive_plan_dates
+                if archive_buffer_start <= archive_date <= shipment_end
+            )
+            archive_freshness_plans, archive_load_error = (
+                _fetch_system_menu_archive_freshness_range(
+                    MENU_ARCHIVE_APPS_SCRIPT_URL,
+                    MENU_ARCHIVE_APPS_SCRIPT_KEY,
+                    archive_dates_needed,
+                )
+            )
+
+            # Архив идёт первым, текущая матрица — второй. Поэтому при совпадении
+            # дата + точка + SKU всегда побеждает текущее значение матрицы.
+            freshness_plan_parts: list[pd.DataFrame] = []
+            if not archive_freshness_plans.empty:
+                archive_part = archive_freshness_plans.copy()
+                archive_part["_source_priority"] = 0
+                freshness_plan_parts.append(archive_part)
+            if not current_sales_time_plans.empty:
+                current_part = current_sales_time_plans.copy()
+                current_part["_source_priority"] = 1
+                freshness_plan_parts.append(current_part)
+
+            if freshness_plan_parts:
+                sales_time_plans = pd.concat(freshness_plan_parts, ignore_index=True, sort=False)
+                sales_time_plans = (
+                    sales_time_plans
+                    .sort_values(
+                        ["plan_date", "point_number", "sku", "_source_priority"],
+                        kind="stable",
+                    )
+                    .drop_duplicates(["plan_date", "point_number", "sku"], keep="last")
+                    .drop(columns="_source_priority", errors="ignore")
+                    .reset_index(drop=True)
+                )
+            else:
+                sales_time_plans = pd.DataFrame()
+
+            if archive_load_error:
+                st.warning(
+                    "Часть архивных партий не удалось получить: "
+                    f"{archive_load_error}"
+                )
+            elif archive_dates_needed:
+                loaded_archive_dates = (
+                    archive_freshness_plans["plan_date"].nunique()
+                    if not archive_freshness_plans.empty
+                    else 0
+                )
+                st.caption(
+                    f"Для расчёта свежести подключён системный архив: "
+                    f"{loaded_archive_dates} архивных дат в диапазоне "
+                    f"{archive_buffer_start:%d.%m.%Y}–{shipment_end:%d.%m.%Y}."
+                )
+
             selected_plan_dates = [
                 plan_date for plan_date in available_plan_dates
                 if shipment_start <= plan_date <= shipment_end
@@ -12986,6 +14162,135 @@ if tab_sales_time.open:
                     "Нажмите на строку нужного SKU в меню — ниже откроется история его продаж "
                     "по выбранной точке за период, заданный слева в «Параметрах»."
                 )
+
+                # Краткая сводка фактической сдачи из Матрицы КОМБО. Она всегда
+                # считается по ВСЕМ точкам, независимо от выбранного фильтра «Точки».
+                handover_history = (
+                    parse_matrix_handover_history(matrix_snapshot_bytes)
+                    if matrix_snapshot_bytes
+                    else pd.DataFrame()
+                )
+                selected_handover_dates = set(selected_plan_dates)
+                handover_period = (
+                    handover_history[handover_history["plan_date"].isin(selected_handover_dates)].copy()
+                    if not handover_history.empty
+                    else pd.DataFrame()
+                )
+                # Категории показываем так же, как в остальных разделах приложения:
+                # живой «Справочник» имеет приоритет над старым текстом категории в плане.
+                if not handover_period.empty and entities is not None and not entities.empty:
+                    handover_reference = (
+                        entities[["sku", "category"]]
+                        .drop_duplicates("sku", keep="last")
+                        .rename(columns={"category": "reference_category"})
+                    )
+                    handover_period = handover_period.merge(
+                        handover_reference, on="sku", how="left"
+                    )
+                    handover_period["reference_category"] = (
+                        handover_period["reference_category"].fillna("").astype(str).str.strip()
+                    )
+                    # Если SKU уже есть в живом «Справочнике», но категория там ещё
+                    # не заполнена, не затираем корректную категорию из самого меню.
+                    # Это особенно важно для новых SKU: «Не сопоставлено» в справочнике
+                    # означает отсутствие категории, а не отдельную бизнес-категорию.
+                    reference_category_normalized = (
+                        handover_period["reference_category"]
+                        .str.casefold()
+                        .str.replace("ё", "е", regex=False)
+                    )
+                    reference_category_is_valid = (
+                        handover_period["reference_category"].ne("")
+                        & ~reference_category_normalized.isin(
+                            {"не сопоставлено", "не задана", "nan", "none"}
+                        )
+                    )
+                    handover_period["category"] = handover_period["reference_category"].where(
+                        reference_category_is_valid,
+                        handover_period["category"],
+                    ).map(normalize_matrix_category)
+                    handover_period = handover_period.drop(
+                        columns="reference_category", errors="ignore"
+                    )
+
+                st.markdown("#### Сдали по категориям · все точки")
+                if handover_period.empty:
+                    st.info(
+                        "Для выбранных дат в текущей Матрице КОМБО нет заполненных значений «СДАЛИ». "
+                        "Архивные меню сейчас хранят плановые Т1–Т29, поэтому старые «СДАЛИ/Ф.Цена» "
+                        "из системного архива восстановить нельзя."
+                    )
+                else:
+                    handover_summary = (
+                        handover_period.groupby("category", as_index=False, dropna=False)
+                        .agg(
+                            **{
+                                "Сдали, шт.": ("handed_qty", "sum"),
+                                "Стоимость, ₽": ("handed_value", "sum"),
+                            }
+                        )
+                        .rename(columns={"category": "Категория"})
+                    )
+                    handover_category_order = [
+                        "Завтраки", "Салаты", "Супы", "Вторые блюда", "Сэндвичи",
+                        "Япония", "Десерты", "Напитки", "Хлеб", "Не сопоставлено",
+                    ]
+                    handover_rank = {
+                        category: index for index, category in enumerate(handover_category_order)
+                    }
+                    handover_summary["_order"] = (
+                        handover_summary["Категория"].map(handover_rank).fillna(99)
+                    )
+                    handover_summary = (
+                        handover_summary.sort_values(["_order", "Категория"], kind="stable")
+                        .drop(columns="_order")
+                        .reset_index(drop=True)
+                    )
+                    handover_total = pd.DataFrame(
+                        [
+                            {
+                                "Категория": "ВСЕГО",
+                                "Сдали, шт.": handover_summary["Сдали, шт."].sum(),
+                                "Стоимость, ₽": handover_summary["Стоимость, ₽"].sum(),
+                            }
+                        ]
+                    )
+                    handover_display = pd.concat(
+                        [handover_summary, handover_total], ignore_index=True
+                    )
+                    actual_handover_dates = sorted(handover_period["plan_date"].dropna().unique())
+                    archive_only_selected_dates = sorted(
+                        selected_handover_dates - set(actual_handover_dates)
+                    )
+                    st.caption(
+                        f"Источник количества — правая ячейка «СДАЛИ» в Матрице КОМБО; "
+                        f"стоимость — «Ф.Цена» (при пустом/повреждённом значении: Сдали × Цена SKU). "
+                        f"Учтено дат: {len(actual_handover_dates)}. Значения суммированы по всем точкам."
+                    )
+                    st.dataframe(
+                        handover_display.style.apply(
+                            lambda row: [
+                                "font-weight: 700; background-color: #f2f2f2;"
+                                if str(row.get("Категория", "")) == "ВСЕГО"
+                                else ""
+                                for _ in row.index
+                            ],
+                            axis=1,
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(520, 38 * len(handover_display) + 80),
+                        column_config={
+                            "Категория": st.column_config.TextColumn(width="medium"),
+                            "Сдали, шт.": st.column_config.NumberColumn(format="%.0f"),
+                            "Стоимость, ₽": st.column_config.NumberColumn(format="%.0f"),
+                        },
+                    )
+                    if archive_only_selected_dates:
+                        st.caption(
+                            "Не включены архивные даты без сохранённого факта «СДАЛИ/Ф.Цена»: "
+                            + ", ".join(value.strftime("%d.%m.%Y") for value in archive_only_selected_dates)
+                        )
 
                 selected_menu_rows = list(menu_selection.selection.rows)
                 if selected_menu_rows:
@@ -15641,3 +16946,540 @@ if tab_forecast.open:
     )
 
     st.markdown('<div class="vk-footer-brand">ВКУСНО МАРКЕТ</div>', unsafe_allow_html=True)
+
+
+if tab_planning.open:
+    with tab_planning:
+        st.subheader("Планировка")
+        st.caption(
+            "Отдельная модель рекомендации загрузки. Источники: текущее/архивное меню Матрицы КОМБО "
+            "и фактические продажи PostgreSQL. Для каждой точки учитываются сущность, цена, день недели, "
+            "давность аналогов, раннее обнуление партии, тренд категории/сущности, живой конкурентный "
+            "остаток и возраст остатка относительно оптимального окна. Т1–Т29 автоматически не меняются."
+        )
+
+        rules_rows = [
+            {
+                "Категория": category,
+                "Срок жизни, дней": rule["life_days"],
+                "Оптимальные продажи, дней": rule["optimal_days"],
+                "Минимум, шт.": rule["minimum"],
+            }
+            for category, rule in PLANNING_V2_RULES.items()
+        ]
+        with st.expander("Правила срока жизни, которые использует Планировка", expanded=False):
+            st.dataframe(pd.DataFrame(rules_rows), use_container_width=True, hide_index=True)
+            st.caption(
+                "День отгрузки считается D0 и не входит в срок жизни. Основная масса партии должна "
+                "продаваться внутри оптимального окна; дни после него — страховочный хвост и риск избытка."
+            )
+
+        planning_matrix_bytes, planning_matrix_source, planning_checked_at, planning_matrix_error = (
+            _load_matrix_context_for_active_tab()
+        )
+        if planning_matrix_error:
+            st.warning(planning_matrix_error)
+        if not planning_matrix_bytes:
+            st.error("Для Планировки нужна текущая Матрица КОМБО.")
+        else:
+            try:
+                planning_menu_raw, _ = parse_menu_matrix(planning_matrix_bytes)
+                planning_current_plans = parse_freshness_plan(planning_matrix_bytes)
+            except Exception as error:
+                st.error(f"Не удалось прочитать меню/планы для Планировки: {error}")
+                planning_menu_raw = pd.DataFrame()
+                planning_current_plans = pd.DataFrame()
+
+            planning_menu = planning_v2_enrich_menu(planning_menu_raw, entities)
+            planning_supported_menu = planning_menu[
+                planning_menu["category"].isin(PLANNING_V2_SUPPORTED_CATEGORIES)
+            ].copy() if not planning_menu.empty else pd.DataFrame()
+
+            if planning_supported_menu.empty:
+                st.info("В текущем меню не найдено категорий, поддерживаемых Планировкой.")
+            else:
+                planning_dates = sorted(planning_supported_menu["target_date"].dropna().unique())
+                future_or_today = [value for value in planning_dates if value >= today]
+                default_date = future_or_today[0] if future_or_today else planning_dates[-1]
+                planning_target_date = st.selectbox(
+                    "Дата меню для Планировки",
+                    options=planning_dates,
+                    index=planning_dates.index(default_date),
+                    format_func=lambda value: f"{value:%d.%m.%Y} · {WEEKDAY_RU.get(value.weekday(), '')}",
+                    key="planning_v2_target_date",
+                )
+
+                date_menu = planning_supported_menu[
+                    planning_supported_menu["target_date"].eq(planning_target_date)
+                ].copy()
+                category_order = list(PLANNING_V2_RULES)
+                category_options = [
+                    category for category in category_order
+                    if category in set(date_menu["category"].dropna().astype(str))
+                ]
+                planning_selected_categories = st.multiselect(
+                    "Категории для расчёта",
+                    options=category_options,
+                    default=category_options,
+                    key="planning_v2_categories",
+                )
+
+                point_mapping_raw = st.session_state.get("point_mapping", {})
+                planning_shop_to_label = {
+                    int(shop): str(label).strip()
+                    for shop, label in point_mapping_raw.items()
+                    if str(label).strip().startswith("Т")
+                    and str(label).strip() != "Т11"
+                    and re.fullmatch(r"Т\d+", str(label).strip())
+                }
+                if not planning_shop_to_label:
+                    planning_shop_to_label = {
+                        number: f"Т{number}" for number in range(1, 30) if number != 11
+                    }
+                planning_shop_to_point = {
+                    int(shop): int(label[1:]) for shop, label in planning_shop_to_label.items()
+                }
+                planning_point_options = sorted(
+                    set(planning_shop_to_label.values()),
+                    key=lambda value: int(value[1:]),
+                )
+                planning_selected_points = st.multiselect(
+                    "Точки для расчёта",
+                    options=planning_point_options,
+                    default=planning_point_options,
+                    key="planning_v2_points",
+                )
+
+                controls = st.columns([1.1, 1.1, 1.1, 1.3])
+                with controls[0]:
+                    planning_lookback = st.selectbox(
+                        "История",
+                        options=[45, 60, 75, 90],
+                        index=1,
+                        format_func=lambda value: f"{value} дней",
+                        key="planning_v2_lookback_days",
+                    )
+                with controls[1]:
+                    st.metric("Категорий", len(planning_selected_categories))
+                with controls[2]:
+                    st.metric("Защита от качелей", "±2 шт.")
+                with controls[3]:
+                    st.metric("Каннибализация остатка", "60%")
+
+                target_menu = date_menu[
+                    date_menu["category"].isin(planning_selected_categories)
+                ].copy()
+                preview_columns = [
+                    column for column in [
+                        "category", "sku", "product_name", "entity", "price"
+                    ] if column in target_menu.columns
+                ]
+                preview = target_menu[preview_columns].rename(columns={
+                    "category": "Категория",
+                    "sku": "SKU",
+                    "product_name": "Блюдо",
+                    "entity": "Сущность",
+                    "price": "Цена",
+                })
+                if not preview.empty:
+                    preview["Срок"] = preview["Категория"].map(
+                        lambda value: planning_v2_rule(value)["life_days"]
+                    )
+                    preview["Оптималка"] = preview["Категория"].map(
+                        lambda value: planning_v2_rule(value)["optimal_days"]
+                    )
+                st.markdown("#### Меню, которое будет рассчитано")
+                st.dataframe(preview, use_container_width=True, hide_index=True)
+
+                if planning_target_date > today:
+                    st.info(
+                        "Для будущей даты остаток строится только из уже реально наступивших партий и "
+                        "фактических продаж PostgreSQL. Будущие промежуточные поставки не считаются уже "
+                        "лежащим товаром."
+                    )
+
+                if st.button(
+                    "Рассчитать Планировку",
+                    type="primary",
+                    use_container_width=True,
+                    key="planning_v2_calculate",
+                ):
+                    if not planning_selected_points:
+                        st.warning("Выберите хотя бы одну точку.")
+                    elif not planning_selected_categories:
+                        st.warning("Выберите хотя бы одну категорию.")
+                    elif target_menu.empty:
+                        st.warning("Для выбранной даты и категорий меню пусто.")
+                    else:
+                        selected_labels = set(planning_selected_points)
+                        selected_shop_to_label = {
+                            shop: label
+                            for shop, label in planning_shop_to_label.items()
+                            if label in selected_labels
+                        }
+                        selected_shop_to_point = {
+                            shop: planning_shop_to_point[shop]
+                            for shop in selected_shop_to_label
+                        }
+                        selected_point_numbers = sorted(set(selected_shop_to_point.values()))
+
+                        history_start = planning_target_date - timedelta(
+                            days=int(planning_lookback) + PLANNING_V2_PLAN_BUFFER_DAYS
+                        )
+                        sales_end_exclusive = min(
+                            planning_target_date,
+                            today + timedelta(days=1),
+                        )
+                        analysis_date = min(
+                            planning_target_date - timedelta(days=1),
+                            today,
+                        )
+
+                        progress = st.status("Собираю данные для Планировки…", expanded=True)
+                        progress.write(
+                            f"Меню: {planning_target_date:%d.%m.%Y}; история продаж: "
+                            f"{history_start:%d.%m.%Y}–{analysis_date:%d.%m.%Y}."
+                        )
+
+                        archive_dates_iso, archive_dates_error = _fetch_system_menu_archive_dates(
+                            MENU_ARCHIVE_APPS_SCRIPT_URL,
+                            MENU_ARCHIVE_APPS_SCRIPT_KEY,
+                        )
+                        archive_needed = tuple(
+                            value for value in archive_dates_iso
+                            if history_start.isoformat() <= value <= planning_target_date.isoformat()
+                        )
+                        archive_plans = pd.DataFrame()
+                        archive_plan_error = ""
+                        if archive_needed:
+                            archive_plans, archive_plan_error = _fetch_system_menu_archive_freshness_range(
+                                MENU_ARCHIVE_APPS_SCRIPT_URL,
+                                MENU_ARCHIVE_APPS_SCRIPT_KEY,
+                                archive_needed,
+                            )
+
+                        plan_parts: list[pd.DataFrame] = []
+                        if not archive_plans.empty:
+                            archive_part = archive_plans.copy()
+                            archive_part["_source_priority"] = 0
+                            plan_parts.append(archive_part)
+                        if not planning_current_plans.empty:
+                            current_part = planning_current_plans.copy()
+                            current_part["_source_priority"] = 1
+                            plan_parts.append(current_part)
+                        if plan_parts:
+                            planning_plan_history = pd.concat(plan_parts, ignore_index=True, sort=False)
+                            planning_plan_history = (
+                                planning_plan_history
+                                .sort_values(
+                                    ["plan_date", "point_number", "sku", "_source_priority"],
+                                    kind="stable",
+                                )
+                                .drop_duplicates(["plan_date", "point_number", "sku"], keep="last")
+                                .drop(columns="_source_priority", errors="ignore")
+                                .reset_index(drop=True)
+                            )
+                        else:
+                            planning_plan_history = pd.DataFrame()
+
+                        if planning_plan_history.empty:
+                            progress.update(label="Нет истории меню/планов для расчёта", state="error")
+                            st.error(
+                                "Планировка не может определить размер исторических партий: "
+                                "не удалось получить ни текущие, ни архивные планы."
+                            )
+                        else:
+                            planning_plan_history = planning_v2_enrich_plans(
+                                planning_plan_history,
+                                entities,
+                            )
+                            planning_plan_history = planning_plan_history[
+                                planning_plan_history["point_number"].isin(selected_point_numbers)
+                                & planning_plan_history["category"].isin(PLANNING_V2_SUPPORTED_CATEGORIES)
+                                & planning_plan_history["plan_date"].between(
+                                    history_start,
+                                    planning_target_date,
+                                    inclusive="both",
+                                )
+                            ].copy()
+                            progress.write(
+                                f"Меню/планы: {planning_plan_history['plan_date'].nunique()} дат · "
+                                f"{len(planning_plan_history):,} строк.".replace(",", " ")
+                            )
+
+                            try:
+                                planning_sales_history = load_forecast_history(
+                                    history_start,
+                                    sales_end_exclusive,
+                                    tuple(sorted(selected_shop_to_label)),
+                                )
+                            except Exception as error:
+                                planning_sales_history = pd.DataFrame()
+                                st.error(f"PostgreSQL: не удалось загрузить продажи для Планировки: {error}")
+
+                            if planning_sales_history.empty:
+                                progress.update(label="Нет продаж PostgreSQL за выбранный период", state="error")
+                            else:
+                                _, planning_sales_daily = planning_v2_prepare_sales(
+                                    planning_sales_history,
+                                    entities,
+                                    selected_shop_to_point,
+                                    planning_plan_history,
+                                )
+                                planning_sales_daily = planning_sales_daily[
+                                    planning_sales_daily["category"].isin(PLANNING_V2_SUPPORTED_CATEGORIES)
+                                ].copy()
+                                progress.write(
+                                    f"PostgreSQL: {planning_sales_daily['business_date'].nunique()} дней · "
+                                    f"{planning_sales_daily['sold_quantity'].sum():,.0f} продаж, шт.".replace(",", " ")
+                                )
+
+                                batch_stats = planning_v2_build_batch_stats(
+                                    planning_plan_history,
+                                    planning_sales_daily,
+                                    analysis_date,
+                                )
+                                sales_lookup = planning_v2_sales_lookup(planning_sales_daily)
+
+                                calculation_rows: list[dict[str, object]] = []
+                                for point_label in planning_selected_points:
+                                    matching_shops = [
+                                        shop for shop, label in selected_shop_to_label.items()
+                                        if label == point_label
+                                    ]
+                                    if not matching_shops:
+                                        continue
+                                    shop_number = int(matching_shops[0])
+                                    point_number = int(point_label[1:])
+                                    point_plans = planning_plan_history[
+                                        planning_plan_history["point_number"].eq(point_number)
+                                    ].copy()
+                                    point_sales = planning_sales_daily[
+                                        planning_sales_daily["point_number"].eq(point_number)
+                                    ].copy()
+                                    point_batches = batch_stats[
+                                        batch_stats["point_number"].eq(point_number)
+                                    ].copy() if not batch_stats.empty else pd.DataFrame()
+
+                                    stock_cache: dict[str, pd.DataFrame] = {}
+                                    for category in planning_selected_categories:
+                                        stock_cache[category] = planning_v2_stock_frame_at_date(
+                                            point_plans,
+                                            sales_lookup,
+                                            point_number,
+                                            category,
+                                            planning_target_date,
+                                            today,
+                                        )
+
+                                    for _, item in target_menu.iterrows():
+                                        target_category = normalize_matrix_category(item.get("category", ""))
+                                        if target_category not in PLANNING_V2_RULES:
+                                            continue
+                                        rule = planning_v2_rule(target_category)
+                                        target_entity = item.get("entity_set")
+                                        if not isinstance(target_entity, set):
+                                            target_entity = set()
+                                        target_price = float(item.get("price", 0.0) or 0.0)
+                                        target_sku = str(item["sku"])
+
+                                        analogs = point_batches[
+                                            point_batches["category"].eq(target_category)
+                                            & point_batches["shipment_date"].between(
+                                                planning_target_date - timedelta(days=int(planning_lookback)),
+                                                planning_target_date - timedelta(days=1),
+                                                inclusive="both",
+                                            )
+                                            & (point_batches["completed"] | point_batches["sold_out"])
+                                        ].copy() if not point_batches.empty else pd.DataFrame()
+
+                                        current_stock_frame = stock_cache.get(target_category, pd.DataFrame())
+                                        normal_effective_stock = planning_v2_normal_effective_stock(
+                                            point_plans,
+                                            sales_lookup,
+                                            point_number,
+                                            target_category,
+                                            planning_target_date,
+                                            target_entity,
+                                            target_price,
+                                            analysis_date,
+                                        )
+                                        category_trend, entity_trend, trend_detail = planning_v2_compute_trends(
+                                            point_sales,
+                                            target_entity,
+                                            analysis_date,
+                                            target_category,
+                                        )
+
+                                        target_plan_rows = point_plans[
+                                            point_plans["plan_date"].eq(planning_target_date)
+                                            & point_plans["sku"].eq(target_sku)
+                                        ]
+                                        current_plan = int(round(float(
+                                            target_plan_rows["analyst_plan"].sum()
+                                        ))) if not target_plan_rows.empty else 0
+
+                                        recommendation = planning_v2_recommend_load(
+                                            point=point_number,
+                                            shipment_date=planning_target_date,
+                                            category=target_category,
+                                            new_entity=target_entity,
+                                            new_price=target_price,
+                                            analogs=analogs,
+                                            current_stock=current_stock_frame,
+                                            normal_effective_stock=normal_effective_stock,
+                                            category_trend=category_trend,
+                                            entity_trend=entity_trend,
+                                            previous_recommendation=(current_plan if current_plan > 0 else None),
+                                        )
+                                        delta = int(recommendation["recommendation"] - current_plan)
+                                        if delta > 0:
+                                            action = f"Добавить +{delta}"
+                                        elif delta < 0:
+                                            action = f"Убавить {delta}"
+                                        else:
+                                            action = "Оставить"
+
+                                        reasons: list[str] = []
+                                        if recommendation["base_demand"] > current_plan + 0.5:
+                                            reasons.append("аналоги показывают спрос выше текущего плана")
+                                        if recommendation["trend"] >= 1.05:
+                                            reasons.append("спрос категории/сущности растёт")
+                                        elif recommendation["trend"] <= 0.95:
+                                            reasons.append("спрос категории/сущности снижается")
+                                        if recommendation["excess_stock"] >= 0.5:
+                                            reasons.append("живой конкурентный остаток выше нормы точки")
+                                        if recommendation["late_physical_stock"] > 0:
+                                            reasons.append("есть остаток старше оптимального окна")
+                                        if recommendation["repeated_early_stockout"]:
+                                            reasons.append("2 из последних 3 сильных аналогов закончились рано")
+                                        if recommendation["analog_count"] < 3:
+                                            reasons.append("мало исторических аналогов — расчёт осторожный")
+                                        if not reasons:
+                                            reasons.append("спрос и остаток близки к норме")
+
+                                        calculation_rows.append({
+                                            "Дата": planning_target_date,
+                                            "День": WEEKDAY_RU.get(planning_target_date.weekday(), ""),
+                                            "Точка": point_label,
+                                            "Магазин": shop_number,
+                                            "Категория": target_category,
+                                            "Срок жизни": int(rule["life_days"]),
+                                            "Оптимальное окно": int(rule["optimal_days"]),
+                                            "Минимум": int(rule["minimum"]),
+                                            "SKU": target_sku,
+                                            "Блюдо": item.get("product_name", ""),
+                                            "Сущность": item.get("entity", "Не задана"),
+                                            "Цена": round(target_price, 2),
+                                            "Текущий план": current_plan,
+                                            "Базовый спрос": recommendation["base_demand"],
+                                            "Тренд": recommendation["trend"],
+                                            "Спрос после тренда": recommendation["demand_after_trend"],
+                                            "Тренд категории": round(category_trend, 3),
+                                            "Тренд сущности": round(entity_trend, 3),
+                                            "Категория · последние 14д": round(trend_detail["category_last14"], 1),
+                                            "Категория · предыдущие 14д": round(trend_detail["category_previous14"], 1),
+                                            "Сущность · последние 14д": round(trend_detail["entity_last14"], 1),
+                                            "Сущность · предыдущие 14д": round(trend_detail["entity_previous14"], 1),
+                                            "Живой остаток физический": recommendation["physical_stock"],
+                                            "Живой остаток эффективный": recommendation["effective_stock"],
+                                            "Нормальный эффективный остаток": recommendation["normal_stock"],
+                                            "Избыточный остаток": recommendation["excess_stock"],
+                                            "Штраф остатка": recommendation["stock_penalty"],
+                                            "Поздний остаток физический": recommendation["late_physical_stock"],
+                                            "Штраф старения": recommendation["aging_penalty"],
+                                            "Расчёт до округления": recommendation["raw_recommendation"],
+                                            "Рекомендация": recommendation["recommendation"],
+                                            "Изменение": delta,
+                                            "Действие": action,
+                                            "Аналогов": recommendation["analog_count"],
+                                            "Сильных аналогов": recommendation["strong_analog_count"],
+                                            "Ранних обнулений": recommendation["early_analog_count"],
+                                            "Повторный ранний недогруз": "Да" if recommendation["repeated_early_stockout"] else "Нет",
+                                            "Уверенность": recommendation["confidence"],
+                                            "Причина": "; ".join(reasons),
+                                        })
+
+                                planning_result = pd.DataFrame(calculation_rows)
+                                st.session_state["planning_v2_result"] = planning_result
+                                st.session_state["planning_v2_target_date_calculated"] = planning_target_date
+                                st.session_state["planning_v2_lookback_calculated"] = int(planning_lookback)
+                                st.session_state["planning_v2_categories_calculated"] = tuple(planning_selected_categories)
+                                if archive_dates_error:
+                                    st.caption(f"Архив дат: {archive_dates_error}")
+                                if archive_plan_error:
+                                    st.caption(f"Часть архивных планов: {archive_plan_error}")
+                                progress.update(label="Планировка рассчитана", state="complete")
+
+                planning_result = st.session_state.get("planning_v2_result", pd.DataFrame())
+                if isinstance(planning_result, pd.DataFrame) and not planning_result.empty:
+                    calculated_date = st.session_state.get("planning_v2_target_date_calculated")
+                    calculated_lookback = st.session_state.get("planning_v2_lookback_calculated")
+                    calculated_categories = tuple(st.session_state.get("planning_v2_categories_calculated", ()))
+                    calculation_current = (
+                        calculated_date == planning_target_date
+                        and int(calculated_lookback or 0) == int(planning_lookback)
+                        and calculated_categories == tuple(planning_selected_categories)
+                    )
+                    if not calculation_current:
+                        st.warning("Дата, категории или период истории изменены. Нажмите «Рассчитать Планировку» ещё раз.")
+
+                    st.markdown("#### Результат Планировки")
+                    metrics = st.columns(5)
+                    metrics[0].metric("Точек", planning_result["Точка"].nunique())
+                    metrics[1].metric("Блюд", planning_result["SKU"].nunique())
+                    metrics[2].metric(
+                        "Текущий план",
+                        f"{planning_result['Текущий план'].sum():,.0f}".replace(",", " "),
+                    )
+                    metrics[3].metric(
+                        "Рекомендация",
+                        f"{planning_result['Рекомендация'].sum():,.0f}".replace(",", " "),
+                    )
+                    total_delta = int(planning_result["Изменение"].sum())
+                    metrics[4].metric("Изменение", f"{total_delta:+d}")
+
+                    summary = (
+                        planning_result.groupby(["Точка", "Категория"], as_index=False)
+                        .agg(**{
+                            "Текущий план": ("Текущий план", "sum"),
+                            "Рекомендация": ("Рекомендация", "sum"),
+                            "Изменение": ("Изменение", "sum"),
+                            "Живой остаток": ("Живой остаток физический", "sum"),
+                            "Поздний остаток": ("Поздний остаток физический", "sum"),
+                        })
+                    )
+                    summary["_point"] = pd.to_numeric(
+                        summary["Точка"].astype(str).str.extract(r"(\d+)", expand=False),
+                        errors="coerce",
+                    )
+                    summary = summary.sort_values(["_point", "Категория"]).drop(columns="_point")
+                    st.markdown("##### По точкам и категориям")
+                    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+                    visible_columns = [
+                        "Точка", "Категория", "Блюдо", "Сущность", "Цена",
+                        "Срок жизни", "Оптимальное окно", "Текущий план", "Рекомендация",
+                        "Изменение", "Действие", "Базовый спрос", "Тренд",
+                        "Живой остаток эффективный", "Поздний остаток физический",
+                        "Штраф остатка", "Штраф старения", "Аналогов", "Уверенность", "Причина",
+                    ]
+                    st.markdown("##### Рекомендации")
+                    st.dataframe(
+                        planning_result[visible_columns],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    with st.expander("Показать все технические показатели Планировки", expanded=False):
+                        st.dataframe(planning_result, use_container_width=True, hide_index=True)
+
+                    if calculation_current:
+                        st.download_button(
+                            "Скачать Планировку Excel",
+                            data=planning_v2_export_excel(planning_result),
+                            file_name=f"планировка_{planning_target_date:%Y-%m-%d}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="planning_v2_download",
+                        )
