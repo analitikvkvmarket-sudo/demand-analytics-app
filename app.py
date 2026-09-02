@@ -34,7 +34,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.34-PERF-V1"
+BUILD_ID = "75.11.36-ARCHIVE-FRESHNESS-V2"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -518,6 +518,109 @@ def _fetch_system_menu_archive_day(
         return snapshot_id, frame[list(rename_map.values())].copy(), ""
     except Exception as error:
         return "", pd.DataFrame(), str(error)
+
+
+
+
+def _archive_menu_frame_to_freshness_plan(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert one archive API day to the same schema as parse_freshness_plan()."""
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+
+    required = {"Дата меню", "Точка", "SKU", "Название блюда", "Категория", "Цена", "План"}
+    if not required.issubset(frame.columns):
+        return pd.DataFrame()
+
+    result = pd.DataFrame(index=frame.index)
+    result["plan_date"] = pd.to_datetime(frame["Дата меню"], errors="coerce").dt.date
+    point_text = (
+        frame["Точка"].fillna("").astype(str).str.strip().str.upper().str.replace("T", "Т", regex=False)
+    )
+    result["point_number"] = pd.to_numeric(
+        point_text.str.extract(r"^Т(\d+)$", expand=False), errors="coerce"
+    )
+    result["sku"] = frame["SKU"].map(normalize_sku)
+    result["product_name"] = frame["Название блюда"].fillna("").astype(str).str.strip()
+    result["matrix_category"] = frame["Категория"].map(normalize_matrix_category)
+    result["unit_price"] = pd.to_numeric(frame["Цена"], errors="coerce").fillna(0).clip(lower=0)
+    result["analyst_plan"] = pd.to_numeric(frame["План"], errors="coerce").fillna(0).clip(lower=0)
+    if "Лист" in frame.columns:
+        result["plan_sheet"] = frame["Лист"].fillna("Архив меню").astype(str).str.strip()
+    else:
+        result["plan_sheet"] = "Архив меню"
+
+    result = result[
+        result["plan_date"].notna()
+        & result["point_number"].notna()
+        & result["sku"].notna()
+        & result["point_number"].between(1, 29)
+        & result["point_number"].ne(11)
+    ].copy()
+    if result.empty:
+        return result
+
+    result["point_number"] = result["point_number"].astype(int)
+    result["sku"] = result["sku"].astype(str)
+    return (
+        result.drop_duplicates(["plan_date", "point_number", "sku"], keep="last")
+        .sort_values(["plan_date", "point_number", "matrix_category", "product_name"], kind="stable")
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(ttl=MENU_ARCHIVE_CACHE_SECONDS, show_spinner=False)
+def _fetch_system_menu_archive_freshness_range(
+    api_url: str,
+    api_key: str,
+    menu_date_isos: tuple[str, ...],
+) -> tuple[pd.DataFrame, str]:
+    """Load only archive dates needed by the freshness period, in parallel."""
+    if not menu_date_isos:
+        return pd.DataFrame(), ""
+    if not api_url:
+        return pd.DataFrame(), "не указан URL системного архива"
+    if not api_key:
+        return pd.DataFrame(), "не указан MENU_ARCHIVE_APPS_SCRIPT_KEY"
+
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+
+    def load_one(menu_date_iso: str) -> tuple[str, pd.DataFrame, str]:
+        _, day_frame, day_error = _fetch_system_menu_archive_day(
+            api_url,
+            api_key,
+            menu_date_iso,
+        )
+        return menu_date_iso, day_frame, day_error
+
+    max_workers = max(1, min(6, len(menu_date_isos)))
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="freshness-archive") as executor:
+        future_to_date = {
+            executor.submit(load_one, menu_date_iso): menu_date_iso
+            for menu_date_iso in menu_date_isos
+        }
+        for future in as_completed(future_to_date):
+            menu_date_iso = future_to_date[future]
+            try:
+                loaded_date, day_frame, day_error = future.result()
+            except Exception as error:
+                errors.append(f"{menu_date_iso}: {error}")
+                continue
+            if day_error:
+                errors.append(f"{loaded_date}: {day_error}")
+                continue
+            converted = _archive_menu_frame_to_freshness_plan(day_frame)
+            if not converted.empty:
+                frames.append(converted)
+
+    if not frames:
+        return pd.DataFrame(), "; ".join(errors[:5])
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.drop_duplicates(
+        ["plan_date", "point_number", "sku"], keep="last"
+    ).reset_index(drop=True)
+    return combined, "; ".join(errors[:5])
 
 
 def _historical_menu_date_iso(value: object) -> str:
@@ -12740,36 +12843,68 @@ if tab_sales_time.open:
             ):
                 _fetch_apps_script_matrix_snapshot.clear()
                 _fetch_apps_script_entity_reference.clear()
+                _fetch_system_menu_archive_dates.clear()
+                _fetch_system_menu_archive_day.clear()
+                _fetch_system_menu_archive_freshness_range.clear()
                 st.rerun()
 
         if not matrix_snapshot_bytes:
             st.error("Матрица 2.3 недоступна ни через Apps Script, ни в резервной копии.")
-            sales_time_plans = pd.DataFrame()
+            current_sales_time_plans = pd.DataFrame()
         else:
             try:
-                sales_time_plans = parse_freshness_plan(matrix_snapshot_bytes)
+                current_sales_time_plans = parse_freshness_plan(matrix_snapshot_bytes)
             except Exception as error:
                 st.error(f"Не удалось прочитать матрицу 2.3: {error}")
-                sales_time_plans = pd.DataFrame()
+                current_sales_time_plans = pd.DataFrame()
 
-        if sales_time_plans.empty:
+        archive_date_isos, archive_dates_error = _fetch_system_menu_archive_dates(
+            MENU_ARCHIVE_APPS_SCRIPT_URL,
+            MENU_ARCHIVE_APPS_SCRIPT_KEY,
+        )
+        archive_plan_dates = []
+        for archive_date_iso in archive_date_isos:
+            try:
+                archive_plan_dates.append(date.fromisoformat(archive_date_iso))
+            except ValueError:
+                continue
+
+        current_plan_dates = (
+            sorted(current_sales_time_plans["plan_date"].dropna().unique())
+            if not current_sales_time_plans.empty
+            else []
+        )
+        available_plan_dates = sorted(set(current_plan_dates) | set(archive_plan_dates))
+
+        if not available_plan_dates:
             st.warning(
-                "В матрице 2.3 не найдены основные блоки «План на день кухня» "
-                "с датами, SKU и колонками Т1–Т29 на листах 1–4 недели."
+                "Не найдены даты меню ни в текущей матрице 1–4 недель, ни в системном архиве."
             )
+            if archive_dates_error:
+                st.caption(f"Архив меню: {archive_dates_error}")
         else:
-            available_plan_dates = sorted(sales_time_plans["plan_date"].dropna().unique())
             matrix_start = available_plan_dates[0]
             matrix_end = available_plan_dates[-1]
-            st.success(
-                f"Матрица 2.3 загружена: планы 1–4 недель; "
-                f"дат — {len(available_plan_dates)}, SKU — {sales_time_plans['sku'].nunique()}; "
-                f"период {matrix_start:%d.%m.%Y}–{matrix_end:%d.%m.%Y}."
+            current_sku_count = (
+                current_sales_time_plans["sku"].nunique()
+                if not current_sales_time_plans.empty
+                else 0
             )
+            st.success(
+                f"Окно свежести · сборка {BUILD_ID}: доступно дат — {len(available_plan_dates)}; "
+                f"текущая матрица — {len(current_plan_dates)} дат / {current_sku_count} SKU; "
+                f"системный архив — {len(archive_plan_dates)} дат; "
+                f"общий период {matrix_start:%d.%m.%Y}–{matrix_end:%d.%m.%Y}."
+            )
+            if archive_dates_error:
+                st.warning(
+                    "Архивные даты загрузились не полностью: "
+                    f"{archive_dates_error}. Текущие планы продолжают работать."
+                )
 
-            start_key = "freshness_period_start_v75"
-            end_key = "freshness_period_end_v75"
-            anchor_key = "freshness_period_anchor_v75"
+            start_key = "freshness_period_start_v76"
+            end_key = "freshness_period_end_v76"
+            anchor_key = "freshness_period_anchor_v76"
             if (
                 st.session_state.get(start_key) not in available_plan_dates
                 or st.session_state.get(end_key) not in available_plan_dates
@@ -12780,12 +12915,12 @@ if tab_sales_time.open:
 
             st.markdown("#### Период плана")
             st.caption(
-                "По умолчанию выбраны все даты из планов 1–4 недель. "
+                "По умолчанию выбраны все доступные даты: текущие планы 1–4 недель и системный архив. "
                 "Чтобы выбрать свой период, нажмите первую дату, затем последнюю."
             )
             if st.button(
-                "Все даты 1–4 недель",
-                key="freshness_all_dates_v75",
+                "Все даты: архив + 1–4 недели",
+                key="freshness_all_dates_v76",
                 type="primary",
                 use_container_width=False,
             ):
@@ -12806,7 +12941,7 @@ if tab_sales_time.open:
                     is_selected = selected_start <= plan_date <= selected_end
                     if date_columns[offset].button(
                         f"{plan_date:%d.%m} · {weekday_short[plan_date.weekday()]}",
-                        key=f"freshness_date_button_v75_{plan_date.isoformat()}",
+                        key=f"freshness_date_button_v76_{plan_date.isoformat()}",
                         type="primary" if is_selected else "secondary",
                         use_container_width=True,
                     ):
@@ -12825,6 +12960,68 @@ if tab_sales_time.open:
             shipment_end = st.session_state[end_key]
             if shipment_start > shipment_end:
                 shipment_start, shipment_end = shipment_end, shipment_start
+
+            # Для FIFO нужны партии, отгруженные до начала выбранного периода.
+            # Максимальный срок сейчас у напитков — 7 дней, поэтому архив читаем
+            # от shipment_start - 7 дней до конца выбранного периода.
+            archive_buffer_start = shipment_start - timedelta(days=7)
+            archive_dates_needed = tuple(
+                archive_date.isoformat()
+                for archive_date in archive_plan_dates
+                if archive_buffer_start <= archive_date <= shipment_end
+            )
+            archive_freshness_plans, archive_load_error = (
+                _fetch_system_menu_archive_freshness_range(
+                    MENU_ARCHIVE_APPS_SCRIPT_URL,
+                    MENU_ARCHIVE_APPS_SCRIPT_KEY,
+                    archive_dates_needed,
+                )
+            )
+
+            # Архив идёт первым, текущая матрица — второй. Поэтому при совпадении
+            # дата + точка + SKU всегда побеждает текущее значение матрицы.
+            freshness_plan_parts: list[pd.DataFrame] = []
+            if not archive_freshness_plans.empty:
+                archive_part = archive_freshness_plans.copy()
+                archive_part["_source_priority"] = 0
+                freshness_plan_parts.append(archive_part)
+            if not current_sales_time_plans.empty:
+                current_part = current_sales_time_plans.copy()
+                current_part["_source_priority"] = 1
+                freshness_plan_parts.append(current_part)
+
+            if freshness_plan_parts:
+                sales_time_plans = pd.concat(freshness_plan_parts, ignore_index=True, sort=False)
+                sales_time_plans = (
+                    sales_time_plans
+                    .sort_values(
+                        ["plan_date", "point_number", "sku", "_source_priority"],
+                        kind="stable",
+                    )
+                    .drop_duplicates(["plan_date", "point_number", "sku"], keep="last")
+                    .drop(columns="_source_priority", errors="ignore")
+                    .reset_index(drop=True)
+                )
+            else:
+                sales_time_plans = pd.DataFrame()
+
+            if archive_load_error:
+                st.warning(
+                    "Часть архивных партий не удалось получить: "
+                    f"{archive_load_error}"
+                )
+            elif archive_dates_needed:
+                loaded_archive_dates = (
+                    archive_freshness_plans["plan_date"].nunique()
+                    if not archive_freshness_plans.empty
+                    else 0
+                )
+                st.caption(
+                    f"Для расчёта свежести подключён системный архив: "
+                    f"{loaded_archive_dates} архивных дат в диапазоне "
+                    f"{archive_buffer_start:%d.%m.%Y}–{shipment_end:%d.%m.%Y}."
+                )
+
             selected_plan_dates = [
                 plan_date for plan_date in available_plan_dates
                 if shipment_start <= plan_date <= shipment_end
