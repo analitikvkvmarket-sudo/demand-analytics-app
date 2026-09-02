@@ -34,7 +34,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.36-ARCHIVE-FRESHNESS-V2"
+BUILD_ID = "75.11.37-HANDOVER-CATEGORY-SUMMARY"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -2181,6 +2181,188 @@ def parse_freshness_plan(file_bytes: bytes) -> pd.DataFrame:
         ["plan_date", "point_number", "sku"], keep="last"
     )
 
+
+@st.cache_data(show_spinner=False)
+def parse_matrix_handover_history(file_bytes: bytes) -> pd.DataFrame:
+    """Read category totals from the matrix fact columns «СДАЛИ» / «Ф.Цена».
+
+    One row in the result is one SKU for one real menu date. Quantity is taken
+    from the right-side «СДАЛИ» cell, i.e. the total actually handed over across
+    all points. Value is taken from «Ф.Цена» when it looks like a monetary total;
+    if that cell is blank or clearly broken, it safely falls back to
+    «СДАЛИ × Цена». Service blocks such as «Участок комплектации» are ignored.
+    """
+    output_columns = [
+        "plan_date", "sku", "product_name", "category",
+        "handed_qty", "handed_value", "fact_value_source",
+    ]
+    if not file_bytes or file_bytes[:2] != b"PK":
+        return pd.DataFrame(columns=output_columns)
+
+    workbook = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=False)
+    records: list[dict[str, object]] = []
+
+    def norm_header(value: object) -> str:
+        return (
+            str(value or "")
+            .strip()
+            .casefold()
+            .replace("ё", "е")
+            .replace(" ", "")
+            .replace("\n", "")
+            .replace("\r", "")
+        )
+
+    for sheet_name in workbook.sheetnames:
+        if not (sheet_name.lower().startswith("план ") and "недел" in sheet_name.lower()):
+            continue
+        sheet = workbook[sheet_name]
+        main_blocks: list[tuple[int, date]] = []
+        max_scan_column = min(sheet.max_column, 12)
+
+        for excel_row in range(1, sheet.max_row + 1):
+            values = [sheet.cell(excel_row, column).value for column in range(1, max_scan_column + 1)]
+            texts = [str(value or "").strip().casefold() for value in values if value is not None]
+            if any("участок комплектации" in text for text in texts):
+                continue
+            has_plan_label = any("план на день кухня" in text for text in texts)
+            if not has_plan_label:
+                continue
+            target_date = next(
+                (parsed for value in values if (parsed := parse_excel_date(value)) is not None),
+                None,
+            )
+            if target_date is not None:
+                main_blocks.append((excel_row, target_date))
+
+        for block_index, (date_row, target_date) in enumerate(main_blocks):
+            next_main_row = (
+                main_blocks[block_index + 1][0]
+                if block_index + 1 < len(main_blocks)
+                else sheet.max_row + 1
+            )
+
+            header_row: int | None = None
+            headers: dict[str, int] = {}
+            for candidate in range(date_row + 1, min(next_main_row, date_row + 7)):
+                candidate_headers: dict[str, int] = {}
+                for column in range(1, sheet.max_column + 1):
+                    key = norm_header(sheet.cell(candidate, column).value)
+                    if key and key not in candidate_headers:
+                        candidate_headers[key] = column
+                if (
+                    any(key in candidate_headers for key in ("код", "код№", "sku", "ску"))
+                    and any(key in candidate_headers for key in ("категория", "вид"))
+                    and "сдали" in candidate_headers
+                ):
+                    header_row = candidate
+                    headers = candidate_headers
+                    break
+
+            if header_row is None:
+                continue
+
+            code_column = next(
+                (headers[key] for key in ("код", "код№", "sku", "ску") if key in headers),
+                None,
+            )
+            category_column = next(
+                (headers[key] for key in ("категория", "вид") if key in headers),
+                None,
+            )
+            name_column = next(
+                (headers[key] for key in ("названиеблюда", "названиетовара", "наименование") if key in headers),
+                None,
+            )
+            price_column = headers.get("цена")
+            handed_column = headers.get("сдали")
+            fact_value_column = next(
+                (headers[key] for key in ("ф.цена", "фцена") if key in headers),
+                None,
+            )
+            if code_column is None or category_column is None or handed_column is None:
+                continue
+
+            end_row = next_main_row - 1
+            for candidate in range(header_row + 1, next_main_row):
+                candidate_label = " ".join(
+                    str(sheet.cell(candidate, column).value or "").strip().casefold()
+                    for column in range(1, max_scan_column + 1)
+                )
+                if "участок комплектации" in candidate_label:
+                    end_row = candidate - 1
+                    break
+
+            for excel_row in range(header_row + 1, end_row + 1):
+                sku = normalize_sku(sheet.cell(excel_row, code_column).value)
+                if sku is None:
+                    continue
+                raw_category = sheet.cell(excel_row, category_column).value
+                category = normalize_matrix_category(raw_category)
+                if not str(category or "").strip():
+                    continue
+                product_name = (
+                    str(sheet.cell(excel_row, name_column).value or "").strip()
+                    if name_column is not None
+                    else ""
+                )
+                handed_qty = pd.to_numeric(
+                    pd.Series([sheet.cell(excel_row, handed_column).value]), errors="coerce"
+                ).iloc[0]
+                if pd.isna(handed_qty):
+                    handed_qty = 0.0
+                handed_qty = max(0.0, float(handed_qty))
+
+                unit_price = pd.to_numeric(
+                    pd.Series([sheet.cell(excel_row, price_column).value if price_column else None]),
+                    errors="coerce",
+                ).iloc[0]
+                unit_price = 0.0 if pd.isna(unit_price) else max(0.0, float(unit_price))
+                calculated_value = handed_qty * unit_price
+
+                fact_value = pd.to_numeric(
+                    pd.Series([
+                        sheet.cell(excel_row, fact_value_column).value
+                        if fact_value_column is not None
+                        else None
+                    ]),
+                    errors="coerce",
+                ).iloc[0]
+                fact_value_source = "Ф.Цена"
+                # «Ф.Цена» in the matrix occasionally stays blank or contains a
+                # clearly non-monetary leftover value. In those cases quantity ×
+                # unit price is the only internally consistent monetary total.
+                if (
+                    pd.isna(fact_value)
+                    or float(fact_value) < 0
+                    or (calculated_value >= 100 and float(fact_value) < calculated_value * 0.20)
+                ):
+                    fact_value = calculated_value
+                    fact_value_source = "Сдали × Цена"
+                else:
+                    fact_value = max(0.0, float(fact_value))
+
+                records.append(
+                    {
+                        "plan_date": target_date,
+                        "sku": sku,
+                        "product_name": product_name,
+                        "category": category,
+                        "handed_qty": handed_qty,
+                        "handed_value": fact_value,
+                        "fact_value_source": fact_value_source,
+                    }
+                )
+
+    if not records:
+        return pd.DataFrame(columns=output_columns)
+
+    result = pd.DataFrame(records, columns=output_columns)
+    return (
+        result.drop_duplicates(["plan_date", "sku"], keep="last")
+        .sort_values(["plan_date", "category", "product_name", "sku"], kind="stable")
+        .reset_index(drop=True)
+    )
 
 
 WEEKDAY_RU = {
@@ -13183,6 +13365,120 @@ if tab_sales_time.open:
                     "Нажмите на строку нужного SKU в меню — ниже откроется история его продаж "
                     "по выбранной точке за период, заданный слева в «Параметрах»."
                 )
+
+                # Краткая сводка фактической сдачи из Матрицы КОМБО. Она всегда
+                # считается по ВСЕМ точкам, независимо от выбранного фильтра «Точки».
+                handover_history = (
+                    parse_matrix_handover_history(matrix_snapshot_bytes)
+                    if matrix_snapshot_bytes
+                    else pd.DataFrame()
+                )
+                selected_handover_dates = set(selected_plan_dates)
+                handover_period = (
+                    handover_history[handover_history["plan_date"].isin(selected_handover_dates)].copy()
+                    if not handover_history.empty
+                    else pd.DataFrame()
+                )
+                # Категории показываем так же, как в остальных разделах приложения:
+                # живой «Справочник» имеет приоритет над старым текстом категории в плане.
+                if not handover_period.empty and entities is not None and not entities.empty:
+                    handover_reference = (
+                        entities[["sku", "category"]]
+                        .drop_duplicates("sku", keep="last")
+                        .rename(columns={"category": "reference_category"})
+                    )
+                    handover_period = handover_period.merge(
+                        handover_reference, on="sku", how="left"
+                    )
+                    handover_period["reference_category"] = (
+                        handover_period["reference_category"].fillna("").astype(str).str.strip()
+                    )
+                    handover_period["category"] = handover_period["reference_category"].where(
+                        handover_period["reference_category"].ne(""),
+                        handover_period["category"],
+                    ).map(normalize_matrix_category)
+                    handover_period = handover_period.drop(
+                        columns="reference_category", errors="ignore"
+                    )
+
+                st.markdown("#### Сдали по категориям · все точки")
+                if handover_period.empty:
+                    st.info(
+                        "Для выбранных дат в текущей Матрице КОМБО нет заполненных значений «СДАЛИ». "
+                        "Архивные меню сейчас хранят плановые Т1–Т29, поэтому старые «СДАЛИ/Ф.Цена» "
+                        "из системного архива восстановить нельзя."
+                    )
+                else:
+                    handover_summary = (
+                        handover_period.groupby("category", as_index=False, dropna=False)
+                        .agg(
+                            **{
+                                "Сдали, шт.": ("handed_qty", "sum"),
+                                "Стоимость, ₽": ("handed_value", "sum"),
+                            }
+                        )
+                        .rename(columns={"category": "Категория"})
+                    )
+                    handover_category_order = [
+                        "Завтраки", "Салаты", "Супы", "Вторые блюда", "Сэндвичи",
+                        "Япония", "Десерты", "Напитки", "Хлеб", "Не сопоставлено",
+                    ]
+                    handover_rank = {
+                        category: index for index, category in enumerate(handover_category_order)
+                    }
+                    handover_summary["_order"] = (
+                        handover_summary["Категория"].map(handover_rank).fillna(99)
+                    )
+                    handover_summary = (
+                        handover_summary.sort_values(["_order", "Категория"], kind="stable")
+                        .drop(columns="_order")
+                        .reset_index(drop=True)
+                    )
+                    handover_total = pd.DataFrame(
+                        [
+                            {
+                                "Категория": "ВСЕГО",
+                                "Сдали, шт.": handover_summary["Сдали, шт."].sum(),
+                                "Стоимость, ₽": handover_summary["Стоимость, ₽"].sum(),
+                            }
+                        ]
+                    )
+                    handover_display = pd.concat(
+                        [handover_summary, handover_total], ignore_index=True
+                    )
+                    actual_handover_dates = sorted(handover_period["plan_date"].dropna().unique())
+                    archive_only_selected_dates = sorted(
+                        selected_handover_dates - set(actual_handover_dates)
+                    )
+                    st.caption(
+                        f"Источник количества — правая ячейка «СДАЛИ» в Матрице КОМБО; "
+                        f"стоимость — «Ф.Цена» (при пустом/повреждённом значении: Сдали × Цена SKU). "
+                        f"Учтено дат: {len(actual_handover_dates)}. Значения суммированы по всем точкам."
+                    )
+                    st.dataframe(
+                        handover_display.style.apply(
+                            lambda row: [
+                                "font-weight: 700; background-color: #f2f2f2;"
+                                if str(row.get("Категория", "")) == "ВСЕГО"
+                                else ""
+                                for _ in row.index
+                            ],
+                            axis=1,
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(520, 38 * len(handover_display) + 80),
+                        column_config={
+                            "Категория": st.column_config.TextColumn(width="medium"),
+                            "Сдали, шт.": st.column_config.NumberColumn(format="%.0f"),
+                            "Стоимость, ₽": st.column_config.NumberColumn(format="%.0f"),
+                        },
+                    )
+                    if archive_only_selected_dates:
+                        st.caption(
+                            "Не включены архивные даты без сохранённого факта «СДАЛИ/Ф.Цена»: "
+                            + ", ".join(value.strftime("%d.%m.%Y") for value in archive_only_selected_dates)
+                        )
 
                 selected_menu_rows = list(menu_selection.selection.rows)
                 if selected_menu_rows:
