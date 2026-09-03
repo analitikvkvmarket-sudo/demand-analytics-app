@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.47-CYCLE-PLAN-MATRIX-EXPORT"
+BUILD_ID = "75.11.48-CYCLE-SKU-MATCH-FIX"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -9297,6 +9297,16 @@ def build_cycle_plan_v1(target_plans: pd.DataFrame, reference_plans: pd.DataFram
         for row in reference.itertuples(index=False)
     } if not reference.empty else {}
 
+    # SKU existence is checked at menu-date level, not at point level.
+    # A SKU can legitimately have 0 / blank previous plan on a specific point.
+    # That is NOT a SKU mismatch and must not become «Проверить SKU».
+    ref_sku_lookup = {}
+    if not reference.empty:
+        for (plan_date, sku), group in reference.groupby(["plan_date", "sku"], dropna=False, sort=False):
+            if pd.isna(plan_date) or not sku:
+                continue
+            ref_sku_lookup[(plan_date, str(sku))] = group.iloc[-1]
+
     sales_lookup = {}
     if not sold.empty:
         for (shop, sku), group in sold.groupby(["shop_number","sku"], sort=False):
@@ -9335,20 +9345,23 @@ def build_cycle_plan_v1(target_plans: pd.DataFrame, reference_plans: pd.DataFram
             "Статус": "",
         }
 
+        # First check whether the SKU exists anywhere in the paired historical menu.
+        # Name differences do not block calculation: SKU is the primary key.
+        sku_reference = ref_sku_lookup.get((reference_date, sku))
+        if sku_reference is None:
+            row["Статус"] = "Проверить SKU"
+            rows.append(row)
+            continue
+
+        # If this SKU existed in the menu but had no plan on the current point,
+        # treat the previous point plan as 0 instead of a mismatch.
         previous = ref_lookup.get((reference_date, point_number, sku))
         if previous is None:
-            row["Статус"] = "Проверить SKU"
-            rows.append(row)
-            continue
+            previous_plan = 0.0
+        else:
+            previous_plan = max(0.0, float(getattr(previous, "analyst_plan", 0.0) or 0.0))
 
-        previous_name = str(getattr(previous, "product_name", "") or "").strip()
-        previous_plan = max(0.0, float(getattr(previous, "analyst_plan", 0.0) or 0.0))
         row["Прошлый план"] = previous_plan
-
-        if not previous_name or not name or _cycle_plan_normalize_name(previous_name) != _cycle_plan_normalize_name(name):
-            row["Статус"] = "Проверить SKU"
-            rows.append(row)
-            continue
 
         first_sale_date = reference_date + timedelta(days=1)
         last_sale_date = reference_date + timedelta(days=lifecycle_days)
@@ -9573,7 +9586,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                             (
                                 "Проверить SKU.\n"
                                 f"Дата сравнения: {record.get('Дата сравнения', '')}\n"
-                                "SKU отсутствует в сопоставимом меню или название блюда не совпадает."
+                                "SKU отсутствует в сопоставимом меню даты сравнения."
                             ),
                             "Циклический план",
                         )
@@ -9668,9 +9681,18 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                 if point_column is None:
                     continue
                 if str(record.get("Статус", "") or "") == "Проверить SKU":
-                    sheet.cell(diag_row, point_column).value = "Проверить SKU"
-                    sheet.cell(diag_row, point_column).fill = PatternFill("solid", fgColor="F4CCCC")
-                    sheet.cell(diag_row, point_column).font = Font(color="9C0006", bold=True)
+                    diag_cell = sheet.cell(diag_row, point_column)
+                    diag_cell.value = None
+                    diag_cell.fill = PatternFill("solid", fgColor="F4CCCC")
+                    diag_cell.font = Font(color="9C0006", bold=True)
+                    diag_cell.comment = Comment(
+                        (
+                            "Проверить SKU.\n"
+                            f"Дата сравнения: {record.get('Дата сравнения', '')}\n"
+                            "SKU отсутствует в сопоставимом меню даты сравнения."
+                        ),
+                        "Циклический план",
+                    )
                 else:
                     previous_plan = pd.to_numeric(pd.Series([record.get("Прошлый план")]), errors="coerce").iloc[0]
                     consumed = pd.to_numeric(pd.Series([record.get("Съедено в срок")]), errors="coerce").iloc[0]
