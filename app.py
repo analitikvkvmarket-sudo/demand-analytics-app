@@ -12,6 +12,7 @@ import re
 import tempfile
 import queue
 import threading
+import time
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
@@ -34,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.42-PLANNING-TAB-FIX"
+BUILD_ID = "75.11.43-PLANNING-FAST-V1"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -1714,6 +1715,74 @@ def load_forecast_history(date_from: date, date_to_exclusive: date, points: tupl
     result["revenue"] = pd.to_numeric(result["revenue"], errors="coerce").fillna(0.0)
     return result
 
+
+
+@st.cache_data(ttl=900, show_spinner="Загружаю дневную историю для Планировки…")
+def load_planning_history_daily(
+    date_from: date,
+    date_to_exclusive: date,
+    points: tuple[int, ...],
+) -> pd.DataFrame:
+    """Лёгкий источник продаж только для Планировки.
+
+    В отличие от общего прогноза, Планировке не нужна строка на каждое время продажи.
+    PostgreSQL сразу возвращает одну строку на дата × точка × SKU, сохраняя
+    максимальное время продажи за день для диагностик. Это резко уменьшает объём
+    данных, который затем проходит через pandas/FIFO.
+    """
+    query = """
+        SELECT
+            business_date,
+            MAX(sale_datetime) AS sale_datetime,
+            shop_number,
+            COALESCE(
+                NULLIF(TRIM(erp_code), ''),
+                NULLIF(TRIM(product_code), ''),
+                NULLIF(TRIM(barcode), ''),
+                NULLIF(TRIM(product_hash), ''),
+                'БЕЗ_SKU'
+            ) AS sku,
+            MAX(product_name) AS product_name,
+            SUM(net_quantity)::numeric AS sold_quantity,
+            SUM(net_line_amount)::numeric AS revenue
+        FROM dwh.v_sales_item
+        WHERE business_date >= %(date_from)s
+          AND business_date < %(date_to)s
+          AND shop_number = ANY(%(points)s)
+        GROUP BY business_date, shop_number,
+                 COALESCE(
+                     NULLIF(TRIM(erp_code), ''),
+                     NULLIF(TRIM(product_code), ''),
+                     NULLIF(TRIM(barcode), ''),
+                     NULLIF(TRIM(product_hash), ''),
+                     'БЕЗ_SKU'
+                 )
+        ORDER BY business_date, shop_number,
+                 COALESCE(
+                     NULLIF(TRIM(erp_code), ''),
+                     NULLIF(TRIM(product_code), ''),
+                     NULLIF(TRIM(barcode), ''),
+                     NULLIF(TRIM(product_hash), ''),
+                     'БЕЗ_SKU'
+                 )
+    """
+    with pg_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                query,
+                {"date_from": date_from, "date_to": date_to_exclusive, "points": list(points)},
+            )
+            records = cursor.fetchall()
+            columns = [description.name for description in cursor.description]
+    result = pd.DataFrame(records, columns=columns)
+    if result.empty:
+        return result
+    result["sku"] = result["sku"].map(normalize_sku)
+    result["business_date"] = pd.to_datetime(result["business_date"]).dt.date
+    result["sale_datetime"] = pd.to_datetime(result["sale_datetime"], errors="coerce")
+    result["sold_quantity"] = pd.to_numeric(result["sold_quantity"], errors="coerce").fillna(0.0)
+    result["revenue"] = pd.to_numeric(result["revenue"], errors="coerce").fillna(0.0)
+    return result
 
 def normalize_matrix_category(value: object) -> str:
     text = str(value or "").strip().lower()
@@ -5903,8 +5972,10 @@ PLANNING_V2_RULES = {
     "Япония": {"life_days": 2, "optimal_days": 1, "minimum": 1},
 }
 PLANNING_V2_SUPPORTED_CATEGORIES = tuple(PLANNING_V2_RULES)
-PLANNING_V2_LOOKBACK_DAYS = 60
+PLANNING_V2_LOOKBACK_DAYS = 45
 PLANNING_V2_PLAN_BUFFER_DAYS = 12
+PLANNING_FAST_STOCK_HISTORY_MULTIPLIER = 2
+PLANNING_FAST_NORMAL_DATES = 4
 PLANNING_V2_CANNIBALIZATION = 0.60
 PLANNING_V2_AGING_PENALTY_WEIGHT = 0.50
 
@@ -6348,32 +6419,57 @@ def planning_v2_stock_frame_at_date(
     category: str,
     as_of_date: date,
     actual_data_through: date,
+    frame_cache: dict[tuple[int, str, date, date], pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
+    """Живые партии на дату с коротким FIFO-окном и локальным кэшем.
+
+    Для остатка нет смысла проигрывать всю историю 45–90 дней. Берём два полных
+    жизненных цикла категории: один для потенциально живой партии и ещё один
+    буфер для корректного FIFO при перекрытии повторных поставок того же SKU.
+    """
     if point_plans is None or point_plans.empty:
         return pd.DataFrame()
     category = normalize_matrix_category(category)
+    cache_key = (int(point_number), category, as_of_date, actual_data_through)
+    if frame_cache is not None and cache_key in frame_cache:
+        return frame_cache[cache_key]
+
+    rule = planning_v2_rule(category)
+    life_days = int(rule["life_days"])
+    fifo_start = as_of_date - timedelta(
+        days=max(2, life_days * PLANNING_FAST_STOCK_HISTORY_MULTIPLIER)
+    )
     latest_confirmed_shipment = min(as_of_date - timedelta(days=1), actual_data_through)
     candidates = point_plans[
         point_plans["point_number"].eq(int(point_number))
         & point_plans["category"].eq(category)
-        & point_plans["plan_date"].le(latest_confirmed_shipment)
+        & point_plans["plan_date"].between(
+            fifo_start, latest_confirmed_shipment, inclusive="both"
+        )
         & point_plans["analyst_plan"].gt(0)
     ].copy()
     if candidates.empty:
-        return pd.DataFrame()
+        result = pd.DataFrame()
+        if frame_cache is not None:
+            frame_cache[cache_key] = result
+        return result
+
     sales_until = min(as_of_date - timedelta(days=1), actual_data_through)
     states = planning_v2_fifo_batch_states(candidates, sales_lookup, sales_until)
     if states.empty:
+        if frame_cache is not None:
+            frame_cache[cache_key] = states
         return states
     states = states[
         states["expiry_date"].ge(as_of_date)
         & states["remaining_qty"].gt(0.01)
     ].copy()
-    if states.empty:
-        return states
-    states["age_days"] = states["shipment_date"].map(
-        lambda shipment: max(0, int((as_of_date - shipment).days))
-    )
+    if not states.empty:
+        states["age_days"] = states["shipment_date"].map(
+            lambda shipment: max(0, int((as_of_date - shipment).days))
+        )
+    if frame_cache is not None:
+        frame_cache[cache_key] = states
     return states
 
 
@@ -6386,6 +6482,7 @@ def planning_v2_effective_stock_at_date(
     new_entity: set[str],
     new_price: float,
     actual_data_through: date,
+    frame_cache: dict[tuple[int, str, date, date], pd.DataFrame] | None = None,
 ) -> dict[str, float]:
     stock_frame = planning_v2_stock_frame_at_date(
         point_plans,
@@ -6394,6 +6491,7 @@ def planning_v2_effective_stock_at_date(
         category,
         as_of_date,
         actual_data_through,
+        frame_cache=frame_cache,
     )
     if stock_frame.empty:
         return {"effective": 0.0, "physical": 0.0, "batches": 0.0, "aging_weighted": 0.0}
@@ -6431,7 +6529,14 @@ def planning_v2_normal_effective_stock(
     new_entity: set[str],
     new_price: float,
     analysis_date: date,
+    frame_cache: dict[tuple[int, str, date, date], pd.DataFrame] | None = None,
 ) -> float:
+    """Медианный эффективный остаток по прошлым таким же дням недели.
+
+    Тяжёлая часть — восстановление физических партий — кэшируется по
+    точка × категория × дата. Для разных блюд меняются только лёгкие веса
+    сущности и цены.
+    """
     comparable_dates: list[date] = []
     for offset in range(1, 43):
         candidate = target_date - timedelta(days=offset)
@@ -6439,7 +6544,7 @@ def planning_v2_normal_effective_stock(
             continue
         if candidate.weekday() == target_date.weekday():
             comparable_dates.append(candidate)
-        if len(comparable_dates) >= 4:
+        if len(comparable_dates) >= PLANNING_FAST_NORMAL_DATES:
             break
     values: list[float] = []
     for comparable_date in comparable_dates:
@@ -6452,6 +6557,7 @@ def planning_v2_normal_effective_stock(
             new_entity,
             new_price,
             comparable_date - timedelta(days=1),
+            frame_cache=frame_cache,
         )
         values.append(float(stock["effective"]))
     if not values:
@@ -16950,9 +17056,9 @@ if tab_forecast.open:
 
 if tab_planning.open:
     with tab_planning:
-        st.subheader("Планировка")
+        st.subheader("Планировка · FAST")
         st.caption(
-            "Отдельная модель рекомендации загрузки. Источники: текущее/архивное меню Матрицы КОМБО "
+            "Ускоренная модель рекомендации загрузки без изменения бизнес-формулы. Источники: текущее/архивное меню Матрицы КОМБО "
             "и фактические продажи PostgreSQL. Для каждой точки учитываются сущность, цена, день недели, "
             "давность аналогов, раннее обнуление партии, тренд категории/сущности, живой конкурентный "
             "остаток и возраст остатка относительно оптимального окна. Т1–Т29 автоматически не меняются."
@@ -17055,7 +17161,7 @@ if tab_planning.open:
                     planning_lookback = st.selectbox(
                         "История",
                         options=[45, 60, 75, 90],
-                        index=1,
+                        index=0,
                         format_func=lambda value: f"{value} дней",
                         key="planning_v2_lookback_days",
                     )
@@ -17136,11 +17242,13 @@ if tab_planning.open:
                         )
 
                         progress = st.status("Собираю данные для Планировки…", expanded=True)
+                        planning_started_at = time.perf_counter()
                         progress.write(
                             f"Меню: {planning_target_date:%d.%m.%Y}; история продаж: "
                             f"{history_start:%d.%m.%Y}–{analysis_date:%d.%m.%Y}."
                         )
 
+                        archive_started_at = time.perf_counter()
                         archive_dates_iso, archive_dates_error = _fetch_system_menu_archive_dates(
                             MENU_ARCHIVE_APPS_SCRIPT_URL,
                             MENU_ARCHIVE_APPS_SCRIPT_KEY,
@@ -17157,6 +17265,9 @@ if tab_planning.open:
                                 MENU_ARCHIVE_APPS_SCRIPT_KEY,
                                 archive_needed,
                             )
+                        progress.write(
+                            f"Архив меню: {time.perf_counter() - archive_started_at:.1f} сек."
+                        )
 
                         plan_parts: list[pd.DataFrame] = []
                         if not archive_plans.empty:
@@ -17207,8 +17318,9 @@ if tab_planning.open:
                                 f"{len(planning_plan_history):,} строк.".replace(",", " ")
                             )
 
+                            sql_started_at = time.perf_counter()
                             try:
-                                planning_sales_history = load_forecast_history(
+                                planning_sales_history = load_planning_history_daily(
                                     history_start,
                                     sales_end_exclusive,
                                     tuple(sorted(selected_shop_to_label)),
@@ -17231,17 +17343,30 @@ if tab_planning.open:
                                 ].copy()
                                 progress.write(
                                     f"PostgreSQL: {planning_sales_daily['business_date'].nunique()} дней · "
-                                    f"{planning_sales_daily['sold_quantity'].sum():,.0f} продаж, шт.".replace(",", " ")
+                                    f"{planning_sales_daily['sold_quantity'].sum():,.0f} продаж, шт. · "
+                                    f"{time.perf_counter() - sql_started_at:.1f} сек.".replace(",", " ")
                                 )
 
+                                fifo_started_at = time.perf_counter()
                                 batch_stats = planning_v2_build_batch_stats(
                                     planning_plan_history,
                                     planning_sales_daily,
                                     analysis_date,
                                 )
                                 sales_lookup = planning_v2_sales_lookup(planning_sales_daily)
+                                progress.write(
+                                    f"FIFO партий: {time.perf_counter() - fifo_started_at:.1f} сек."
+                                )
 
+                                calculation_started_at = time.perf_counter()
                                 calculation_rows: list[dict[str, object]] = []
+                                # FAST: физическое состояние партии зависит от точки/категории/даты,
+                                # но не от нового блюда. Поэтому один FIFO-снимок переиспользуется
+                                # всеми блюдами этой категории вместо повторного пересчёта.
+                                planning_stock_frame_cache: dict[
+                                    tuple[int, str, date, date], pd.DataFrame
+                                ] = {}
+                                planning_trend_cache: dict[tuple[int, str, tuple[str, ...]], tuple[float, float, dict[str, float]]] = {}
                                 for point_label in planning_selected_points:
                                     matching_shops = [
                                         shop for shop, label in selected_shop_to_label.items()
@@ -17261,6 +17386,29 @@ if tab_planning.open:
                                         batch_stats["point_number"].eq(point_number)
                                     ].copy() if not batch_stats.empty else pd.DataFrame()
 
+                                    # FAST: один пул исторических аналогов на категорию точки.
+                                    analog_pool_cache: dict[str, pd.DataFrame] = {}
+                                    for category in planning_selected_categories:
+                                        if point_batches.empty:
+                                            analog_pool_cache[category] = pd.DataFrame()
+                                        else:
+                                            analog_pool_cache[category] = point_batches[
+                                                point_batches["category"].eq(category)
+                                                & point_batches["shipment_date"].between(
+                                                    planning_target_date - timedelta(days=int(planning_lookback)),
+                                                    planning_target_date - timedelta(days=1),
+                                                    inclusive="both",
+                                                )
+                                                & (point_batches["completed"] | point_batches["sold_out"])
+                                            ].copy()
+
+                                    target_plan_lookup = (
+                                        point_plans[point_plans["plan_date"].eq(planning_target_date)]
+                                        .groupby("sku")["analyst_plan"]
+                                        .sum()
+                                        .to_dict()
+                                    )
+
                                     stock_cache: dict[str, pd.DataFrame] = {}
                                     for category in planning_selected_categories:
                                         stock_cache[category] = planning_v2_stock_frame_at_date(
@@ -17270,6 +17418,7 @@ if tab_planning.open:
                                             category,
                                             planning_target_date,
                                             today,
+                                            frame_cache=planning_stock_frame_cache,
                                         )
 
                                     for _, item in target_menu.iterrows():
@@ -17283,15 +17432,7 @@ if tab_planning.open:
                                         target_price = float(item.get("price", 0.0) or 0.0)
                                         target_sku = str(item["sku"])
 
-                                        analogs = point_batches[
-                                            point_batches["category"].eq(target_category)
-                                            & point_batches["shipment_date"].between(
-                                                planning_target_date - timedelta(days=int(planning_lookback)),
-                                                planning_target_date - timedelta(days=1),
-                                                inclusive="both",
-                                            )
-                                            & (point_batches["completed"] | point_batches["sold_out"])
-                                        ].copy() if not point_batches.empty else pd.DataFrame()
+                                        analogs = analog_pool_cache.get(target_category, pd.DataFrame())
 
                                         current_stock_frame = stock_cache.get(target_category, pd.DataFrame())
                                         normal_effective_stock = planning_v2_normal_effective_stock(
@@ -17303,21 +17444,24 @@ if tab_planning.open:
                                             target_entity,
                                             target_price,
                                             analysis_date,
+                                            frame_cache=planning_stock_frame_cache,
                                         )
-                                        category_trend, entity_trend, trend_detail = planning_v2_compute_trends(
-                                            point_sales,
-                                            target_entity,
-                                            analysis_date,
-                                            target_category,
-                                        )
+                                        entity_cache_key = tuple(sorted(target_entity))
+                                        trend_cache_key = (point_number, target_category, entity_cache_key)
+                                        trend_cached = planning_trend_cache.get(trend_cache_key)
+                                        if trend_cached is None:
+                                            trend_cached = planning_v2_compute_trends(
+                                                point_sales,
+                                                target_entity,
+                                                analysis_date,
+                                                target_category,
+                                            )
+                                            planning_trend_cache[trend_cache_key] = trend_cached
+                                        category_trend, entity_trend, trend_detail = trend_cached
 
-                                        target_plan_rows = point_plans[
-                                            point_plans["plan_date"].eq(planning_target_date)
-                                            & point_plans["sku"].eq(target_sku)
-                                        ]
                                         current_plan = int(round(float(
-                                            target_plan_rows["analyst_plan"].sum()
-                                        ))) if not target_plan_rows.empty else 0
+                                            target_plan_lookup.get(target_sku, 0.0)
+                                        )))
 
                                         recommendation = planning_v2_recommend_load(
                                             point=point_number,
@@ -17409,7 +17553,13 @@ if tab_planning.open:
                                     st.caption(f"Архив дат: {archive_dates_error}")
                                 if archive_plan_error:
                                     st.caption(f"Часть архивных планов: {archive_plan_error}")
-                                progress.update(label="Планировка рассчитана", state="complete")
+                                calculation_seconds = time.perf_counter() - calculation_started_at
+                                total_seconds = time.perf_counter() - planning_started_at
+                                progress.write(f"Рекомендации: {calculation_seconds:.1f} сек.")
+                                progress.update(
+                                    label=f"Планировка рассчитана за {total_seconds:.1f} сек.",
+                                    state="complete",
+                                )
 
                 planning_result = st.session_state.get("planning_v2_result", pd.DataFrame())
                 if isinstance(planning_result, pd.DataFrame) and not planning_result.empty:
