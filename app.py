@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.46-CYCLE-PLAN-V1"
+BUILD_ID = "75.11.47-CYCLE-PLAN-MATRIX-EXPORT"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -9402,29 +9402,363 @@ def build_cycle_plan_v1(target_plans: pd.DataFrame, reference_plans: pd.DataFram
     ).reset_index(drop=True)
 
 
-def export_cycle_plan_v1_excel(frame: pd.DataFrame) -> bytes:
+def _cycle_plan_find_block_header(sheet, date_row: int, next_date_row: int) -> int | None:
+    """Find the menu header row inside one matrix date block."""
+    search_end = min(next_date_row, date_row + 8)
+    for candidate in range(date_row + 1, search_end):
+        values = [str(sheet.cell(candidate, c).value or "").strip() for c in range(1, sheet.max_column + 1)]
+        normalized = [value.casefold().replace("ё", "е") for value in values]
+        has_code = any(value.replace(" ", "") in {"код", "код№", "sku", "ску"} for value in normalized)
+        has_name = any("название блюда" in value or "название товара" in value for value in normalized)
+        has_category = any("категор" in value for value in normalized)
+        has_point = any(re.fullmatch(r"т\s*0*1", value) for value in normalized if value)
+        if has_code and has_name and has_category and has_point:
+            return candidate
+    return None
+
+
+def _cycle_plan_selected_sheet_dates(workbook, selected_dates: set[date]) -> dict[str, set[date]]:
+    """Resolve which source matrix sheet contains each selected plan date."""
+    selected_by_sheet: dict[str, set[date]] = {}
+    for sheet_name in workbook.sheetnames:
+        if not (sheet_name.casefold().startswith("план ") and "недел" in sheet_name.casefold()):
+            continue
+        sheet = workbook[sheet_name]
+        max_scan_column = min(sheet.max_column, 12)
+        for row_number in range(1, sheet.max_row + 1):
+            values = [sheet.cell(row_number, column).value for column in range(1, max_scan_column + 1)]
+            texts = [str(value or "").strip().casefold() for value in values if value is not None]
+            if any("участок комплектации" in value for value in texts):
+                continue
+            has_plan_label = any("план на день кухня" in value for value in texts)
+            has_date_label = any(value.startswith("дата") for value in texts)
+            if not (has_plan_label or has_date_label):
+                continue
+            block_date = next(
+                (parsed for value in values if (parsed := parse_excel_date(value)) is not None),
+                None,
+            )
+            if block_date in selected_dates:
+                selected_by_sheet.setdefault(sheet_name, set()).add(block_date)
+    return selected_by_sheet
+
+
+def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
+    """Export cyclic plan in the same matrix-style workbook used by «Прогноз плана».
+
+    The primary sheets keep the original menu layout. Calculated values are written
+    directly into T1… point cells. A blue diagnostic row is inserted under each SKU.
+    Rows requiring manual SKU review stay blank/red. Two calculation sheets are added.
+    """
+    if not file_bytes or file_bytes[:2] != b"PK":
+        raise ValueError("Матрица КОМБО недоступна для формирования Excel.")
+    if frame is None or frame.empty:
+        raise ValueError("Нет рассчитанных строк циклического плана.")
+
+    workbook = load_workbook(io.BytesIO(file_bytes))
+    work = frame.copy()
+    work["Дата плана"] = pd.to_datetime(work["Дата плана"], errors="coerce").dt.date
+    work["SKU"] = work["SKU"].map(normalize_sku)
+    work["Точка"] = work["Точка"].fillna("").astype(str).str.strip().str.upper().str.replace("T", "Т", regex=False)
+    selected_dates = set(work["Дата плана"].dropna().tolist())
+
+    selected_by_sheet = _cycle_plan_selected_sheet_dates(workbook, selected_dates)
+    if not selected_by_sheet:
+        raise ValueError("Выбранные даты не найдены в исходной Матрице КОМБО.")
+
+    # Fast lookup by date/SKU/point.
+    result_lookup: dict[tuple[date, str, str], pd.Series] = {}
+    sku_groups: dict[tuple[date, str], pd.DataFrame] = {}
+    for (plan_date, sku), group in work.groupby(["Дата плана", "SKU"], dropna=False, sort=False):
+        if pd.isna(plan_date) or not sku:
+            continue
+        clean_group = group.copy()
+        sku_groups[(plan_date, str(sku))] = clean_group
+        for _, record in clean_group.iterrows():
+            result_lookup[(plan_date, str(sku), str(record["Точка"]))] = record
+
+    # Remember fact columns before inserting diagnostic rows.
+    fact_columns_by_sheet: dict[str, list[int]] = {}
+    matched_rows: dict[str, list[tuple[int, int, date, str]]] = {}
+
+    for sheet_name, sheet_dates in selected_by_sheet.items():
+        sheet = workbook[sheet_name]
+        max_scan_column = min(sheet.max_column, 12)
+        date_rows: list[tuple[int, date]] = []
+        for row_number in range(1, sheet.max_row + 1):
+            values = [sheet.cell(row_number, c).value for c in range(1, max_scan_column + 1)]
+            texts = [str(value or "").strip().casefold() for value in values if value is not None]
+            if any("участок комплектации" in value for value in texts):
+                continue
+            if not any("план на день кухня" in value for value in texts):
+                continue
+            block_date = next(
+                (parsed for value in values if (parsed := parse_excel_date(value)) is not None),
+                None,
+            )
+            if block_date is not None:
+                date_rows.append((row_number, block_date))
+
+        for position, (date_row, block_date) in enumerate(date_rows):
+            if block_date not in sheet_dates:
+                continue
+            next_date_row = date_rows[position + 1][0] if position + 1 < len(date_rows) else sheet.max_row + 1
+            header_row = _cycle_plan_find_block_header(sheet, date_row, next_date_row)
+            if header_row is None:
+                continue
+
+            headers = {
+                str(sheet.cell(header_row, column).value or "").strip(): column
+                for column in range(1, sheet.max_column + 1)
+            }
+            if sheet_name not in fact_columns_by_sheet:
+                fact_columns_by_sheet[sheet_name] = [
+                    column for column in range(1, sheet.max_column + 1)
+                    if _is_forecast_fact_header(sheet.cell(header_row, column).value)
+                ]
+
+            code_column = next(
+                (
+                    column for label, column in headers.items()
+                    if label.casefold().replace(" ", "") in {"код", "код№", "sku", "ску"}
+                ),
+                None,
+            )
+            name_column = next(
+                (column for label, column in headers.items() if "название блюда" in label.casefold()),
+                headers.get("Название блюда", 5),
+            )
+            category_column = next(
+                (column for label, column in headers.items() if "категор" in label.casefold()),
+                headers.get("Категория", 4),
+            )
+            if code_column is None:
+                continue
+
+            block_end = next_date_row - 1
+            for candidate_row in range(header_row + 1, next_date_row):
+                label = " ".join(
+                    str(sheet.cell(candidate_row, c).value or "").strip().casefold()
+                    for c in range(1, max_scan_column + 1)
+                )
+                if "участок комплектации" in label:
+                    block_end = candidate_row - 1
+                    break
+
+            menu_rows: list[int] = []
+            for row_number in range(header_row + 1, block_end + 1):
+                sku = normalize_sku(sheet.cell(row_number, code_column).value)
+                if not sku or (block_date, sku) not in sku_groups:
+                    continue
+                menu_rows.append(row_number)
+                matched_rows.setdefault(sheet_name, []).append((row_number, header_row, block_date, sku))
+
+                for point_label in sorted(
+                    set(sku_groups[(block_date, sku)]["Точка"].tolist()),
+                    key=_archive_point_sort_key,
+                ):
+                    point_column = headers.get(point_label)
+                    if point_column is None:
+                        continue
+                    record = result_lookup.get((block_date, sku, point_label))
+                    if record is None:
+                        continue
+                    target_cell = sheet.cell(row_number, point_column)
+                    status = str(record.get("Статус", "") or "")
+                    if status == "Проверить SKU":
+                        target_cell.value = None
+                        target_cell.fill = PatternFill("solid", fgColor="F4CCCC")
+                        target_cell.font = Font(color="9C0006")
+                        target_cell.comment = Comment(
+                            (
+                                "Проверить SKU.\n"
+                                f"Дата сравнения: {record.get('Дата сравнения', '')}\n"
+                                "SKU отсутствует в сопоставимом меню или название блюда не совпадает."
+                            ),
+                            "Циклический план",
+                        )
+                        continue
+
+                    new_plan = pd.to_numeric(pd.Series([record.get("Новый план")]), errors="coerce").iloc[0]
+                    if pd.isna(new_plan):
+                        target_cell.value = None
+                        continue
+                    target_cell.value = int(new_plan)
+                    previous_plan = pd.to_numeric(pd.Series([record.get("Прошлый план")]), errors="coerce").iloc[0]
+                    consumed = pd.to_numeric(pd.Series([record.get("Съедено в срок")]), errors="coerce").iloc[0]
+                    coefficient = pd.to_numeric(pd.Series([record.get("Коэффициент")]), errors="coerce").iloc[0]
+                    completion = record.get("День полного съедания")
+                    completion_text = "не съеден полностью" if pd.isna(completion) else f"день {int(completion)}"
+                    target_cell.comment = Comment(
+                        (
+                            f"Дата сравнения: {record.get('Дата сравнения', '')}\n"
+                            f"Прошлый план: {0 if pd.isna(previous_plan) else float(previous_plan):g}\n"
+                            f"Съедено в срок: {0 if pd.isna(consumed) else float(consumed):g}\n"
+                            f"Полное съедание: {completion_text}\n"
+                            f"Зелёное окно: {int(record.get('Зелёное окно, дней', 0) or 0)} дн.\n"
+                            f"Коэффициент: ×{1 if pd.isna(coefficient) else float(coefficient):g}\n"
+                            f"Новый план: {int(new_plan)}\n"
+                            f"Статус: {status}"
+                        ),
+                        "Циклический план",
+                    )
+
+            # Recalculate the matrix PLAN total across visible T-point columns.
+            plan_column = headers.get("ПЛАН")
+            point_columns = [
+                column for label, column in headers.items()
+                if re.fullmatch(r"Т\d+", str(label).strip().upper().replace("T", "Т"))
+            ]
+            if plan_column is not None:
+                for row_number in menu_rows:
+                    total = sum(
+                        float(sheet.cell(row_number, column).value or 0)
+                        for column in point_columns
+                        if isinstance(sheet.cell(row_number, column).value, (int, float))
+                    )
+                    sheet.cell(row_number, plan_column).value = int(round(total))
+
+    # Insert one blue diagnostic row under every matched SKU, similar to forecast export.
+    for sheet_name, rows_info in matched_rows.items():
+        if sheet_name not in workbook.sheetnames:
+            continue
+        sheet = workbook[sheet_name]
+        # Deduplicate same SKU row and insert bottom-up so source row numbers remain valid.
+        unique_rows = {}
+        for row_number, header_row, block_date, sku in rows_info:
+            unique_rows[row_number] = (header_row, block_date, sku)
+        for source_row in sorted(unique_rows, reverse=True):
+            header_row, block_date, sku = unique_rows[source_row]
+            headers = {
+                str(sheet.cell(header_row, column).value or "").strip(): column
+                for column in range(1, sheet.max_column + 1)
+            }
+            row_group = sku_groups.get((block_date, sku), pd.DataFrame())
+            if row_group.empty:
+                continue
+            sheet.insert_rows(source_row + 1, amount=1)
+            diag_row = source_row + 1
+            sheet.row_dimensions[diag_row].height = sheet.row_dimensions[source_row].height
+            for column in range(1, sheet.max_column + 1):
+                source_cell = sheet.cell(source_row, column)
+                target_cell = sheet.cell(diag_row, column)
+                if source_cell.has_style:
+                    target_cell._style = copy(source_cell._style)
+                target_cell.number_format = source_cell.number_format
+                target_cell.alignment = copy(source_cell.alignment)
+                target_cell.border = copy(source_cell.border)
+                target_cell.value = None
+                target_cell.comment = None
+                target_cell.fill = PatternFill("solid", fgColor="DDEBF7")
+
+            sheet.cell(diag_row, 1).value = "ЦИКЛ"
+            category_column = headers.get("Категория", 4)
+            name_column = headers.get("Название блюда", 5)
+            first = row_group.iloc[0]
+            green_days = int(first.get("Зелёное окно, дней", 0) or 0)
+            reference_date = first.get("Дата сравнения", "")
+            sheet.cell(diag_row, category_column).value = f"Окно свежести: {green_days} дн."
+            sheet.cell(diag_row, name_column).value = f"Сравнение с {reference_date} · прошлый план → съедено → коэффициент"
+            sheet.cell(diag_row, category_column).font = Font(bold=True, color="7F6000")
+            sheet.cell(diag_row, name_column).font = Font(bold=True, color="1F4E78")
+
+            for _, record in row_group.iterrows():
+                point_label = str(record.get("Точка", ""))
+                point_column = headers.get(point_label)
+                if point_column is None:
+                    continue
+                if str(record.get("Статус", "") or "") == "Проверить SKU":
+                    sheet.cell(diag_row, point_column).value = "Проверить SKU"
+                    sheet.cell(diag_row, point_column).fill = PatternFill("solid", fgColor="F4CCCC")
+                    sheet.cell(diag_row, point_column).font = Font(color="9C0006", bold=True)
+                else:
+                    previous_plan = pd.to_numeric(pd.Series([record.get("Прошлый план")]), errors="coerce").iloc[0]
+                    consumed = pd.to_numeric(pd.Series([record.get("Съедено в срок")]), errors="coerce").iloc[0]
+                    coefficient = pd.to_numeric(pd.Series([record.get("Коэффициент")]), errors="coerce").iloc[0]
+                    prev_text = "-" if pd.isna(previous_plan) else f"{float(previous_plan):g}"
+                    eaten_text = "-" if pd.isna(consumed) else f"{float(consumed):g}"
+                    coef_text = "-" if pd.isna(coefficient) else f"×{float(coefficient):g}"
+                    sheet.cell(diag_row, point_column).value = f"{prev_text}→{eaten_text} {coef_text}"
+                    sheet.cell(diag_row, point_column).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # Remove fact columns from the downloadable copy, exactly like «Прогноз плана».
+    for sheet_name, columns in fact_columns_by_sheet.items():
+        if sheet_name in workbook.sheetnames and columns:
+            _delete_columns_preserving_merges(workbook[sheet_name], columns)
+
+    # Keep only the chosen dates/sheets in the final workbook.
+    export_frame_rows = []
+    for sheet_name, dates in selected_by_sheet.items():
+        for plan_date in dates:
+            export_frame_rows.append({"Дата плана": plan_date, "Лист": sheet_name})
+    export_frame = pd.DataFrame(export_frame_rows)
+    workbook = _restrict_forecast_workbook_to_selected_dates(workbook, export_frame)
+
+    # Compact pivoted calculation sheet: one row per date/SKU, columns by point.
+    calculation_name = "Расчёт по меню"
+    if calculation_name in workbook.sheetnames:
+        del workbook[calculation_name]
+    calculation_sheet = workbook.create_sheet(calculation_name)
+    calc_rows: list[dict[str, object]] = []
+    group_keys = ["Дата плана", "День недели", "Дата сравнения", "Категория", "SKU", "Название блюда", "Зелёное окно, дней", "Полный срок, дней"]
+    for _, group in work.groupby(group_keys, dropna=False, sort=False):
+        first = group.iloc[0]
+        output_row = {key: first.get(key) for key in group_keys}
+        total_new_plan = 0
+        for _, record in group.sort_values("Точка", key=lambda s: s.map(_archive_point_sort_key)).iterrows():
+            point = str(record.get("Точка", ""))
+            output_row[f"Прошлый план {point}"] = record.get("Прошлый план")
+            output_row[f"Съедено {point}"] = record.get("Съедено в срок")
+            output_row[f"Коэф. {point}"] = record.get("Коэффициент")
+            output_row[f"Новый план {point}"] = record.get("Новый план")
+            output_row[f"Статус {point}"] = record.get("Статус")
+            numeric_plan = pd.to_numeric(pd.Series([record.get("Новый план")]), errors="coerce").iloc[0]
+            if pd.notna(numeric_plan):
+                total_new_plan += float(numeric_plan)
+        output_row["ВСЕГО"] = int(round(total_new_plan))
+        calc_rows.append(output_row)
+
+    calc_frame = pd.DataFrame(calc_rows)
+    calculation_sheet.append(calc_frame.columns.tolist())
+    for row in calc_frame.itertuples(index=False, name=None):
+        calculation_sheet.append([
+            None if value is pd.NA or (not isinstance(value, str) and pd.isna(value)) else value
+            for value in row
+        ])
+    calculation_sheet.freeze_panes = "A2"
+    calculation_sheet.auto_filter.ref = calculation_sheet.dimensions
+    calculation_sheet.sheet_properties.tabColor = "70AD47"
+    for cells in calculation_sheet.columns:
+        width = min(max(len(str(cell.value or "")) for cell in cells) + 2, 34)
+        calculation_sheet.column_dimensions[cells[0].column_letter].width = width
+
+    # Detailed long-form justification sheet.
+    detail_name = "Обоснование циклического плана"
+    if detail_name in workbook.sheetnames:
+        del workbook[detail_name]
+    detail_sheet = workbook.create_sheet(detail_name)
+    detail_sheet.append(work.columns.tolist())
+    for row in work.itertuples(index=False, name=None):
+        detail_sheet.append([
+            None if value is pd.NA or (not isinstance(value, str) and pd.isna(value)) else value
+            for value in row
+        ])
+    detail_sheet.freeze_panes = "A2"
+    detail_sheet.auto_filter.ref = detail_sheet.dimensions
+    detail_sheet.sheet_properties.tabColor = "5B9BD5"
+    status_col = work.columns.get_loc("Статус") + 1 if "Статус" in work.columns else None
+    if status_col:
+        for row_number in range(2, detail_sheet.max_row + 1):
+            if str(detail_sheet.cell(row_number, status_col).value or "") == "Проверить SKU":
+                for column in range(1, detail_sheet.max_column + 1):
+                    detail_sheet.cell(row_number, column).fill = PatternFill("solid", fgColor="F4CCCC")
+                    detail_sheet.cell(row_number, column).font = Font(color="9C0006")
+    for cells in detail_sheet.columns:
+        width = min(max(len(str(cell.value or "")) for cell in cells[:500]) + 2, 34)
+        detail_sheet.column_dimensions[cells[0].column_letter].width = width
+
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        frame.to_excel(writer, sheet_name="Циклический план", index=False)
-        sheet = writer.book["Циклический план"]
-        sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = sheet.dimensions
-        for cell in sheet[1]:
-            cell.font = Font(bold=True)
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        status_col = next((i for i, cell in enumerate(sheet[1], start=1) if str(cell.value or "").strip() == "Статус"), None)
-        if status_col:
-            red_fill = PatternFill("solid", fgColor="F4CCCC")
-            red_font = Font(color="9C0006")
-            for r in range(2, sheet.max_row + 1):
-                if str(sheet.cell(r, status_col).value or "") == "Проверить SKU":
-                    for c in range(1, sheet.max_column + 1):
-                        sheet.cell(r, c).fill = red_fill
-                        sheet.cell(r, c).font = red_font
-        for column_cells in sheet.columns:
-            letter = get_column_letter(column_cells[0].column)
-            max_length = max(len(str(cell.value or "")) for cell in list(column_cells)[:500])
-            sheet.column_dimensions[letter].width = min(max(max_length + 2, 10), 36)
+    workbook.save(output)
     output.seek(0)
     return output.getvalue()
 
@@ -17359,12 +17693,12 @@ if tab_cycle_plan.open:
                             hide_index=True,
                         )
                         st.caption(
-                            "Красные строки не получают автоматический новый план: сначала нужно проверить SKU/название блюда."
+                            "Красные строки не получают автоматический новый план. Excel выгружается в формате Матрицы КОМБО, как обычный «Прогноз плана»: основной лист меню + служебные листы расчёта."
                         )
 
                         st.download_button(
                             "Скачать циклический план",
-                            data=export_cycle_plan_v1_excel(result),
+                            data=export_cycle_plan_v1_excel(matrix_bytes, result),
                             file_name=f"циклический_план_{cycle_start:%Y-%m-%d}_{cycle_end:%Y-%m-%d}.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             use_container_width=True,
