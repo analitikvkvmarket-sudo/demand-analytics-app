@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.44-ALL-POSTGRES-SHOPS"
+BUILD_ID = "75.11.45-EXACT-30-POINTS"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -1636,7 +1636,7 @@ def load_available_shops(date_from: date, date_to_exclusive: date) -> pd.DataFra
         )
 
 
-REQUIRED_POINT_SHOPS = {}
+REQUIRED_POINT_SHOPS = {number: f"Т{number}" for number in range(1, 31)}
 
 
 def ensure_required_shops(frame: pd.DataFrame) -> pd.DataFrame:
@@ -9184,16 +9184,19 @@ if analysis_needs_refresh:
             if available_shops.empty:
                 raise RuntimeError("за выбранный период база не вернула магазины")
 
-            # Используем все точки, которые реально вернул PostgreSQL за выбранный период.
-            # Никаких ограничений по диапазону, исключения Т11 или принудительного добавления Т25.
+            # Фиксированная рабочая сетка: ровно Т1–Т30, включая Т11.
+            # ensure_required_shops() выше добавляет отсутствующие за период точки с нулевыми показателями.
             selected = available_shops.copy()
             selected["shop_number"] = pd.to_numeric(selected["shop_number"], errors="coerce")
-            selected = selected[selected["shop_number"].notna()].copy()
+            selected = selected[
+                selected["shop_number"].notna()
+                & selected["shop_number"].between(1, 30)
+            ].copy()
             selected["shop_number"] = selected["shop_number"].astype(int)
             selected = selected.drop_duplicates("shop_number").sort_values("shop_number")
 
             if selected.empty:
-                raise RuntimeError("PostgreSQL не вернул ни одной точки за выбранный период")
+                raise RuntimeError("не найдены точки Т1–Т30")
 
             selected_shop_numbers = tuple(selected["shop_number"].tolist())
             point_mapping = {number: f"Т{number}" for number in selected_shop_numbers}
