@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.45-EXACT-30-POINTS"
+BUILD_ID = "75.11.46-CYCLE-PLAN-V1"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -9246,6 +9246,189 @@ if "analysis" not in st.session_state:
     st.info("Данные ещё не подготовлены.")
     st.stop()
 
+
+def _cycle_plan_normalize_name(value: object) -> str:
+    return re.sub(r"\\s+", " ", str(value or "").strip().casefold().replace("ё", "е"))
+
+
+def build_cycle_plan_v1(target_plans: pd.DataFrame, reference_plans: pd.DataFrame, sales: pd.DataFrame) -> pd.DataFrame:
+    columns = [
+        "Дата плана","День недели","Дата сравнения","Точка","SKU","Название блюда","Категория",
+        "Прошлый план","Съедено в срок","Зелёное окно, дней","Полный срок, дней",
+        "День полного съедания","Коэффициент","Новый план","Статус",
+    ]
+    if target_plans is None or target_plans.empty:
+        return pd.DataFrame(columns=columns)
+
+    target = target_plans.copy()
+    reference = reference_plans.copy() if reference_plans is not None else pd.DataFrame()
+    sold = sales.copy() if sales is not None else pd.DataFrame()
+
+    for frame in (target, reference):
+        if frame.empty:
+            continue
+        frame["plan_date"] = pd.to_datetime(frame["plan_date"], errors="coerce").dt.date
+        frame["point_number"] = pd.to_numeric(frame["point_number"], errors="coerce")
+        frame["sku"] = frame["sku"].map(normalize_sku)
+        frame["analyst_plan"] = pd.to_numeric(frame["analyst_plan"], errors="coerce").fillna(0.0).clip(lower=0)
+        frame["product_name"] = frame["product_name"].fillna("").astype(str).str.strip()
+        frame["matrix_category"] = frame["matrix_category"].map(normalize_matrix_category)
+
+    target = target[target["plan_date"].notna() & target["point_number"].notna() & target["sku"].notna()].copy()
+    target["point_number"] = target["point_number"].astype(int)
+
+    if not reference.empty:
+        reference = reference[reference["plan_date"].notna() & reference["point_number"].notna() & reference["sku"].notna()].copy()
+        reference["point_number"] = reference["point_number"].astype(int)
+        reference = reference.drop_duplicates(["plan_date","point_number","sku"], keep="last")
+
+    if sold.empty:
+        sold = pd.DataFrame(columns=["business_date","shop_number","sku","sold_quantity"])
+    else:
+        sold["business_date"] = pd.to_datetime(sold["business_date"], errors="coerce").dt.date
+        sold["shop_number"] = pd.to_numeric(sold["shop_number"], errors="coerce")
+        sold["sku"] = sold["sku"].map(normalize_sku)
+        sold["sold_quantity"] = pd.to_numeric(sold["sold_quantity"], errors="coerce").fillna(0.0).clip(lower=0)
+        sold = sold[sold["business_date"].notna() & sold["shop_number"].notna() & sold["sku"].notna()].copy()
+        sold["shop_number"] = sold["shop_number"].astype(int)
+
+    ref_lookup = {
+        (row.plan_date, int(row.point_number), str(row.sku)): row
+        for row in reference.itertuples(index=False)
+    } if not reference.empty else {}
+
+    sales_lookup = {}
+    if not sold.empty:
+        for (shop, sku), group in sold.groupby(["shop_number","sku"], sort=False):
+            sales_lookup[(int(shop), str(sku))] = (
+                group[["business_date","sold_quantity"]]
+                .groupby("business_date", as_index=False)["sold_quantity"].sum()
+                .sort_values("business_date")
+            )
+
+    rows = []
+    for item in target.sort_values(["plan_date","point_number","matrix_category","product_name"], kind="stable").itertuples(index=False):
+        target_date = item.plan_date
+        reference_date = target_date - timedelta(days=14)
+        point_number = int(item.point_number)
+        sku = str(item.sku)
+        category = normalize_matrix_category(item.matrix_category)
+        name = str(item.product_name or "").strip()
+        green_days = int(product_green_days(category))
+        lifecycle_days = int(product_lifecycle_days(category))
+
+        row = {
+            "Дата плана": target_date,
+            "День недели": WEEKDAY_RU.get(target_date.weekday(), ""),
+            "Дата сравнения": reference_date,
+            "Точка": f"Т{point_number}",
+            "SKU": sku,
+            "Название блюда": name,
+            "Категория": category,
+            "Прошлый план": pd.NA,
+            "Съедено в срок": pd.NA,
+            "Зелёное окно, дней": green_days,
+            "Полный срок, дней": lifecycle_days,
+            "День полного съедания": pd.NA,
+            "Коэффициент": pd.NA,
+            "Новый план": pd.NA,
+            "Статус": "",
+        }
+
+        previous = ref_lookup.get((reference_date, point_number, sku))
+        if previous is None:
+            row["Статус"] = "Проверить SKU"
+            rows.append(row)
+            continue
+
+        previous_name = str(getattr(previous, "product_name", "") or "").strip()
+        previous_plan = max(0.0, float(getattr(previous, "analyst_plan", 0.0) or 0.0))
+        row["Прошлый план"] = previous_plan
+
+        if not previous_name or not name or _cycle_plan_normalize_name(previous_name) != _cycle_plan_normalize_name(name):
+            row["Статус"] = "Проверить SKU"
+            rows.append(row)
+            continue
+
+        first_sale_date = reference_date + timedelta(days=1)
+        last_sale_date = reference_date + timedelta(days=lifecycle_days)
+        sku_sales = sales_lookup.get((point_number, sku), pd.DataFrame())
+
+        all_dates = pd.DataFrame({"business_date": [reference_date + timedelta(days=i) for i in range(1, lifecycle_days + 1)]})
+        if sku_sales.empty:
+            daily = all_dates.copy()
+            daily["sold_quantity"] = 0.0
+        else:
+            daily = all_dates.merge(
+                sku_sales[sku_sales["business_date"].between(first_sale_date, last_sale_date, inclusive="both")],
+                on="business_date",
+                how="left",
+            )
+            daily["sold_quantity"] = pd.to_numeric(daily["sold_quantity"], errors="coerce").fillna(0.0).clip(lower=0)
+
+        total_sales = float(daily["sold_quantity"].sum())
+        consumed = min(previous_plan, total_sales)
+
+        completion_day = None
+        if previous_plan > 0:
+            cumulative = 0.0
+            for day_num, qty in enumerate(daily["sold_quantity"].tolist(), start=1):
+                cumulative += float(qty)
+                if cumulative + 1e-9 >= previous_plan:
+                    completion_day = day_num
+                    break
+
+        if previous_plan <= 0:
+            coef, new_plan, status = 1.0, 0, "Прошлый план = 0"
+        elif completion_day == 1:
+            coef, new_plan, status = 1.5, int(math.ceil(previous_plan * 1.5)), "Съедено полностью в 1-й день"
+        elif completion_day is not None and completion_day <= green_days:
+            coef, new_plan, status = 1.2, int(math.ceil(previous_plan * 1.2)), f"Съедено полностью в зелёное окно · день {completion_day}"
+        else:
+            coef, new_plan = 1.0, int(math.ceil(consumed))
+            status = f"Полностью съедено в серый период · день {completion_day}" if completion_day is not None else "Съедено меньше прошлого плана"
+
+        row.update({
+            "Съедено в срок": consumed,
+            "День полного съедания": completion_day if completion_day is not None else pd.NA,
+            "Коэффициент": coef,
+            "Новый план": new_plan,
+            "Статус": status,
+        })
+        rows.append(row)
+
+    return pd.DataFrame(rows, columns=columns).sort_values(
+        ["Дата плана","Точка","Категория","Название блюда","SKU"], kind="stable"
+    ).reset_index(drop=True)
+
+
+def export_cycle_plan_v1_excel(frame: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        frame.to_excel(writer, sheet_name="Циклический план", index=False)
+        sheet = writer.book["Циклический план"]
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+        for cell in sheet[1]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        status_col = next((i for i, cell in enumerate(sheet[1], start=1) if str(cell.value or "").strip() == "Статус"), None)
+        if status_col:
+            red_fill = PatternFill("solid", fgColor="F4CCCC")
+            red_font = Font(color="9C0006")
+            for r in range(2, sheet.max_row + 1):
+                if str(sheet.cell(r, status_col).value or "") == "Проверить SKU":
+                    for c in range(1, sheet.max_column + 1):
+                        sheet.cell(r, c).fill = red_fill
+                        sheet.cell(r, c).font = red_font
+        for column_cells in sheet.columns:
+            letter = get_column_letter(column_cells[0].column)
+            max_length = max(len(str(cell.value or "")) for cell in list(column_cells)[:500])
+            sheet.column_dimensions[letter].width = min(max(max_length + 2, 10), 36)
+    output.seek(0)
+    return output.getvalue()
+
+
 sku_point, category_profile, entity_profile, daily_detail = st.session_state["analysis"]
 period = st.session_state["period"]
 
@@ -9262,6 +9445,7 @@ MENU_ITEMS = [
     ("Списания категорий", ":material/delete:"),
     ("Архив меню", ":material/history:"),
     ("Прогноз плана", ":material/track_changes:"),
+    ("Циклический план", ":material/repeat:"),
     ("Планировка", ":material/route:"),
     ("Проверка", ":material/fact_check:"),
 ]
@@ -9623,7 +9807,7 @@ class _MainSection:
         return False
 
 
-tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_planning, tab_plan_check = [
+tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_cycle_plan, tab_planning, tab_plan_check = [
     _MainSection(label) for label, _ in MENU_ITEMS
 ]
 
@@ -17052,6 +17236,142 @@ if tab_forecast.open:
     )
 
     st.markdown('<div class="vk-footer-brand">ВКУСНО МАРКЕТ</div>', unsafe_allow_html=True)
+
+
+
+if tab_cycle_plan.open:
+    with tab_cycle_plan:
+        st.subheader("Циклический план · сравнение с позапрошлой неделей")
+        st.caption(
+            "Каждая дата выбранного периода сравнивается с датой ровно на 14 дней раньше (1↔3, 2↔4). "
+            "Если прошлый план съеден полностью в 1-й день — ×1,5; полностью внутри зелёного окна — ×1,2; "
+            "в серый период или не полностью — без роста, по фактически съеденному количеству. "
+            "Несовпадение SKU/названия блюда подсвечивается красным со статусом «Проверить SKU»."
+        )
+
+        matrix_bytes, matrix_source, matrix_checked_at, matrix_error = _load_matrix_context_for_active_tab()
+        if not matrix_bytes:
+            st.error("Текущая Матрица КОМБО недоступна.")
+            if matrix_error:
+                st.caption(f"Причина: {matrix_error}")
+        else:
+            cycle_matrix_plans = parse_freshness_plan(matrix_bytes)
+            if cycle_matrix_plans.empty:
+                st.info("В текущей Матрице КОМБО не найдены плановые даты.")
+            else:
+                cycle_matrix_plans = cycle_matrix_plans.copy()
+                cycle_matrix_plans["plan_date"] = pd.to_datetime(cycle_matrix_plans["plan_date"], errors="coerce").dt.date
+                available_dates = sorted(v for v in cycle_matrix_plans["plan_date"].dropna().unique().tolist() if isinstance(v, date))
+                default_start = available_dates[0]
+                default_end = min(available_dates[-1], default_start + timedelta(days=6))
+
+                selected_period = st.date_input(
+                    "Период выгрузки нового плана",
+                    value=(default_start, default_end),
+                    min_value=available_dates[0],
+                    max_value=available_dates[-1],
+                    format="DD.MM.YYYY",
+                    key="cycle_plan_period_v1",
+                )
+
+                if isinstance(selected_period, tuple) and len(selected_period) == 2:
+                    cycle_start, cycle_end = selected_period
+                    selected_dates = [d for d in available_dates if cycle_start <= d <= cycle_end]
+                    st.caption(f"Источник меню: {matrix_source}. Дат в выбранном периоде: {len(selected_dates)}.")
+
+                    if selected_dates and st.button(
+                        "Рассчитать циклический план",
+                        type="primary",
+                        use_container_width=True,
+                        key="cycle_plan_calculate_v1",
+                    ):
+                        try:
+                            with st.spinner("Считаю план по циклу −14 дней и фактическим продажам…"):
+                                target_plans = cycle_matrix_plans[cycle_matrix_plans["plan_date"].isin(selected_dates)].copy()
+                                reference_dates = sorted({d - timedelta(days=14) for d in selected_dates})
+
+                                current_reference = cycle_matrix_plans[cycle_matrix_plans["plan_date"].isin(reference_dates)].copy()
+                                current_dates = set(current_reference["plan_date"].dropna().tolist())
+                                missing_dates = [d for d in reference_dates if d not in current_dates]
+
+                                archive_reference = pd.DataFrame()
+                                archive_error = ""
+                                if missing_dates:
+                                    archive_reference, archive_error = _fetch_system_menu_archive_freshness_range(
+                                        MENU_ARCHIVE_APPS_SCRIPT_URL,
+                                        MENU_ARCHIVE_APPS_SCRIPT_KEY,
+                                        tuple(d.isoformat() for d in missing_dates),
+                                    )
+
+                                parts = [f for f in [current_reference, archive_reference] if f is not None and not f.empty]
+                                reference_plans = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+                                if not reference_plans.empty:
+                                    reference_plans = reference_plans.drop_duplicates(
+                                        ["plan_date","point_number","sku"], keep="last"
+                                    )
+
+                                points = tuple(sorted(
+                                    pd.to_numeric(target_plans["point_number"], errors="coerce")
+                                    .dropna().astype(int).unique().tolist()
+                                ))
+                                max_lifecycle = max(
+                                    [product_lifecycle_days(c) for c in target_plans["matrix_category"].dropna().tolist()] or [7]
+                                )
+                                history_from = min(reference_dates) + timedelta(days=1)
+                                history_to = max(reference_dates) + timedelta(days=max_lifecycle + 1)
+                                cycle_sales = load_forecast_history(history_from, history_to, points)
+
+                                result = build_cycle_plan_v1(target_plans, reference_plans, cycle_sales)
+                                st.session_state["cycle_plan_result_v1"] = result
+                                st.session_state["cycle_plan_period_saved_v1"] = (cycle_start, cycle_end)
+                                st.session_state["cycle_plan_archive_error_v1"] = archive_error
+                        except Exception as error:
+                            st.error(f"Не удалось рассчитать циклический план: {error}")
+
+                    result = st.session_state.get("cycle_plan_result_v1", pd.DataFrame())
+                    if (
+                        isinstance(result, pd.DataFrame)
+                        and not result.empty
+                        and st.session_state.get("cycle_plan_period_saved_v1") == (cycle_start, cycle_end)
+                    ):
+                        archive_error = st.session_state.get("cycle_plan_archive_error_v1", "")
+                        if archive_error:
+                            st.warning(f"Часть дат сравнения не получена из архива: {archive_error}")
+
+                        metrics = st.columns(5)
+                        metrics[0].metric("Дат", int(result["Дата плана"].nunique()))
+                        metrics[1].metric("Точек", int(result["Точка"].nunique()))
+                        metrics[2].metric("SKU", int(result["SKU"].nunique()))
+                        metrics[3].metric(
+                            "Новый план, шт.",
+                            f"{pd.to_numeric(result['Новый план'], errors='coerce').sum():,.0f}".replace(",", " "),
+                        )
+                        metrics[4].metric("Проверить SKU", int(result["Статус"].eq("Проверить SKU").sum()))
+
+                        def _cycle_style(row):
+                            if str(row.get("Статус", "")) == "Проверить SKU":
+                                return ["background-color: #f4cccc; color: #9c0006;"] * len(row)
+                            return [""] * len(row)
+
+                        st.dataframe(
+                            result.style.apply(_cycle_style, axis=1),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                        st.caption(
+                            "Красные строки не получают автоматический новый план: сначала нужно проверить SKU/название блюда."
+                        )
+
+                        st.download_button(
+                            "Скачать циклический план",
+                            data=export_cycle_plan_v1_excel(result),
+                            file_name=f"циклический_план_{cycle_start:%Y-%m-%d}_{cycle_end:%Y-%m-%d}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="cycle_plan_download_v1",
+                        )
+                else:
+                    st.info("Выберите дату начала и дату окончания периода.")
 
 
 if tab_planning.open:
