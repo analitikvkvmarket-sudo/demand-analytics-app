@@ -36,7 +36,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.57-CYCLE-GROWTH-GUARD"
+BUILD_ID = "75.11.58-CYCLE-SKU-FIRST-CATEGORY-CONTROL"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -9340,11 +9340,11 @@ def build_cycle_plan_v1(
         "Минимум SKU",
         "Факт категории прошлой недели, шт.",
         "Сумма минимумов категории, шт.",
-        "Остаток к распределению, шт.",
+        "Превышение над фактом категории, шт.",
         "Вес добора SKU",
-        "Добор SKU",
+        "Коррекция категории SKU",
         "Макс. план SKU",
-        "Право на добор",
+        "Приоритет SKU",
         "Новый план",
         "Сущность текущего SKU",
         "SKU-основание",
@@ -9661,11 +9661,11 @@ def build_cycle_plan_v1(
             "Минимум SKU": pd.NA,
             "Факт категории прошлой недели, шт.": category_fact,
             "Сумма минимумов категории, шт.": pd.NA,
-            "Остаток к распределению, шт.": pd.NA,
+            "Превышение над фактом категории, шт.": pd.NA,
             "Вес добора SKU": pd.NA,
-            "Добор SKU": pd.NA,
+            "Коррекция категории SKU": pd.NA,
             "Макс. план SKU": pd.NA,
-            "Право на добор": False,
+            "Приоритет SKU": 0,
             "Новый план": pd.NA,
             "Сущность текущего SKU": sku_entity_map.get(sku, ""),
             "SKU-основание": sku,
@@ -9831,22 +9831,28 @@ def build_cycle_plan_v1(
             day_text = completion_day if completion_day is not None else "?"
             status = f"Съеден полностью в День {day_text} · минимум ×1.0"
 
-        # Право на добор есть только у SKU, который полностью подтвердил прошлый план.
-        # Неполностью съеденный SKU остаётся ровно на минимуме по факту.
-        eligible_for_extra = bool(
-            previous_plan > 0
-            and consumed + 1e-9 >= previous_plan
-            and completion_day is not None
-        )
+        # Приоритет SKU используется только при контроле категории.
+        # 4 = самый сильный (съеден в День 1), 1 = самый слабый.
+        if previous_plan <= 0:
+            strength_priority = 0
+        elif consumed + 1e-9 < previous_plan:
+            strength_priority = 1
+        elif completion_day == 1:
+            strength_priority = 4
+        elif completion_day == 2:
+            strength_priority = 3
+        else:
+            strength_priority = 2
 
-        # Жёсткий потолок роста: не больше прошлый план × 1.5.
-        # Если прошлый план = 0, потолок равен минимуму.
-        max_plan = (
-            int(math.ceil(previous_plan * 1.5))
-            if previous_plan > 0
-            else int(minimum)
+        # Безопасный уровень ниже которого категория SKU не режет:
+        # неполностью съеденный SKU -> фактически съеденное;
+        # полностью съеденный SKU -> прошлый план без повышающего коэффициента.
+        safe_floor = (
+            int(math.ceil(consumed))
+            if consumed + 1e-9 < previous_plan
+            else int(math.ceil(previous_plan))
         )
-        max_plan = max(int(minimum), int(max_plan))
+        safe_floor = max(0, safe_floor)
 
         if entity_fallback_used:
             entity_label = str(row.get("Сущность текущего SKU", "") or "").strip()
@@ -9866,8 +9872,8 @@ def build_cycle_plan_v1(
             "Минимум SKU": int(minimum),
             # Вес ДОБОРА — исходный исторический план / proxy-план.
             "Вес добора SKU": float(previous_plan),
-            "Макс. план SKU": int(max_plan),
-            "Право на добор": bool(eligible_for_extra),
+            "Макс. план SKU": int(safe_floor),
+            "Приоритет SKU": int(strength_priority),
             "Статус": status,
         })
         rows.append(row)
@@ -9877,8 +9883,12 @@ def build_cycle_plan_v1(
         return result
 
     # ------------------------------------------------------------------
-    # Второй проход: добираем категорию до факта прошлой недели.
-    # Минимумы не уменьшаем.
+    # Второй проход: категория только контролирует общий объём сверху.
+    #
+    # Сначала каждый SKU получает план по собственной истории.
+    # Если сумма SKU ниже факта категории прошлой недели — ничего не добавляем.
+    # Если сумма SKU выше факта категории — снимаем только излишний рост,
+    # начиная со слабых SKU и не опускаясь ниже безопасного уровня.
     # ------------------------------------------------------------------
     group_columns = ["Дата плана", "Точка", "Категория"]
 
@@ -9902,130 +9912,69 @@ def build_cycle_plan_v1(
         )
         category_target = max(0, int(round(category_fact)))
 
-        minimums = pd.to_numeric(
+        base_plan = pd.to_numeric(
             result.loc[valid_idx, "Минимум SKU"],
             errors="coerce",
         ).fillna(0.0).clip(lower=0).astype(int)
 
-        minimum_sum = int(minimums.sum())
-        remainder = max(0, category_target - minimum_sum)
+        base_sum = int(base_plan.sum())
+        excess = max(0, base_sum - category_target)
 
         for idx in valid_idx:
-            result.at[idx, "Сумма минимумов категории, шт."] = minimum_sum
-            result.at[idx, "Остаток к распределению, шт."] = remainder
+            result.at[idx, "Сумма минимумов категории, шт."] = base_sum
+            result.at[idx, "Превышение над фактом категории, шт."] = excess
+            result.at[idx, "Коррекция категории SKU"] = 0
+            result.at[idx, "Новый план"] = int(base_plan.loc[idx])
 
-        # Итог начинается с обязательного минимума.
-        allocation = {idx: int(minimums.loc[idx]) for idx in valid_idx}
-        extra = {idx: 0 for idx in valid_idx}
+        if excess <= 0:
+            continue
 
-        # В доборе участвуют только SKU с полностью подтверждённым прошлым планом.
-        eligible_idx = [
-            idx
-            for idx in valid_idx
-            if bool(result.at[idx, "Право на добор"])
-        ]
+        ranking = sorted(
+            valid_idx,
+            key=lambda idx: (
+                int(
+                    pd.to_numeric(
+                        pd.Series([result.at[idx, "Приоритет SKU"]]),
+                        errors="coerce",
+                    ).fillna(0).iloc[0]
+                ),
+                -int(base_plan.loc[idx]),
+            ),
+        )
 
-        if remainder > 0 and eligible_idx:
-            weights = pd.to_numeric(
-                result.loc[eligible_idx, "Вес добора SKU"],
-                errors="coerce",
-            ).fillna(0.0).clip(lower=0)
+        remaining_excess = int(excess)
 
-            if float(weights.sum()) <= 0:
-                weights = pd.Series(1.0, index=eligible_idx, dtype=float)
+        for idx in ranking:
+            if remaining_excess <= 0:
+                break
 
-            remaining = int(remainder)
-            active_idx = list(eligible_idx)
+            current_plan = int(
+                pd.to_numeric(
+                    pd.Series([result.at[idx, "Новый план"]]),
+                    errors="coerce",
+                ).fillna(0).iloc[0]
+            )
+            safe_floor = int(
+                pd.to_numeric(
+                    pd.Series([result.at[idx, "Макс. план SKU"]]),
+                    errors="coerce",
+                ).fillna(0).iloc[0]
+            )
 
-            while remaining > 0 and active_idx:
-                active_weights = weights.loc[active_idx].copy()
-                if float(active_weights.sum()) <= 0:
-                    active_weights = pd.Series(1.0, index=active_idx, dtype=float)
+            removable = max(0, current_plan - safe_floor)
+            cut = min(removable, remaining_excess)
 
-                raw_extra = active_weights / float(active_weights.sum()) * remaining
-                floor_extra = raw_extra.apply(math.floor).astype(int)
+            if cut > 0:
+                result.at[idx, "Новый план"] = current_plan - cut
+                result.at[idx, "Коррекция категории SKU"] = -int(cut)
+                remaining_excess -= int(cut)
 
-                distributed_now = 0
-                for idx in active_idx:
-                    cap = int(
-                        pd.to_numeric(
-                            pd.Series([result.at[idx, "Макс. план SKU"]]),
-                            errors="coerce",
-                        ).fillna(allocation[idx]).iloc[0]
-                    )
-                    available_capacity = max(0, cap - allocation[idx] - extra[idx])
-                    give = min(int(floor_extra.loc[idx]), available_capacity)
-                    if give > 0:
-                        extra[idx] += give
-                        distributed_now += give
-
-                remaining -= distributed_now
-                if remaining <= 0:
-                    break
-
-                ranking = pd.DataFrame({
-                    "idx": active_idx,
-                    "fraction": [
-                        float(raw_extra.loc[idx] - floor_extra.loc[idx])
-                        for idx in active_idx
-                    ],
-                    "weight": [float(active_weights.loc[idx]) for idx in active_idx],
-                    "completion_day": [
-                        999
-                        if pd.isna(result.at[idx, "День полного съедания"])
-                        else int(result.at[idx, "День полного съедания"])
-                        for idx in active_idx
-                    ],
-                }).sort_values(
-                    ["fraction", "completion_day", "weight"],
-                    ascending=[False, True, False],
-                    kind="stable",
-                )
-
-                gave_one = False
-                for idx in ranking["idx"].tolist():
-                    if remaining <= 0:
-                        break
-                    cap = int(
-                        pd.to_numeric(
-                            pd.Series([result.at[idx, "Макс. план SKU"]]),
-                            errors="coerce",
-                        ).fillna(allocation[idx]).iloc[0]
-                    )
-                    available_capacity = max(0, cap - allocation[idx] - extra[idx])
-                    if available_capacity <= 0:
-                        continue
-                    extra[idx] += 1
-                    remaining -= 1
-                    gave_one = True
-
-                active_idx = [
-                    idx
-                    for idx in active_idx
-                    if allocation[idx] + extra[idx]
-                    < int(
-                        pd.to_numeric(
-                            pd.Series([result.at[idx, "Макс. план SKU"]]),
-                            errors="coerce",
-                        ).fillna(allocation[idx]).iloc[0]
-                    )
-                ]
-
-                if not gave_one and distributed_now == 0:
-                    break
-
-        actual_extra_sum = sum(int(extra[idx]) for idx in valid_idx)
-        undistributed = max(0, int(remainder) - actual_extra_sum)
-
-        for idx in valid_idx:
-            allocation[idx] += int(extra[idx])
-            result.at[idx, "Добор SKU"] = int(extra[idx])
-            result.at[idx, "Новый план"] = int(allocation[idx])
-
-            if undistributed > 0:
+        if remaining_excess > 0:
+            for idx in valid_idx:
                 current_status = str(result.at[idx, "Статус"] or "")
                 result.at[idx, "Статус"] = (
-                    f"{current_status} · не распределено по категории: {undistributed}"
+                    f"{current_status} · факт категории ниже безопасной суммы SKU "
+                    f"на {remaining_excess}"
                 )
 
 
@@ -10303,7 +10252,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
             green_days = int(first.get("Зелёное окно, дней", 0) or 0)
             reference_date = first.get("Дата сравнения SKU", "")
             sheet.cell(diag_row, category_column).value = f"Окно свежести: {green_days} дн."
-            sheet.cell(diag_row, name_column).value = f"Сравнение SKU с {reference_date} · минимум SKU · факт категории -7 · добор · новый план"
+            sheet.cell(diag_row, name_column).value = f"Сравнение SKU с {reference_date} · план SKU · факт категории -7 · контроль категории · новый план"
             sheet.cell(diag_row, category_column).font = Font(bold=True, color="7F6000")
             sheet.cell(diag_row, name_column).font = Font(bold=True, color="1F4E78")
 
@@ -10350,19 +10299,22 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                         pd.Series([record.get("Сумма минимумов категории, шт.")]),
                         errors="coerce",
                     ).iloc[0]
-                    remainder = pd.to_numeric(
-                        pd.Series([record.get("Остаток к распределению, шт.")]),
+                    excess = pd.to_numeric(
+                        pd.Series([record.get("Превышение над фактом категории, шт.")]),
                         errors="coerce",
                     ).iloc[0]
-                    extra = pd.to_numeric(
-                        pd.Series([record.get("Добор SKU")]),
+                    category_correction = pd.to_numeric(
+                        pd.Series([record.get("Коррекция категории SKU")]),
                         errors="coerce",
                     ).iloc[0]
-                    max_plan = pd.to_numeric(
+                    safe_floor = pd.to_numeric(
                         pd.Series([record.get("Макс. план SKU")]),
                         errors="coerce",
                     ).iloc[0]
-                    eligible_extra = bool(record.get("Право на добор", False))
+                    sku_priority = pd.to_numeric(
+                        pd.Series([record.get("Приоритет SKU")]),
+                        errors="coerce",
+                    ).fillna(0).iloc[0]
                     new_plan = pd.to_numeric(
                         pd.Series([record.get("Новый план")]),
                         errors="coerce",
@@ -10374,10 +10326,14 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                     minimum_text = "-" if pd.isna(minimum) else f"{int(minimum)}"
                     category_text = "-" if pd.isna(category_fact) else f"{float(category_fact):g}"
                     min_sum_text = "-" if pd.isna(minimum_sum) else f"{int(minimum_sum)}"
-                    remainder_text = "-" if pd.isna(remainder) else f"{int(remainder)}"
-                    extra_text = "-" if pd.isna(extra) else f"+{int(extra)}"
-                    cap_text = "-" if pd.isna(max_plan) else f"{int(max_plan)}"
-                    extra_flag_text = "добор+" if eligible_extra else "без добора"
+                    excess_text = "-" if pd.isna(excess) else f"{int(excess)}"
+                    correction_text = (
+                        "-"
+                        if pd.isna(category_correction)
+                        else f"{int(category_correction):+d}"
+                    )
+                    floor_text = "-" if pd.isna(safe_floor) else f"{int(safe_floor)}"
+                    priority_text = "-" if pd.isna(sku_priority) else f"P{int(sku_priority)}"
                     new_text = "-" if pd.isna(new_plan) else f"{int(new_plan)}"
 
                     diag_cell = sheet.cell(diag_row, point_column)
@@ -10390,10 +10346,10 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                         )
 
                     diag_cell.value = (
-                        f"{prev_text}→{eaten_text} {sku_k_text} = min {minimum_text} | "
-                        f"{extra_flag_text}; max {cap_text} | "
-                        f"кат факт {category_text}; minΣ {min_sum_text}; ост {remainder_text} | "
-                        f"{extra_text} → {new_text}{basis_suffix}"
+                        f"{prev_text}→{eaten_text} {sku_k_text} = база {minimum_text} | "
+                        f"{priority_text}; floor {floor_text} | "
+                        f"кат факт {category_text}; базаΣ {min_sum_text}; превыш {excess_text} | "
+                        f"корр {correction_text} → {new_text}{basis_suffix}"
                     )
                     diag_cell.alignment = Alignment(
                         horizontal="center",
