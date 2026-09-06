@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.51-CYCLE-FULL-REFERENCE-CATEGORIES"
+BUILD_ID = "75.11.52-DYNAMIC-POINTS-GLOBAL"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -554,8 +554,7 @@ def _archive_menu_frame_to_freshness_plan(frame: pd.DataFrame) -> pd.DataFrame:
         result["plan_date"].notna()
         & result["point_number"].notna()
         & result["sku"].notna()
-        & result["point_number"].between(1, 29)
-        & result["point_number"].ne(11)
+        & result["point_number"].gt(0)
     ].copy()
     if result.empty:
         return result
@@ -720,7 +719,7 @@ def _parse_historical_menu_workbook(
     file_bytes: bytes,
     source_name: str = "историческое меню.xlsx",
 ) -> tuple[pd.DataFrame, str]:
-    """Parse matrix-style archive files and keep plan columns Т1–Т29 only."""
+    """Parse matrix-style archive files and keep plan columns все точки из PostgreSQL only."""
     output_columns = [
         "Лист",
         "Дата меню",
@@ -834,7 +833,7 @@ def _parse_historical_menu_workbook(
                     if not point_match:
                         continue
                     point_number = int(point_match.group(1))
-                    if 1 <= point_number <= 29:
+                    if point_number > 0:
                         point_columns.append((column_index, f"Т{point_number}"))
                 continue
 
@@ -879,7 +878,7 @@ def _parse_historical_menu_workbook(
 
     if not records:
         return empty, (
-            "в файле не найдены блоки «План на день кухня» с колонками Код/Цена/Категория/Название блюда и Т1–Т29"
+            "в файле не найдены блоки «План на день кухня» с колонками Код/Цена/Категория/Название блюда и все точки из PostgreSQL"
         )
 
     frame = pd.DataFrame(records, columns=output_columns)
@@ -1615,18 +1614,41 @@ def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]
 
 @st.cache_data(ttl=300, show_spinner="Ищу магазины с продажами…")
 def load_available_shops(date_from: date, date_to_exclusive: date) -> pd.DataFrame:
+    """Возвращает ВСЕ номера точек, которые существуют в PostgreSQL.
+
+    Продажи/чеки считаются только за выбранный период, но сама точка не исчезает
+    из приложения, если в этом периоде у неё не было продаж. Поэтому новая точка
+    автоматически появляется во всех разделах после того, как её shop_number
+    появился в dwh.v_sales_item.
+    """
     query = """
+        WITH all_shops AS (
+            SELECT DISTINCT shop_number
+            FROM dwh.v_sales_item
+            WHERE shop_number IS NOT NULL
+        ),
+        period_sales AS (
+            SELECT
+                shop_number,
+                COUNT(DISTINCT source_purchase_id) AS receipts,
+                SUM(net_quantity)::numeric AS sold_quantity,
+                MIN(business_date) AS first_sale_date,
+                MAX(business_date) AS last_sale_date
+            FROM dwh.v_sales_item
+            WHERE business_date >= %(date_from)s
+              AND business_date < %(date_to)s
+              AND shop_number IS NOT NULL
+            GROUP BY shop_number
+        )
         SELECT
-            shop_number,
-            COUNT(DISTINCT source_purchase_id) AS receipts,
-            SUM(net_quantity)::numeric AS sold_quantity,
-            MIN(business_date) AS first_sale_date,
-            MAX(business_date) AS last_sale_date
-        FROM dwh.v_sales_item
-        WHERE business_date >= %(date_from)s
-          AND business_date < %(date_to)s
-        GROUP BY shop_number
-        ORDER BY shop_number
+            a.shop_number,
+            COALESCE(p.receipts, 0) AS receipts,
+            COALESCE(p.sold_quantity, 0)::numeric AS sold_quantity,
+            p.first_sale_date,
+            p.last_sale_date
+        FROM all_shops a
+        LEFT JOIN period_sales p USING (shop_number)
+        ORDER BY a.shop_number
     """
     with pg_connection() as connection:
         return pd.read_sql_query(
@@ -1636,34 +1658,19 @@ def load_available_shops(date_from: date, date_to_exclusive: date) -> pd.DataFra
         )
 
 
-REQUIRED_POINT_SHOPS = {number: f"Т{number}" for number in range(1, 31)}
+REQUIRED_POINT_SHOPS: dict[int, str] = {}
 
 
 def ensure_required_shops(frame: pd.DataFrame) -> pd.DataFrame:
-    """Добавляет обязательные точки, даже если в периоде по ним нет продаж."""
+    """Совместимость: больше не добавляет и не исключает номера точек вручную."""
     result = frame.copy()
-    existing = set(
-        pd.to_numeric(result.get("shop_number", pd.Series(dtype=float)), errors="coerce")
-        .dropna()
-        .astype(int)
-        .tolist()
-    )
-    missing_rows = []
-    for shop_number in REQUIRED_POINT_SHOPS:
-        if shop_number not in existing:
-            missing_rows.append(
-                {
-                    "shop_number": shop_number,
-                    "receipts": 0,
-                    "sold_quantity": 0.0,
-                    "first_sale_date": pd.NaT,
-                    "last_sale_date": pd.NaT,
-                }
-            )
-    if missing_rows:
-        result = pd.concat([result, pd.DataFrame(missing_rows)], ignore_index=True)
     if "shop_number" in result.columns:
-        result = result.sort_values("shop_number", kind="stable").reset_index(drop=True)
+        result["shop_number"] = pd.to_numeric(result["shop_number"], errors="coerce")
+        result = result[result["shop_number"].notna()].copy()
+        result["shop_number"] = result["shop_number"].astype(int)
+        result = result.drop_duplicates("shop_number").sort_values(
+            "shop_number", kind="stable"
+        ).reset_index(drop=True)
     return result
 
 
@@ -2162,12 +2169,16 @@ def parse_analyst_plan_history(file_bytes: bytes) -> pd.DataFrame:
                     sheet.cell(excel_row, price_column).value if price_column else None,
                     errors="coerce",
                 )
-                for point_number in range(1, 30):
-                    if point_number == 11:
-                        continue
-                    point_column = normalized_headers.get(f"Т{point_number}")
-                    if point_column is None:
-                        continue
+                point_columns = sorted(
+                    (
+                        (int(match.group(1)), column_index)
+                        for header_label, column_index in normalized_headers.items()
+                        for match in [re.fullmatch(r"Т(\d+)", str(header_label))]
+                        if match and int(match.group(1)) > 0
+                    ),
+                    key=lambda item: item[0],
+                )
+                for point_number, point_column in point_columns:
                     plan = pd.to_numeric(sheet.cell(excel_row, point_column).value, errors="coerce")
                     if pd.isna(plan):
                         # В матрице пустая ячейка точки означает нулевой план.
@@ -2217,12 +2228,16 @@ def parse_freshness_plan(file_bytes: bytes) -> pd.DataFrame:
             str(sheet.cell(header_row, column).value or "").strip(): column
             for column in range(1, sheet.max_column + 1)
         }
-        for point_number in range(1, 30):
-            if point_number == 11:
-                continue
-            point_column = headers.get(f"Т{point_number}")
-            if point_column is None:
-                continue
+        point_columns = sorted(
+            (
+                (int(match.group(1)), column_index)
+                for header_label, column_index in headers.items()
+                for match in [re.fullmatch(r"Т(\d+)", str(header_label).replace(" ", ""))]
+                if match and int(match.group(1)) > 0
+            ),
+            key=lambda item: item[0],
+        )
+        for point_number, point_column in point_columns:
             plan_value = pd.to_numeric(
                 sheet.cell(int(item["excel_row"]), point_column).value,
                 errors="coerce",
@@ -2440,7 +2455,7 @@ WEEKDAY_RU = {
 
 
 def normalize_point_label(value: object) -> str | None:
-    """Нормализует Т7 / T7 / 7 в формат Т7; Т11 исключается бизнес-правилом."""
+    """Нормализует Т7 / T7 / 7 в формат Т7 без верхнего ограничения номера точки."""
     if value is None or pd.isna(value):
         return None
     text = str(value).strip().upper().replace("T", "Т")
@@ -2450,7 +2465,7 @@ def normalize_point_label(value: object) -> str | None:
         number = int(float(text))
     except (TypeError, ValueError):
         return None
-    if number < 1 or number > 29 or number == 11:
+    if number < 1:
         return None
     return f"Т{number}"
 
@@ -2580,7 +2595,7 @@ def resolve_stock_balance_points(
     missing_shop = shop_numeric.isna() & result["point"].notna()
     result.loc[missing_shop, "shop_number"] = result.loc[missing_shop, "point"].map(point_to_shop)
     result["shop_number"] = pd.to_numeric(result["shop_number"], errors="coerce")
-    result = result[result["point"].notna() & result["point"].ne("Т11")].copy()
+    result = result[result["point"].notna()].copy()
     result["weekday"] = result["snapshot_date"].map(
         lambda value: WEEKDAY_RU.get(value.weekday(), "") if pd.notna(value) else ""
     )
@@ -2609,7 +2624,7 @@ def stock_balance_template_bytes() -> bytes:
                 "Как заполнять": [
                     "Одна строка = один SKU в одной точке на конкретную дату снимка.",
                     "Дата — обязательна. День недели приложение определит само.",
-                    "Точка — Т1…Т29 без Т11. Вместо точки можно использовать колонку «Магазин».",
+                    "Точка — любой номер формата ТN, который существует в PostgreSQL. Вместо точки можно использовать колонку «Магазин».",
                     "SKU — код товара. Остаток, шт. — фактическое количество на момент снимка.",
                 ]
             }
@@ -3772,15 +3787,10 @@ def fill_forecast_into_matrix(
             for column in range(1, sheet.max_column + 1)
         }
         menu_rows = sorted({int(value) for value in group["Строка Excel"]})
-        # Т11 должна быть пустой. Т4 участвует в расчёте; Ф-столбцы не изменяются.
-        for point_number in (11,):
-            target_column = headers.get(f"Т{point_number}")
-            if target_column is not None:
-                for excel_row in menu_rows:
-                    sheet.cell(row=excel_row, column=target_column).value = None
+        # Заполняем любую точку ТN, если такая колонка существует в текущем шаблоне.
         for _, record in group.iterrows():
             point_number = int(record["Номер точки"])
-            if point_number == 11 or not 1 <= point_number <= 29:
+            if point_number <= 0:
                 continue
             forecast_header = f"Т{point_number}"
             forecast_column = headers.get(forecast_header)
@@ -3825,11 +3835,10 @@ def fill_forecast_into_matrix(
 
         plan_column = headers.get("ПЛАН")
         point_columns = [
-            headers.get(f"Т{point_number}")
-            for point_number in range(1, 30)
-            if point_number != 11
+            column
+            for header_label, column in headers.items()
+            if re.fullmatch(r"Т\d+", str(header_label).replace(" ", ""))
         ]
-        point_columns = [column for column in point_columns if column is not None]
         if plan_column is not None:
             for excel_row in menu_rows:
                 total = sum(
@@ -3950,10 +3959,14 @@ def fill_forecast_into_matrix(
     calculation_header_map = {
         str(cell.value): cell.column for cell in calculation_sheet[1] if cell.value is not None
     }
+    calculation_point_numbers = sorted({
+        int(match.group(1))
+        for header_name in calculation_header_map
+        for match in [re.search(r"Т(\d+)$", str(header_name))]
+        if match and int(match.group(1)) > 0
+    })
     for row_number in range(2, calculation_sheet.max_row + 1):
-        for point_number in range(1, 30):
-            if point_number == 11:
-                continue
+        for point_number in calculation_point_numbers:
             days_col = calculation_header_map.get(f"Дней продаж Т{point_number}")
             plan_col = calculation_header_map.get(f"План Т{point_number}")
             if days_col is None or plan_col is None:
@@ -4327,7 +4340,7 @@ def _freshness_point_source_is_separate(
     source: pd.DataFrame,
     context: dict[str, object] | None,
 ) -> bool:
-    """Проверяет, что детализация списаний действительно содержит отдельные строки Т1–Т29."""
+    """Проверяет, что детализация списаний действительно содержит отдельные строки все точки из PostgreSQL."""
     if source is None or source.empty or "Точка" not in source.columns:
         return False
     point_values = source["Точка"].dropna().astype(str).str.strip()
@@ -4371,7 +4384,7 @@ def rebuild_freshness_writeoff_source_by_point(
         point_to_shop = {
             str(label): int(shop_number)
             for shop_number, label in current_mapping.items()
-            if str(label).startswith("Т") and str(label) != "Т11"
+            if re.fullmatch(r"Т\d+", str(label).strip())
         }
         valid_points = [point for point in selected_points if point in point_to_shop]
         if not valid_points:
@@ -5481,7 +5494,6 @@ def build_category_point_monthly_report(source: pd.DataFrame) -> tuple[pd.DataFr
         return (pd.DataFrame(),) * 5
 
     work["point"] = work["point"].astype(str).str.strip()
-    work = work[work["point"].ne("Т11")].copy()
     work["sales"] = pd.to_numeric(work["sales"], errors="coerce").fillna(0.0)
     work["revenue"] = pd.to_numeric(work["revenue"], errors="coerce").fillna(0.0)
     work["category_report"] = work["category"].fillna("Не сопоставлено").astype(str)
@@ -5633,7 +5645,6 @@ def category_point_report_bytes(source: pd.DataFrame, period_value: tuple[date, 
         {"Параметр": "Период", "Значение": f"{period_value[0]:%d.%m.%Y} - {period_value[1]:%d.%m.%Y}"},
         {"Параметр": "Источник", "Значение": "PostgreSQL · dwh.v_sales_item / данные приложения"},
         {"Параметр": "Разрез", "Значение": "Категория -> точка -> календарный месяц"},
-        {"Параметр": "Т11", "Значение": "Исключена"},
         {"Параметр": "Напитки", "Значение": "Напитки (негазированные) и Газированные напитки разделены"},
         {"Параметр": "Retail-категории", "Значение": "Газированные напитки и Шоколад и снеки выделяются из Не сопоставлено по текущей автоклассификации; лист Retail SKU содержит аудит"},
     ])
@@ -5957,7 +5968,7 @@ def plan_check_minimum(category: object) -> int:
 # ПЛАНИРОВКА · модель загрузки по всем категориям
 # Источники: меню/планы Матрицы КОМБО + продажи PostgreSQL.
 # День отгрузки = D0. Срок жизни отсчитывается со следующего дня.
-# Ничего автоматически не записывает в Т1–Т29: сначала аналитическая проверка.
+# Ничего автоматически не записывает в все точки из PostgreSQL: сначала аналитическая проверка.
 # ============================================================
 
 PLANNING_V2_RULES = {
@@ -6845,12 +6856,12 @@ def parse_auto_unit_points(file_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFram
         if not re.fullmatch(r"\d+", str(sheet_name).strip()):
             continue
         fallback_point = int(str(sheet_name).strip())
-        if not 1 <= fallback_point <= 29:
+        if fallback_point <= 0:
             continue
         sheet = workbook[sheet_name]
         point_number_value = _auto_unit_number(sheet["B1"].value)
         point_number = int(point_number_value) if point_number_value is not None else fallback_point
-        if not 1 <= point_number <= 29:
+        if point_number <= 0:
             continue
 
         point_type = str(sheet["F1"].value or "").strip()
@@ -7071,7 +7082,7 @@ def build_ready_plan_check(
     plans["sku"] = plans["sku"].map(normalize_sku)
     plans = plans[plans["plan_date"].notna() & plans["point_number"].notna() & plans["sku"].notna()].copy()
     plans["point_number"] = plans["point_number"].astype(int)
-    plans = plans[plans["point_number"].ne(11)].copy()
+    plans = plans[plans["point_number"].gt(0)].copy()
 
     plans = plans.merge(entities[["sku", "category", "entity"]], on="sku", how="left")
     plans["category"] = plans["category"].fillna(plans["matrix_category"]).map(normalize_matrix_category)
@@ -7086,7 +7097,7 @@ def build_ready_plan_check(
         for shop, label in point_mapping.items()
         if str(label).strip().startswith("Т")
         and str(label).strip().lstrip("Тт").isdigit()
-        and int(str(label).strip().lstrip("Тт")) != 11
+        
     }
     target["point"] = target["point_number"].map(lambda number: f"Т{int(number)}")
     target["shop_number"] = target["point_number"].map(point_to_shop)
@@ -7847,11 +7858,17 @@ def ready_plan_check_excel(
                 sku = normalize_sku(sheet.cell(row_number, code_column).value)
                 if sku is None:
                     continue
-                for point_number in range(1, 30):
+                point_headers = sorted(
+                    (
+                        (int(match.group(1)), column_index)
+                        for header_label, column_index in normalized_headers.items()
+                        for match in [re.fullmatch(r"Т(\d+)", str(header_label))]
+                        if match and int(match.group(1)) > 0
+                    ),
+                    key=lambda item: item[0],
+                )
+                for point_number, point_column in point_headers:
                     point_label = f"Т{point_number}"
-                    point_column = normalized_headers.get(point_label)
-                    if point_column is None:
-                        continue
                     record = lookup.get((sku, point_label))
                     if record is None:
                         continue
@@ -8026,8 +8043,7 @@ def prepare_report_sales_frame(
     report["shop_number"] = pd.to_numeric(report["shop_number"], errors="coerce").astype("Int64")
     report = report[report["business_date"].notna() & report["shop_number"].notna()].copy()
     report["shop_number"] = report["shop_number"].astype(int)
-    report = report[(report["shop_number"] >= 1) & (report["shop_number"] <= 29)]
-    report = report[report["shop_number"] != 11].copy()
+    report = report[report["shop_number"].gt(0)].copy()
     report["point"] = report["shop_number"].map(lambda value: f"Т{int(value)}")
     report["sku"] = report["sku"].map(normalize_sku)
 
@@ -9178,25 +9194,27 @@ analysis_needs_refresh = (
 if analysis_needs_refresh:
     try:
         with st.spinner("Автоматически загружаю точки и продажи из PostgreSQL…"):
-            available_shops = ensure_required_shops(
-                load_available_shops(start_date, end_date + timedelta(days=1))
+            available_shops = load_available_shops(
+                start_date, end_date + timedelta(days=1)
             )
             if available_shops.empty:
-                raise RuntimeError("за выбранный период база не вернула магазины")
+                raise RuntimeError("PostgreSQL не вернул ни одной точки")
 
-            # Фиксированная рабочая сетка: ровно Т1–Т30, включая Т11.
-            # ensure_required_shops() выше добавляет отсутствующие за период точки с нулевыми показателями.
+            # Динамическая сетка: берём все положительные shop_number из PostgreSQL.
+            # Никаких фиксированных диапазонов и никаких исключений отдельных точек.
             selected = available_shops.copy()
-            selected["shop_number"] = pd.to_numeric(selected["shop_number"], errors="coerce")
+            selected["shop_number"] = pd.to_numeric(
+                selected["shop_number"], errors="coerce"
+            )
             selected = selected[
                 selected["shop_number"].notna()
-                & selected["shop_number"].between(1, 30)
+                & selected["shop_number"].gt(0)
             ].copy()
             selected["shop_number"] = selected["shop_number"].astype(int)
             selected = selected.drop_duplicates("shop_number").sort_values("shop_number")
 
             if selected.empty:
-                raise RuntimeError("не найдены точки Т1–Т30")
+                raise RuntimeError("не найдены корректные номера точек в PostgreSQL")
 
             selected_shop_numbers = tuple(selected["shop_number"].tolist())
             point_mapping = {number: f"Т{number}" for number in selected_shop_numbers}
@@ -10248,7 +10266,7 @@ with filter_columns[1]:
     mapped_point_options = {
         str(label).strip()
         for label in st.session_state.get("point_mapping", {}).values()
-        if str(label).strip().startswith("Т") and str(label).strip() != "Т11"
+        if re.fullmatch(r"Т\d+", str(label).strip())
     }
     point_options = sorted(
         mapped_point_options | set(sku_point["point"].dropna().unique()),
@@ -10303,7 +10321,7 @@ with st.expander("Фактические остатки по точкам · н�
             )
             if stock_balances.empty:
                 st.warning(
-                    "Файл прочитан, но после сопоставления магазинов с Т1–Т29 не осталось строк. "
+                    "Файл прочитан, но после сопоставления магазинов с все точки из PostgreSQL не осталось строк. "
                     "Проверьте колонку «Точка» или «Магазин»."
                 )
             else:
@@ -10454,7 +10472,14 @@ if tab_report.open:
             ),
         )
 
-        all_report_points = [f"Т{number}" for number in range(1, 30) if number != 11]
+        all_report_points = sorted(
+            {
+                str(label).strip()
+                for label in st.session_state.get("point_mapping", {}).values()
+                if re.fullmatch(r"Т\d+", str(label).strip())
+            },
+            key=lambda value: int(value[1:]),
+        )
         report_points = st.multiselect(
             "Точки отчета",
             all_report_points,
@@ -12093,7 +12118,7 @@ if tab_category_detail.open:
                 {
                     str(label).strip()
                     for label in category_detail_mapping.values()
-                    if str(label).strip().startswith("Т") and str(label).strip() != "Т11"
+                    if re.fullmatch(r"Т\d+", str(label).strip())
                 },
                 key=lambda value: int(value[1:]),
             )
@@ -12715,7 +12740,7 @@ if tab_abc.open:
         abc_point_to_shop = {
             str(label).strip(): int(shop_number)
             for shop_number, label in abc_mapping.items()
-            if str(label).strip().startswith("Т") and str(label).strip() != "Т11"
+            if re.fullmatch(r"Т\d+", str(label).strip())
         }
         abc_point_options = sorted(abc_point_to_shop, key=lambda label: int(label[1:]))
         with abc_controls[1]:
@@ -13322,12 +13347,10 @@ if tab_category_analysis.open:
             month_week_shop_number_set = {
                 int(shop_number)
                 for shop_number in st.session_state.get("point_mapping", {})
-                if str(shop_number).isdigit()
-                and 1 <= int(shop_number) <= 29
-                and int(shop_number) != 11
+                if str(shop_number).isdigit() and int(shop_number) > 0
             }
-            month_week_available_shops = ensure_required_shops(
-                load_available_shops(selected_month_week, month_week_next_month)
+            month_week_available_shops = load_available_shops(
+                selected_month_week, month_week_next_month
             )
             if not month_week_available_shops.empty:
                 month_week_available_shops = month_week_available_shops.copy()
@@ -13336,8 +13359,7 @@ if tab_category_analysis.open:
                 )
                 month_week_available_shops = month_week_available_shops[
                     month_week_available_shops["shop_number"].notna()
-                    & month_week_available_shops["shop_number"].between(1, 29)
-                    & month_week_available_shops["shop_number"].ne(11)
+                    & month_week_available_shops["shop_number"].gt(0)
                 ].copy()
                 month_week_shop_number_set.update(
                     month_week_available_shops["shop_number"].astype(int).tolist()
@@ -13378,7 +13400,7 @@ if tab_category_analysis.open:
         if month_week_error:
             st.error(f"Не удалось загрузить месячную сводку категорий: {month_week_error}")
         elif not month_week_point_mapping:
-            st.info("За выбранный месяц не найдены рабочие точки Т1–Т29.")
+            st.info("За выбранный месяц не найдены рабочие точки все точки из PostgreSQL.")
         else:
             if month_week_sales.empty:
                 month_week_sales = pd.DataFrame(
@@ -13732,7 +13754,7 @@ if tab_category_analysis.open:
         category_point_to_shop = {
             str(label).strip(): int(shop_number)
             for shop_number, label in category_mapping.items()
-            if str(label).strip().startswith("Т") and str(label).strip() != "Т11"
+            if re.fullmatch(r"Т\d+", str(label).strip())
         }
         category_point_options = sorted(
             category_point_to_shop,
@@ -14907,18 +14929,18 @@ if tab_sales_time.open:
             point_to_shop = {
                 label: int(shop_number)
                 for shop_number, label in current_mapping.items()
-                if str(label).startswith("Т") and str(label) != "Т11"
+                if re.fullmatch(r"Т\d+", str(label).strip())
             }
             available_point_numbers = sorted(
                 period_plans["point_number"].dropna().astype(int).unique()
             )
             available_point_labels = [
                 f"Т{number}" for number in available_point_numbers
-                if number != 11 and f"Т{number}" in point_to_shop
+                if f"Т{number}" in point_to_shop
             ]
             if not available_point_labels:
                 st.warning(
-                    "Для выбранного периода нет сопоставленных точек. Сначала найдите магазины и задайте им названия Т1–Т29."
+                    "Для выбранного периода нет сопоставленных точек между Матрицей КОМБО и PostgreSQL."
                 )
             else:
                 selected_time_points = st.multiselect(
@@ -15108,7 +15130,7 @@ if tab_sales_time.open:
                 if handover_period.empty:
                     st.info(
                         "Для выбранных дат в текущей Матрице КОМБО нет заполненных значений «СДАЛИ». "
-                        "Архивные меню сейчас хранят плановые Т1–Т29, поэтому старые «СДАЛИ/Ф.Цена» "
+                        "Архивные меню сейчас хранят плановые все точки из PostgreSQL, поэтому старые «СДАЛИ/Ф.Цена» "
                         "из системного архива восстановить нельзя."
                     )
                 else:
@@ -15463,7 +15485,7 @@ if tab_sales_time.open:
                 # Сохраняем исходную детализацию по каждой точке до суммирования.
                 # Верхняя таблица партий по-прежнему показывает общий итог по выбранным точкам,
                 # а по клику на строку ниже можно раскрыть реализацию именно этой партии
-                # отдельно по Т1–Т29.
+                # отдельно по все точки из PostgreSQL.
                 sales_time_menu_by_point = sales_time_menu.copy()
 
                 # 75.11.27: агрегированный вид меню по категориям без детализации до SKU.
@@ -15744,7 +15766,7 @@ if tab_sales_time.open:
                     ).round(1)
                     sales_time_menu.insert(0, "Точка", ", ".join(selected_time_points))
                 # Для вкладки «Списания» сохраняем также несуммированную детализацию по каждой точке.
-                # Это позволяет раскрыть категорию до SKU, а SKU — до конкретных Т1–Т29.
+                # Это позволяет раскрыть категорию до SKU, а SKU — до конкретных все точки из PostgreSQL.
                 st.session_state["freshness_category_source_by_point_v63"] = sales_time_menu_by_point.copy()
                 st.session_state["freshness_category_source_by_point_v64"] = sales_time_menu_by_point.copy()
                 st.session_state["freshness_category_source_v62"] = sales_time_menu.copy()
@@ -16858,7 +16880,7 @@ if tab_category_writeoffs.open:
                                         st.warning(
                                             "Не удалось автоматически восстановить разрез по отдельным точкам: "
                                             f"{point_source_rebuild_error}. Откройте «Окно свежести» и повторно "
-                                            "выберите период/точки — после расчёта здесь появятся отдельные строки Т1–Т29."
+                                            "выберите период/точки — после расчёта здесь появятся отдельные строки все точки из PostgreSQL."
                                         )
                                     else:
                                         st.info("Для выбранного SKU нет детализации по отдельным точкам.")
@@ -17111,10 +17133,20 @@ if tab_plan_check.open:
                     check_point_mapping = {
                         int(shop): str(label)
                         for shop, label in st.session_state.get("point_mapping", {}).items()
-                        if str(label).startswith("Т") and str(label) != "Т11"
+                        if re.fullmatch(r"Т\d+", str(label).strip())
                     }
                     if not check_point_mapping:
-                        check_point_mapping = {number: f"Т{number}" for number in range(1, 30) if number != 11}
+                        available_check_shops = load_available_shops(
+                            history_from, analysis_date + timedelta(days=1)
+                        )
+                        check_point_mapping = {
+                            int(number): f"Т{int(number)}"
+                            for number in pd.to_numeric(
+                                available_check_shops.get("shop_number", pd.Series(dtype=float)),
+                                errors="coerce",
+                            ).dropna().tolist()
+                            if int(number) > 0
+                        }
                     try:
                         with st.spinner("Проверяю текущие значения плана: SKU, свежесть, категория, сущность и Авто Юнит…"):
                             check_sales = load_forecast_history(history_from, analysis_date + timedelta(days=1), tuple(sorted(check_point_mapping)))
@@ -17160,7 +17192,7 @@ if tab_plan_check.open:
                     st.markdown("#### Проверка прямо в меню")
                     st.caption(
                         "Показан только выбранный день готового меню. Значения категорийщика не заменяются. "
-                        "Цвет наносится только на ячейки Т1–Т29: зелёный — согласие, жёлтый — сомнение/рекомендация, "
+                        "Цвет наносится только на ячейки все точки из PostgreSQL: зелёный — согласие, жёлтый — сомнение/рекомендация, "
                         "красный — полное несогласие. Наведите курсор на ячейку, чтобы увидеть объяснение системы."
                     )
                     matrix_html = ready_plan_check_menu_html(
@@ -17243,7 +17275,7 @@ if tab_menu_archive.open:
                 with st.expander("Добавить старое меню из Excel", expanded=False):
                     st.caption(
                         "Загрузите старую матрицу меню. Система сама найдёт блоки «План на день кухня», "
-                        "возьмёт только Т1–Т29 и добавит только те даты, которых ещё нет в архиве. "
+                        "возьмёт только все точки из PostgreSQL и добавит только те даты, которых ещё нет в архиве. "
                         "Ф1–Ф29 и «Участок комплектации» не импортируются."
                     )
                     historical_menu_file = st.file_uploader(
@@ -17303,7 +17335,7 @@ if tab_menu_archive.open:
                                 int(historical_frame["SKU"].nunique()),
                             )
                             import_metrics[3].metric(
-                                "Строк Т1–Т29",
+                                "Строк все точки из PostgreSQL",
                                 len(historical_frame),
                             )
 
@@ -17488,12 +17520,12 @@ if tab_forecast.open:
         st.caption(
             "Меню и даты плана загружаются автоматически из текущей матрицы. "
             "Сначала выберите нужные даты из тех, которые найдены в матрице; затем приложение "
-            "рассчитает только выбранные дни и заполнит Т1–Т29 только в соответствующих блоках меню. "
+            "рассчитает только выбранные дни и заполнит все точки из PostgreSQL только в соответствующих блоках меню. "
             "Период для расчёта среднего выбирается вручную ползунком ниже — от 1 до 26 недель (примерно 6 месяцев). "
             "Для каждого SKU и каждой точки среднее считается только по дням, когда SKU действительно продавался, "
             "и только внутри выбранного исторического периода. "
             "Множитель загрузки зависит от категории: Япония — ×1, вторые блюда — ×3, "
-            "напитки — ×4, остальные категории — ×2. Т11 остаётся пустой."
+            "напитки — ×4, остальные категории — ×2. Новые точки подключаются автоматически, если они есть в PostgreSQL и в шаблоне Матрицы."
         )
 
         matrix_bytes, matrix_source, matrix_checked_at, matrix_error = _load_matrix_context_for_active_tab()
@@ -17663,17 +17695,24 @@ if tab_forecast.open:
                     )
                     if forecast_button:
                         forecast_points = {
-                            int(number): label
+                            int(number): str(label).strip()
                             for number, label in st.session_state.get("point_mapping", {}).items()
-                            if str(label).startswith("Т")
-                            and 1 <= int(str(label)[1:]) <= 29
-                            and int(str(label)[1:]) != 11
+                            if re.fullmatch(r"Т\d+", str(label).strip())
+                            and int(number) > 0
                         }
                         if not forecast_points:
+                            available_forecast_shops = load_available_shops(
+                                history_from, last_target_date
+                            )
                             forecast_points = {
-                                number: f"Т{number}"
-                                for number in range(1, 30)
-                                if number != 11
+                                int(number): f"Т{int(number)}"
+                                for number in pd.to_numeric(
+                                    available_forecast_shops.get(
+                                        "shop_number", pd.Series(dtype=float)
+                                    ),
+                                    errors="coerce",
+                                ).dropna().tolist()
+                                if int(number) > 0
                             }
                         try:
                             forecast_history = load_forecast_history(
