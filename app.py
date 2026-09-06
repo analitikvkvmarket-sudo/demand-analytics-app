@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
 from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import pandas as pd
@@ -35,7 +36,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.55-CYCLE-EXPORT-KEY-FIX"
+BUILD_ID = "75.11.56-CYCLE-ENTITY-FALLBACK"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -9343,6 +9344,11 @@ def build_cycle_plan_v1(
         "Вес добора SKU",
         "Добор SKU",
         "Новый план",
+        "Сущность текущего SKU",
+        "SKU-основание",
+        "Название основания",
+        "Тип сопоставления",
+        "Сопоставление неуверенное",
         "Статус",
     ]
     if target_plans is None or target_plans.empty:
@@ -9396,6 +9402,42 @@ def build_cycle_plan_v1(
         for sku, category in entity_frame[["sku", "category"]].itertuples(index=False, name=None):
             sku_category_map[str(sku)] = normalize_matrix_category(category)
 
+    # Полная карта SKU -> сущность / название из актуального справочника.
+    sku_entity_map: dict[str, str] = {}
+    sku_name_map: dict[str, str] = {}
+    if not entity_frame.empty:
+        if "entity" in entity_frame.columns:
+            for sku, entity_value in entity_frame[["sku", "entity"]].itertuples(index=False, name=None):
+                norm_sku = normalize_sku(sku)
+                entity_text = str(entity_value or "").strip()
+                if norm_sku and entity_text:
+                    sku_entity_map[str(norm_sku)] = entity_text
+        name_column = None
+        for candidate_name in ("product_name", "name", "Название блюда"):
+            if candidate_name in entity_frame.columns:
+                name_column = candidate_name
+                break
+        if name_column:
+            for sku, name_value in entity_frame[["sku", name_column]].itertuples(index=False, name=None):
+                norm_sku = normalize_sku(sku)
+                name_text = str(name_value or "").strip()
+                if norm_sku and name_text:
+                    sku_name_map[str(norm_sku)] = name_text
+
+    def _entity_key(value: object) -> str:
+        return re.sub(
+            r"\s+",
+            " ",
+            str(value or "").strip().casefold().replace("ё", "е"),
+        )
+
+    def _name_similarity(left: object, right: object) -> float:
+        left_text = _cycle_plan_normalize_name(left)
+        right_text = _cycle_plan_normalize_name(right)
+        if not left_text or not right_text:
+            return 0.0
+        return float(SequenceMatcher(None, left_text, right_text).ratio())
+
     # Резерв категории из меню.
     for frame in (reference, target):
         if frame.empty:
@@ -9443,6 +9485,33 @@ def build_cycle_plan_v1(
             if pd.isna(plan_date) or not sku:
                 continue
             ref_sku_lookup[(plan_date, str(sku))] = group.iloc[-1]
+
+    # Индекс исторического меню -14 по сущности.
+    # Сначала используем ту же точку; если на ней сущность отсутствует,
+    # разрешаем резерв по другим точкам и помечаем его как неуверенный.
+    reference_entity_rows: dict[tuple[date, str, str], pd.DataFrame] = {}
+    if not reference.empty:
+        reference_with_entity = reference.copy()
+        reference_with_entity["entity_match_key"] = reference_with_entity["sku"].map(
+            lambda value: _entity_key(sku_entity_map.get(str(value), ""))
+        )
+        reference_with_entity["category_match_key"] = reference_with_entity["matrix_category"].map(
+            lambda value: normalize_matrix_category(value)
+        )
+        reference_with_entity = reference_with_entity[
+            reference_with_entity["entity_match_key"].astype(str).str.strip().ne("")
+        ].copy()
+
+        for (plan_date, entity_key_value, category_value), group in reference_with_entity.groupby(
+            ["plan_date", "entity_match_key", "category_match_key"],
+            dropna=False,
+            sort=False,
+        ):
+            if pd.isna(plan_date) or not entity_key_value:
+                continue
+            reference_entity_rows[
+                (plan_date, str(entity_key_value), str(category_value))
+            ] = group.copy()
 
     # Дневной факт SKU по точке.
     sales_lookup: dict[tuple[int, str], pd.DataFrame] = {}
@@ -9594,25 +9663,134 @@ def build_cycle_plan_v1(
             "Вес добора SKU": pd.NA,
             "Добор SKU": pd.NA,
             "Новый план": pd.NA,
+            "Сущность текущего SKU": sku_entity_map.get(sku, ""),
+            "SKU-основание": sku,
+            "Название основания": name,
+            "Тип сопоставления": "Точный SKU",
+            "Сопоставление неуверенное": False,
             "Статус": "",
         }
 
-        if ref_sku_lookup.get((sku_reference_date, sku)) is None:
-            row["Статус"] = "Проверить SKU"
-            rows.append(row)
-            continue
-
+        calculation_sku = sku
         previous = ref_lookup.get((sku_reference_date, point_number, sku))
-        previous_plan = 0.0 if previous is None else max(
-            0.0,
-            float(getattr(previous, "analyst_plan", 0.0) or 0.0),
-        )
+        previous_plan = 0.0
+        uncertain_entity_match = False
+        entity_fallback_used = False
+        matched_name = name
+
+        exact_sku_exists = ref_sku_lookup.get((sku_reference_date, sku)) is not None
+
+        if exact_sku_exists:
+            if previous is not None:
+                previous_plan = max(
+                    0.0,
+                    float(getattr(previous, "analyst_plan", 0.0) or 0.0),
+                )
+            row["Тип сопоставления"] = "Точный SKU"
+        else:
+            # Fallback: тот же entity + та же категория.
+            current_entity = sku_entity_map.get(sku, "")
+            entity_key_value = _entity_key(current_entity)
+            candidates = reference_entity_rows.get(
+                (sku_reference_date, entity_key_value, category),
+                pd.DataFrame(),
+            )
+
+            if candidates is None or candidates.empty:
+                row["Статус"] = "Проверить SKU"
+                rows.append(row)
+                continue
+
+            # Предпочтение: та же точка. Если её нет — разрешаем другие точки,
+            # но это уже неуверенное сопоставление.
+            same_point = candidates[
+                pd.to_numeric(candidates["point_number"], errors="coerce")
+                .fillna(-1)
+                .astype(int)
+                .eq(point_number)
+            ].copy()
+
+            candidate_pool = same_point if not same_point.empty else candidates.copy()
+            if same_point.empty:
+                uncertain_entity_match = True
+
+            candidate_pool["name_similarity"] = candidate_pool["product_name"].map(
+                lambda value: _name_similarity(name, value)
+            )
+            candidate_pool["plan_numeric"] = pd.to_numeric(
+                candidate_pool["analyst_plan"],
+                errors="coerce",
+            ).fillna(0.0)
+
+            # Самое похожее название; при равенстве — больший исторический план.
+            candidate_pool = candidate_pool.sort_values(
+                ["name_similarity", "plan_numeric"],
+                ascending=[False, False],
+                kind="stable",
+            )
+            chosen = candidate_pool.iloc[0]
+            calculation_sku = str(chosen["sku"])
+            matched_name = str(chosen.get("product_name", "") or "").strip()
+
+            # Несколько кандидатов одной сущности = неуверенность.
+            distinct_candidate_skus = candidate_pool["sku"].astype(str).nunique()
+            if distinct_candidate_skus > 1:
+                uncertain_entity_match = True
+
+            # Если нашли на этой точке — берём её конкретный план.
+            # Если точка отсутствует — берём медиану плана выбранного proxy SKU по другим точкам.
+            chosen_same_point = candidate_pool[
+                pd.to_numeric(candidate_pool["point_number"], errors="coerce")
+                .fillna(-1)
+                .astype(int)
+                .eq(point_number)
+                & candidate_pool["sku"].astype(str).eq(calculation_sku)
+            ]
+
+            if not chosen_same_point.empty:
+                previous_plan = max(
+                    0.0,
+                    float(
+                        pd.to_numeric(
+                            chosen_same_point["analyst_plan"],
+                            errors="coerce",
+                        ).fillna(0.0).iloc[-1]
+                    ),
+                )
+            else:
+                proxy_plans = pd.to_numeric(
+                    candidate_pool.loc[
+                        candidate_pool["sku"].astype(str).eq(calculation_sku),
+                        "analyst_plan",
+                    ],
+                    errors="coerce",
+                ).dropna()
+                previous_plan = max(
+                    0.0,
+                    float(proxy_plans.median()) if not proxy_plans.empty else 0.0,
+                )
+                uncertain_entity_match = True
+
+            entity_fallback_used = True
+            row["SKU-основание"] = calculation_sku
+            row["Название основания"] = matched_name
+            row["Тип сопоставления"] = (
+                "По сущности · неуверенно"
+                if uncertain_entity_match
+                else "По сущности"
+            )
+            row["Сопоставление неуверенное"] = bool(uncertain_entity_match)
+
         row["Прошлый план SKU"] = previous_plan
 
+        # Для точного SKU и уверенного entity-match на той же точке используем
+        # фактические продажи proxy SKU этой точки.
+        # Для cross-point entity fallback факта по текущей точке у proxy SKU может не быть;
+        # тогда считаем consumed по доступному proxy SKU на текущей точке (0, если не было).
         consumed, completion_day = _batch_consumption(
             sku_reference_date,
             point_number,
-            sku,
+            calculation_sku,
             category,
             previous_plan,
         )
@@ -9649,6 +9827,14 @@ def build_cycle_plan_v1(
             day_text = completion_day if completion_day is not None else "?"
             status = f"Съеден полностью в День {day_text} · минимум ×1.0"
 
+        if entity_fallback_used:
+            entity_label = str(row.get("Сущность текущего SKU", "") or "").strip()
+            confidence_text = "НЕУВЕРЕННО" if uncertain_entity_match else "уверенно"
+            status = (
+                f"{status} · сопоставлено по сущности «{entity_label}» "
+                f"через SKU {calculation_sku} ({confidence_text})"
+            )
+
         row.update({
             "Факт SKU за срок": consumed,
             "Реализация SKU, %": realization_ratio,
@@ -9657,7 +9843,7 @@ def build_cycle_plan_v1(
             ),
             "K SKU": sku_k,
             "Минимум SKU": int(minimum),
-            # Вес ДОБОРА — исходный исторический план этого SKU.
+            # Вес ДОБОРА — исходный исторический план / proxy-план.
             "Вес добора SKU": float(previous_plan),
             "Статус": status,
         })
@@ -9931,7 +10117,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                         target_cell.comment = Comment(
                             (
                                 "Проверить SKU.\n"
-                                f"Дата сравнения: {record.get('Дата сравнения', '')}\n"
+                                f"Дата сравнения: {record.get('Дата сравнения SKU', '')}\n"
                                 "SKU отсутствует в сопоставимом меню даты сравнения."
                             ),
                             "Циклический план",
@@ -9943,6 +10129,13 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                         target_cell.value = None
                         continue
                     target_cell.value = int(new_plan)
+
+                    uncertain_match = bool(record.get("Сопоставление неуверенное", False))
+                    match_type = str(record.get("Тип сопоставления", "") or "")
+                    if uncertain_match:
+                        target_cell.fill = PatternFill("solid", fgColor="FCE4D6")
+                        target_cell.font = Font(color="9C5700", bold=True)
+
                     previous_plan = pd.to_numeric(pd.Series([record.get("Прошлый план SKU")]), errors="coerce").iloc[0]
                     consumed = pd.to_numeric(pd.Series([record.get("Факт SKU за срок")]), errors="coerce").iloc[0]
                     coefficient = pd.to_numeric(pd.Series([record.get("K SKU")]), errors="coerce").iloc[0]
@@ -9950,13 +10143,17 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                     completion_text = "не съеден полностью" if pd.isna(completion) else f"день {int(completion)}"
                     target_cell.comment = Comment(
                         (
-                            f"Дата сравнения: {record.get('Дата сравнения', '')}\n"
+                            f"Дата сравнения: {record.get('Дата сравнения SKU', '')}\n"
                             f"Прошлый план: {0 if pd.isna(previous_plan) else float(previous_plan):g}\n"
                             f"Съедено в срок: {0 if pd.isna(consumed) else float(consumed):g}\n"
                             f"Полное съедание: {completion_text}\n"
                             f"Зелёное окно: {int(record.get('Зелёное окно, дней', 0) or 0)} дн.\n"
                             f"Коэффициент: ×{1 if pd.isna(coefficient) else float(coefficient):g}\n"
                             f"Новый план: {int(new_plan)}\n"
+                            f"Тип сопоставления: {match_type}\n"
+                            f"Сущность: {record.get('Сущность текущего SKU', '')}\n"
+                            f"SKU-основание: {record.get('SKU-основание', '')}\n"
+                            f"Название основания: {record.get('Название основания', '')}\n"
                             f"Статус: {status}"
                         ),
                         "Циклический план",
@@ -10034,7 +10231,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                     diag_cell.comment = Comment(
                         (
                             "Проверить SKU.\n"
-                            f"Дата сравнения: {record.get('Дата сравнения', '')}\n"
+                            f"Дата сравнения: {record.get('Дата сравнения SKU', '')}\n"
                             "SKU отсутствует в сопоставимом меню даты сравнения."
                         ),
                         "Циклический план",
@@ -10087,12 +10284,38 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                     extra_text = "-" if pd.isna(extra) else f"+{int(extra)}"
                     new_text = "-" if pd.isna(new_plan) else f"{int(new_plan)}"
 
-                    sheet.cell(diag_row, point_column).value = (
+                    diag_cell = sheet.cell(diag_row, point_column)
+                    match_type = str(record.get("Тип сопоставления", "") or "")
+                    uncertain_match = bool(record.get("Сопоставление неуверенное", False))
+                    basis_suffix = ""
+                    if match_type.startswith("По сущности"):
+                        basis_suffix = (
+                            f" | сущность→SKU {record.get('SKU-основание', '')}"
+                        )
+
+                    diag_cell.value = (
                         f"{prev_text}→{eaten_text} {sku_k_text} = min {minimum_text} | "
                         f"кат факт {category_text}; minΣ {min_sum_text}; ост {remainder_text} | "
-                        f"{extra_text} → {new_text}"
+                        f"{extra_text} → {new_text}{basis_suffix}"
                     )
-                    sheet.cell(diag_row, point_column).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                    diag_cell.alignment = Alignment(
+                        horizontal="center",
+                        vertical="center",
+                        wrap_text=True,
+                    )
+                    if uncertain_match:
+                        diag_cell.fill = PatternFill("solid", fgColor="FCE4D6")
+                        diag_cell.font = Font(color="9C5700", bold=True)
+                        diag_cell.comment = Comment(
+                            (
+                                "Неуверенное сопоставление по сущности.\n"
+                                f"Сущность: {record.get('Сущность текущего SKU', '')}\n"
+                                f"Использован SKU: {record.get('SKU-основание', '')}\n"
+                                f"Название основания: {record.get('Название основания', '')}\n"
+                                "Число рассчитано и поставлено в план, но рекомендуется проверить соответствие."
+                            ),
+                            "Циклический план",
+                        )
 
     # Remove fact columns from the downloadable copy, exactly like «Прогноз плана».
     for sheet_name, columns in fact_columns_by_sheet.items():
