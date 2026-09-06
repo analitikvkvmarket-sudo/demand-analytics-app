@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.49-NO-PLANNING-TAB"
+BUILD_ID = "75.11.50-CYCLE-CATEGORY-FACT-V2"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -9251,11 +9251,54 @@ def _cycle_plan_normalize_name(value: object) -> str:
     return re.sub(r"\\s+", " ", str(value or "").strip().casefold().replace("ё", "е"))
 
 
-def build_cycle_plan_v1(target_plans: pd.DataFrame, reference_plans: pd.DataFrame, sales: pd.DataFrame) -> pd.DataFrame:
+def build_cycle_plan_v1(
+    target_plans: pd.DataFrame,
+    reference_plans: pd.DataFrame,
+    sales: pd.DataFrame,
+) -> pd.DataFrame:
+    """Циклический план V2.
+
+    1) SKU-приоритет оценивается по паре меню -14 дней:
+       - полностью съеден в 1-й зелёный день -> база SKU = прошлый план × 1.5;
+       - полностью съеден в зелёное окно -> база SKU = прошлый план × 1.2;
+       - ушёл в серый период / съеден не полностью -> база SKU = фактически съедено;
+       - SKU отсутствует в меню -14 дней -> «Проверить SKU».
+
+    2) Общий объём категории берётся НЕ из этой базы, а из факта продаж после
+       такого же планового дня неделю назад:
+       - Вс / Пн / Вт / Ср -> следующие 3 календарных дня;
+       - Чт -> следующие 4 календарных дня.
+       Пример: план на воскресенье -> факт прошлой недели Пн+Вт+Ср.
+       План на четверг -> факт прошлой недели Пт+Сб+Вс+Пн.
+
+    3) Факт категории считается отдельно по точке и категории, затем ВСЁ это
+       количество распределяется между SKU текущего меню этой категории.
+       Приоритет получают SKU, которые съедались быстрее в зелёном окне.
+       Итог после округления сохраняет полный объём категории.
+    """
     columns = [
-        "Дата плана","День недели","Дата сравнения","Точка","SKU","Название блюда","Категория",
-        "Прошлый план","Съедено в срок","Зелёное окно, дней","Полный срок, дней",
-        "День полного съедания","Коэффициент","Новый план","Статус",
+        "Дата плана",
+        "День недели",
+        "Дата сравнения",
+        "Дата базы категории",
+        "Факт категории с",
+        "Факт категории по",
+        "Окно факта категории, дней",
+        "Точка",
+        "SKU",
+        "Название блюда",
+        "Категория",
+        "Прошлый план",
+        "Съедено в срок",
+        "Зелёное окно, дней",
+        "Полный срок, дней",
+        "День полного съедания",
+        "Коэффициент",
+        "База SKU до распределения",
+        "Факт категории, шт.",
+        "Доля распределения",
+        "Новый план",
+        "Статус",
     ]
     if target_plans is None or target_plans.empty:
         return pd.DataFrame(columns=columns)
@@ -9270,56 +9313,123 @@ def build_cycle_plan_v1(target_plans: pd.DataFrame, reference_plans: pd.DataFram
         frame["plan_date"] = pd.to_datetime(frame["plan_date"], errors="coerce").dt.date
         frame["point_number"] = pd.to_numeric(frame["point_number"], errors="coerce")
         frame["sku"] = frame["sku"].map(normalize_sku)
-        frame["analyst_plan"] = pd.to_numeric(frame["analyst_plan"], errors="coerce").fillna(0.0).clip(lower=0)
+        frame["analyst_plan"] = pd.to_numeric(
+            frame["analyst_plan"], errors="coerce"
+        ).fillna(0.0).clip(lower=0)
         frame["product_name"] = frame["product_name"].fillna("").astype(str).str.strip()
         frame["matrix_category"] = frame["matrix_category"].map(normalize_matrix_category)
 
-    target = target[target["plan_date"].notna() & target["point_number"].notna() & target["sku"].notna()].copy()
+    target = target[
+        target["plan_date"].notna()
+        & target["point_number"].notna()
+        & target["sku"].notna()
+    ].copy()
     target["point_number"] = target["point_number"].astype(int)
 
     if not reference.empty:
-        reference = reference[reference["plan_date"].notna() & reference["point_number"].notna() & reference["sku"].notna()].copy()
+        reference = reference[
+            reference["plan_date"].notna()
+            & reference["point_number"].notna()
+            & reference["sku"].notna()
+        ].copy()
         reference["point_number"] = reference["point_number"].astype(int)
-        reference = reference.drop_duplicates(["plan_date","point_number","sku"], keep="last")
+        reference = reference.drop_duplicates(
+            ["plan_date", "point_number", "sku"],
+            keep="last",
+        )
+
+    # SKU -> category. Current target menu has priority, reference menu fills history.
+    sku_category_map: dict[str, str] = {}
+    for frame in (reference, target):
+        if frame.empty:
+            continue
+        for sku, category in frame[["sku", "matrix_category"]].itertuples(index=False, name=None):
+            normalized_sku = normalize_sku(sku)
+            normalized_category = normalize_matrix_category(category)
+            if normalized_sku and normalized_category:
+                sku_category_map[str(normalized_sku)] = normalized_category
 
     if sold.empty:
-        sold = pd.DataFrame(columns=["business_date","shop_number","sku","sold_quantity"])
+        sold = pd.DataFrame(
+            columns=["business_date", "shop_number", "sku", "sold_quantity", "cycle_category"]
+        )
     else:
-        sold["business_date"] = pd.to_datetime(sold["business_date"], errors="coerce").dt.date
+        sold["business_date"] = pd.to_datetime(
+            sold["business_date"], errors="coerce"
+        ).dt.date
         sold["shop_number"] = pd.to_numeric(sold["shop_number"], errors="coerce")
         sold["sku"] = sold["sku"].map(normalize_sku)
-        sold["sold_quantity"] = pd.to_numeric(sold["sold_quantity"], errors="coerce").fillna(0.0).clip(lower=0)
-        sold = sold[sold["business_date"].notna() & sold["shop_number"].notna() & sold["sku"].notna()].copy()
+        sold["sold_quantity"] = pd.to_numeric(
+            sold["sold_quantity"], errors="coerce"
+        ).fillna(0.0).clip(lower=0)
+        sold = sold[
+            sold["business_date"].notna()
+            & sold["shop_number"].notna()
+            & sold["sku"].notna()
+        ].copy()
         sold["shop_number"] = sold["shop_number"].astype(int)
+        sold["cycle_category"] = sold["sku"].map(
+            lambda value: sku_category_map.get(str(value), "")
+        )
 
     ref_lookup = {
         (row.plan_date, int(row.point_number), str(row.sku)): row
         for row in reference.itertuples(index=False)
     } if not reference.empty else {}
 
-    # SKU existence is checked at menu-date level, not at point level.
-    # A SKU can legitimately have 0 / blank previous plan on a specific point.
-    # That is NOT a SKU mismatch and must not become «Проверить SKU».
+    # SKU existence is checked at date level, not point level.
     ref_sku_lookup = {}
     if not reference.empty:
-        for (plan_date, sku), group in reference.groupby(["plan_date", "sku"], dropna=False, sort=False):
+        for (plan_date, sku), group in reference.groupby(
+            ["plan_date", "sku"], dropna=False, sort=False
+        ):
             if pd.isna(plan_date) or not sku:
                 continue
             ref_sku_lookup[(plan_date, str(sku))] = group.iloc[-1]
 
     sales_lookup = {}
     if not sold.empty:
-        for (shop, sku), group in sold.groupby(["shop_number","sku"], sort=False):
+        for (shop, sku), group in sold.groupby(["shop_number", "sku"], sort=False):
             sales_lookup[(int(shop), str(sku))] = (
-                group[["business_date","sold_quantity"]]
-                .groupby("business_date", as_index=False)["sold_quantity"].sum()
+                group[["business_date", "sold_quantity"]]
+                .groupby("business_date", as_index=False)["sold_quantity"]
+                .sum()
                 .sort_values("business_date")
             )
 
-    rows = []
-    for item in target.sort_values(["plan_date","point_number","matrix_category","product_name"], kind="stable").itertuples(index=False):
+    # Fast category fact lookup: date × point × category.
+    category_daily_lookup: dict[tuple[date, int, str], float] = {}
+    if not sold.empty:
+        category_sales = sold[sold["cycle_category"].astype(str).str.strip().ne("")].copy()
+        if not category_sales.empty:
+            grouped = (
+                category_sales.groupby(
+                    ["business_date", "shop_number", "cycle_category"],
+                    as_index=False,
+                )["sold_quantity"]
+                .sum()
+            )
+            category_daily_lookup = {
+                (row.business_date, int(row.shop_number), str(row.cycle_category)): float(row.sold_quantity)
+                for row in grouped.itertuples(index=False)
+            }
+
+    rows: list[dict[str, object]] = []
+
+    # First pass: calculate SKU speed / priority from the -14 day paired menu.
+    for item in target.sort_values(
+        ["plan_date", "point_number", "matrix_category", "product_name"],
+        kind="stable",
+    ).itertuples(index=False):
         target_date = item.plan_date
         reference_date = target_date - timedelta(days=14)
+        category_base_date = target_date - timedelta(days=7)
+
+        # Thursday = 3 -> 4 days after last week's Thursday, other plan days = 3.
+        category_window_days = 4 if target_date.weekday() == 3 else 3
+        category_fact_start = category_base_date + timedelta(days=1)
+        category_fact_end = category_base_date + timedelta(days=category_window_days)
+
         point_number = int(item.point_number)
         sku = str(item.sku)
         category = normalize_matrix_category(item.matrix_category)
@@ -9327,10 +9437,22 @@ def build_cycle_plan_v1(target_plans: pd.DataFrame, reference_plans: pd.DataFram
         green_days = int(product_green_days(category))
         lifecycle_days = int(product_lifecycle_days(category))
 
+        category_fact_total = sum(
+            float(category_daily_lookup.get(
+                (category_base_date + timedelta(days=offset), point_number, category),
+                0.0,
+            ))
+            for offset in range(1, category_window_days + 1)
+        )
+
         row = {
             "Дата плана": target_date,
             "День недели": WEEKDAY_RU.get(target_date.weekday(), ""),
             "Дата сравнения": reference_date,
+            "Дата базы категории": category_base_date,
+            "Факт категории с": category_fact_start,
+            "Факт категории по": category_fact_end,
+            "Окно факта категории, дней": category_window_days,
             "Точка": f"Т{point_number}",
             "SKU": sku,
             "Название блюда": name,
@@ -9341,43 +9463,56 @@ def build_cycle_plan_v1(target_plans: pd.DataFrame, reference_plans: pd.DataFram
             "Полный срок, дней": lifecycle_days,
             "День полного съедания": pd.NA,
             "Коэффициент": pd.NA,
+            "База SKU до распределения": pd.NA,
+            "Факт категории, шт.": category_fact_total,
+            "Доля распределения": pd.NA,
             "Новый план": pd.NA,
             "Статус": "",
         }
 
-        # First check whether the SKU exists anywhere in the paired historical menu.
-        # Name differences do not block calculation: SKU is the primary key.
+        # SKU missing from the paired menu (-14) is a real mismatch.
         sku_reference = ref_sku_lookup.get((reference_date, sku))
         if sku_reference is None:
             row["Статус"] = "Проверить SKU"
             rows.append(row)
             continue
 
-        # If this SKU existed in the menu but had no plan on the current point,
-        # treat the previous point plan as 0 instead of a mismatch.
         previous = ref_lookup.get((reference_date, point_number, sku))
-        if previous is None:
-            previous_plan = 0.0
-        else:
-            previous_plan = max(0.0, float(getattr(previous, "analyst_plan", 0.0) or 0.0))
-
+        previous_plan = (
+            0.0
+            if previous is None
+            else max(0.0, float(getattr(previous, "analyst_plan", 0.0) or 0.0))
+        )
         row["Прошлый план"] = previous_plan
 
         first_sale_date = reference_date + timedelta(days=1)
         last_sale_date = reference_date + timedelta(days=lifecycle_days)
         sku_sales = sales_lookup.get((point_number, sku), pd.DataFrame())
 
-        all_dates = pd.DataFrame({"business_date": [reference_date + timedelta(days=i) for i in range(1, lifecycle_days + 1)]})
+        all_dates = pd.DataFrame({
+            "business_date": [
+                reference_date + timedelta(days=i)
+                for i in range(1, lifecycle_days + 1)
+            ]
+        })
         if sku_sales.empty:
             daily = all_dates.copy()
             daily["sold_quantity"] = 0.0
         else:
             daily = all_dates.merge(
-                sku_sales[sku_sales["business_date"].between(first_sale_date, last_sale_date, inclusive="both")],
+                sku_sales[
+                    sku_sales["business_date"].between(
+                        first_sale_date,
+                        last_sale_date,
+                        inclusive="both",
+                    )
+                ],
                 on="business_date",
                 how="left",
             )
-            daily["sold_quantity"] = pd.to_numeric(daily["sold_quantity"], errors="coerce").fillna(0.0).clip(lower=0)
+            daily["sold_quantity"] = pd.to_numeric(
+                daily["sold_quantity"], errors="coerce"
+            ).fillna(0.0).clip(lower=0)
 
         total_sales = float(daily["sold_quantity"].sum())
         consumed = min(previous_plan, total_sales)
@@ -9391,27 +9526,113 @@ def build_cycle_plan_v1(target_plans: pd.DataFrame, reference_plans: pd.DataFram
                     completion_day = day_num
                     break
 
+        # This is only the SKU PRIORITY BASE now.
         if previous_plan <= 0:
-            coef, new_plan, status = 1.0, 0, "Прошлый план = 0"
+            coef = 1.0
+            sku_base = 0.25  # minimal share only if category has volume
+            status = "Прошлый план = 0 · минимальный приоритет"
         elif completion_day == 1:
-            coef, new_plan, status = 1.5, int(math.ceil(previous_plan * 1.5)), "Съедено полностью в 1-й день"
+            coef = 1.5
+            sku_base = previous_plan * coef
+            status = "Приоритет 1 · съедено полностью в 1-й день"
         elif completion_day is not None and completion_day <= green_days:
-            coef, new_plan, status = 1.2, int(math.ceil(previous_plan * 1.2)), f"Съедено полностью в зелёное окно · день {completion_day}"
+            coef = 1.2
+            sku_base = previous_plan * coef
+            status = (
+                f"Приоритет зелёного окна · полностью съедено, день {completion_day}"
+            )
         else:
-            coef, new_plan = 1.0, int(math.ceil(consumed))
-            status = f"Полностью съедено в серый период · день {completion_day}" if completion_day is not None else "Съедено меньше прошлого плана"
+            coef = 1.0
+            sku_base = max(consumed, 0.25)
+            if completion_day is not None:
+                status = (
+                    f"Низкий приоритет · полностью съедено в серый период, день {completion_day}"
+                )
+            else:
+                status = "Низкий приоритет · съедено меньше прошлого плана"
 
         row.update({
             "Съедено в срок": consumed,
-            "День полного съедания": completion_day if completion_day is not None else pd.NA,
+            "День полного съедания": (
+                completion_day if completion_day is not None else pd.NA
+            ),
             "Коэффициент": coef,
-            "Новый план": new_plan,
+            "База SKU до распределения": float(sku_base),
             "Статус": status,
         })
         rows.append(row)
 
-    return pd.DataFrame(rows, columns=columns).sort_values(
-        ["Дата плана","Точка","Категория","Название блюда","SKU"], kind="stable"
+    result = pd.DataFrame(rows, columns=columns)
+    if result.empty:
+        return result
+
+    # Second pass: distribute the FULL category fact among current menu SKUs.
+    # Distribution is separate for each target date × point × category.
+    group_columns = ["Дата плана", "Точка", "Категория"]
+
+    for _, index_values in result.groupby(group_columns, sort=False).groups.items():
+        idx = list(index_values)
+        group = result.loc[idx].copy()
+
+        category_fact = float(
+            pd.to_numeric(group["Факт категории, шт."], errors="coerce")
+            .fillna(0.0)
+            .max()
+        )
+        total_units = max(0, int(round(category_fact)))
+
+        valid_mask = group["Статус"].ne("Проверить SKU")
+        valid_idx = group.index[valid_mask].tolist()
+
+        if not valid_idx:
+            continue
+
+        weights = pd.to_numeric(
+            result.loc[valid_idx, "База SKU до распределения"],
+            errors="coerce",
+        ).fillna(0.0).clip(lower=0.0)
+
+        if float(weights.sum()) <= 0:
+            weights = pd.Series(1.0, index=valid_idx)
+
+        raw_alloc = weights / float(weights.sum()) * total_units
+        floor_alloc = raw_alloc.apply(math.floor).astype(int)
+        remainder = int(total_units - floor_alloc.sum())
+
+        # Largest-remainder allocation. If fractions tie, earlier freshness wins.
+        ranking = pd.DataFrame({
+            "idx": valid_idx,
+            "fraction": raw_alloc - floor_alloc,
+            "completion_day": pd.to_numeric(
+                result.loc[valid_idx, "День полного съедания"],
+                errors="coerce",
+            ).fillna(999.0).values,
+            "coefficient": pd.to_numeric(
+                result.loc[valid_idx, "Коэффициент"],
+                errors="coerce",
+            ).fillna(0.0).values,
+            "weight": weights.values,
+        }).sort_values(
+            ["fraction", "completion_day", "coefficient", "weight"],
+            ascending=[False, True, False, False],
+            kind="stable",
+        )
+
+        allocation = floor_alloc.to_dict()
+        for row_idx in ranking["idx"].tolist()[:remainder]:
+            allocation[row_idx] = int(allocation.get(row_idx, 0)) + 1
+
+        for row_idx in valid_idx:
+            final_plan = int(allocation.get(row_idx, 0))
+            result.at[row_idx, "Новый план"] = final_plan
+            result.at[row_idx, "Доля распределения"] = (
+                (final_plan / total_units) if total_units > 0 else 0.0
+            )
+
+    return result.sort_values(
+        ["Дата плана", "Точка", "Категория", "Новый план", "Название блюда", "SKU"],
+        ascending=[True, True, True, False, True, True],
+        kind="stable",
     ).reset_index(drop=True)
 
 
@@ -17598,10 +17819,11 @@ if tab_cycle_plan.open:
     with tab_cycle_plan:
         st.subheader("Циклический план · сравнение с позапрошлой неделей")
         st.caption(
-            "Каждая дата выбранного периода сравнивается с датой ровно на 14 дней раньше (1↔3, 2↔4). "
-            "Если прошлый план съеден полностью в 1-й день — ×1,5; полностью внутри зелёного окна — ×1,2; "
-            "в серый период или не полностью — без роста, по фактически съеденному количеству. "
-            "Несовпадение SKU/названия блюда подсвечивается красным со статусом «Проверить SKU»."
+            "SKU-приоритет берётся из цикла −14 дней: быстрее съеденные блюда получают больший вес. "
+            "Общий объём категории берётся из фактических продаж после такого же дня неделю назад: "
+            "для Вс–Ср — следующие 3 дня, для Чт — следующие 4 дня. Затем весь этот объём по каждой "
+            "точке и категории распределяется между SKU текущего меню с приоритетом зелёного окна свежести. "
+            "Если SKU отсутствует в меню −14 дней, строка остаётся пустой со статусом «Проверить SKU»."
         )
 
         matrix_bytes, matrix_source, matrix_checked_at, matrix_error = _load_matrix_context_for_active_tab()
@@ -17641,7 +17863,7 @@ if tab_cycle_plan.open:
                         key="cycle_plan_calculate_v1",
                     ):
                         try:
-                            with st.spinner("Считаю план по циклу −14 дней и фактическим продажам…"):
+                            with st.spinner("Считаю приоритет SKU и распределяю факт категории прошлой недели…"):
                                 target_plans = cycle_matrix_plans[cycle_matrix_plans["plan_date"].isin(selected_dates)].copy()
                                 reference_dates = sorted({d - timedelta(days=14) for d in selected_dates})
 
@@ -17672,8 +17894,21 @@ if tab_cycle_plan.open:
                                 max_lifecycle = max(
                                     [product_lifecycle_days(c) for c in target_plans["matrix_category"].dropna().tolist()] or [7]
                                 )
-                                history_from = min(reference_dates) + timedelta(days=1)
-                                history_to = max(reference_dates) + timedelta(days=max_lifecycle + 1)
+                                # Нужно покрыть два независимых окна:
+                                # 1) свежесть SKU после даты -14;
+                                # 2) факт категории после такого же дня неделю назад (-7):
+                                #    3 дня обычно, 4 дня для четверга.
+                                freshness_history_from = min(reference_dates) + timedelta(days=1)
+                                freshness_history_to = max(reference_dates) + timedelta(days=max_lifecycle + 1)
+
+                                category_history_from = min(selected_dates) - timedelta(days=6)
+                                category_history_to = max(
+                                    d - timedelta(days=(2 if d.weekday() == 3 else 3))
+                                    for d in selected_dates
+                                ) + timedelta(days=1)
+
+                                history_from = min(freshness_history_from, category_history_from)
+                                history_to = max(freshness_history_to, category_history_to)
                                 cycle_sales = load_forecast_history(history_from, history_to, points)
 
                                 result = build_cycle_plan_v1(target_plans, reference_plans, cycle_sales)
