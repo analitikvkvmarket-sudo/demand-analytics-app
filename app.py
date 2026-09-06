@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.54-CYCLE-MINIMUM-PLUS-CATEGORY-FACT"
+BUILD_ID = "75.11.55-CYCLE-EXPORT-KEY-FIX"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -10015,7 +10015,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
             name_column = headers.get("Название блюда", 5)
             first = row_group.iloc[0]
             green_days = int(first.get("Зелёное окно, дней", 0) or 0)
-            reference_date = first.get("Дата сравнения", "")
+            reference_date = first.get("Дата сравнения SKU", "")
             sheet.cell(diag_row, category_column).value = f"Окно свежести: {green_days} дн."
             sheet.cell(diag_row, name_column).value = f"Сравнение SKU с {reference_date} · минимум SKU · факт категории -7 · добор · новый план"
             sheet.cell(diag_row, category_column).font = Font(bold=True, color="7F6000")
@@ -10113,7 +10113,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
         del workbook[calculation_name]
     calculation_sheet = workbook.create_sheet(calculation_name)
     calc_rows: list[dict[str, object]] = []
-    group_keys = ["Дата плана", "День недели", "Дата сравнения", "Категория", "SKU", "Название блюда", "Зелёное окно, дней", "Полный срок, дней"]
+    group_keys = ["Дата плана", "День недели", "Дата сравнения SKU", "Категория", "SKU", "Название блюда", "Зелёное окно, дней", "Полный срок, дней"]
     for _, group in work.groupby(group_keys, dropna=False, sort=False):
         first = group.iloc[0]
         output_row = {key: first.get(key) for key in group_keys}
