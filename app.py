@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.50-CYCLE-CATEGORY-FACT-V2"
+BUILD_ID = "75.11.51-CYCLE-FULL-REFERENCE-CATEGORIES"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -9255,6 +9255,7 @@ def build_cycle_plan_v1(
     target_plans: pd.DataFrame,
     reference_plans: pd.DataFrame,
     sales: pd.DataFrame,
+    entities: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Циклический план V2.
 
@@ -9338,15 +9339,39 @@ def build_cycle_plan_v1(
             keep="last",
         )
 
-    # SKU -> category. Current target menu has priority, reference menu fills history.
+    # Полная карта SKU -> Категория.
+    # Главный источник — актуальный лист «Справочник».
+    # Меню используется только как резерв для SKU, которых ещё нет в справочнике.
     sku_category_map: dict[str, str] = {}
+
+    entity_frame = entities.copy() if isinstance(entities, pd.DataFrame) else pd.DataFrame()
+    if not entity_frame.empty and {"sku", "category"}.issubset(entity_frame.columns):
+        entity_frame["sku"] = entity_frame["sku"].map(normalize_sku)
+        entity_frame["category"] = entity_frame["category"].map(normalize_matrix_category)
+        entity_frame = entity_frame[
+            entity_frame["sku"].notna()
+            & entity_frame["category"].fillna("").astype(str).str.strip().ne("")
+            & entity_frame["category"].fillna("").astype(str).ne("Не сопоставлено")
+        ].drop_duplicates("sku", keep="last")
+
+        for sku, category in entity_frame[["sku", "category"]].itertuples(index=False, name=None):
+            normalized_sku = normalize_sku(sku)
+            normalized_category = normalize_matrix_category(category)
+            if normalized_sku and normalized_category:
+                sku_category_map[str(normalized_sku)] = normalized_category
+
+    # Резерв: если SKU нет в «Справочнике», пробуем категорию из меню.
     for frame in (reference, target):
         if frame.empty:
             continue
         for sku, category in frame[["sku", "matrix_category"]].itertuples(index=False, name=None):
             normalized_sku = normalize_sku(sku)
             normalized_category = normalize_matrix_category(category)
-            if normalized_sku and normalized_category:
+            if (
+                normalized_sku
+                and normalized_category
+                and str(normalized_sku) not in sku_category_map
+            ):
                 sku_category_map[str(normalized_sku)] = normalized_category
 
     if sold.empty:
@@ -17820,7 +17845,7 @@ if tab_cycle_plan.open:
         st.subheader("Циклический план · сравнение с позапрошлой неделей")
         st.caption(
             "SKU-приоритет берётся из цикла −14 дней: быстрее съеденные блюда получают больший вес. "
-            "Общий объём категории берётся из фактических продаж после такого же дня неделю назад: "
+            "Общий объём категории собирается по всем проданным SKU через полный лист «Справочник» и берётся из фактических продаж после такого же дня неделю назад: "
             "для Вс–Ср — следующие 3 дня, для Чт — следующие 4 дня. Затем весь этот объём по каждой "
             "точке и категории распределяется между SKU текущего меню с приоритетом зелёного окна свежести. "
             "Если SKU отсутствует в меню −14 дней, строка остаётся пустой со статусом «Проверить SKU»."
@@ -17911,10 +17936,21 @@ if tab_cycle_plan.open:
                                 history_to = max(freshness_history_to, category_history_to)
                                 cycle_sales = load_forecast_history(history_from, history_to, points)
 
-                                result = build_cycle_plan_v1(target_plans, reference_plans, cycle_sales)
+                                cycle_entities, cycle_entity_source, cycle_entity_checked_at, cycle_entity_error, _ = (
+                                    get_current_entity_reference()
+                                )
+
+                                result = build_cycle_plan_v1(
+                                    target_plans,
+                                    reference_plans,
+                                    cycle_sales,
+                                    entities=cycle_entities,
+                                )
                                 st.session_state["cycle_plan_result_v1"] = result
                                 st.session_state["cycle_plan_period_saved_v1"] = (cycle_start, cycle_end)
                                 st.session_state["cycle_plan_archive_error_v1"] = archive_error
+                                st.session_state["cycle_plan_entity_source_v2"] = cycle_entity_source
+                                st.session_state["cycle_plan_entity_error_v2"] = cycle_entity_error
                         except Exception as error:
                             st.error(f"Не удалось рассчитать циклический план: {error}")
 
@@ -17927,6 +17963,19 @@ if tab_cycle_plan.open:
                         archive_error = st.session_state.get("cycle_plan_archive_error_v1", "")
                         if archive_error:
                             st.warning(f"Часть дат сравнения не получена из архива: {archive_error}")
+
+                        cycle_entity_source = st.session_state.get("cycle_plan_entity_source_v2", "")
+                        cycle_entity_error = st.session_state.get("cycle_plan_entity_error_v2", "")
+                        if cycle_entity_source:
+                            st.caption(
+                                "Категории фактических продаж собраны по полному справочнику SKU: "
+                                f"{cycle_entity_source}."
+                            )
+                        if cycle_entity_error:
+                            st.warning(
+                                "При обновлении справочника была ошибка; мог использоваться резерв: "
+                                f"{cycle_entity_error}"
+                            )
 
                         metrics = st.columns(5)
                         metrics[0].metric("Дат", int(result["Дата плана"].nunique()))
