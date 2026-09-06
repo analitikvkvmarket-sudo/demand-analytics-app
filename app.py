@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.53-CYCLE-PLAN-FACT-TREND"
+BUILD_ID = "75.11.54-CYCLE-MINIMUM-PLUS-CATEGORY-FACT"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -9275,49 +9275,73 @@ def build_cycle_plan_v1(
     sales: pd.DataFrame,
     entities: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Циклический план V3: план + факт SKU + недельный тренд категории.
+    """Циклический план V4: минимальный SKU + добор до факта категории.
 
-    Для конкретного SKU сравниваем одинаковый цикл меню через 14 дней (1↔3, 2↔4).
-    Общий спрос категории оцениваем каждую неделю, потому что категория сохраняется,
-    даже когда набор SKU меняется.
+    Бизнес-логика:
 
-    K_SKU:
-      • весь прошлый план съеден в День 1 -> 1.50;
-      • весь план съеден к концу Дня 2 и День 2 ещё зелёный -> 1.20;
-      • весь план съеден внутри более длинного зелёного окна -> 1.00;
-      • реализовано 70–99% прошлого плана -> 0.90;
-      • реализовано 50–69% -> 0.80;
-      • реализовано <50% -> 0.70.
+    1. Текущий SKU сравнивается с таким же SKU ровно 14 дней назад
+       (цикл меню 1↔3 и 2↔4).
 
-    K_КАТЕГОРИИ:
-      факт категории в День 1 после поставки неделю назад / факт категории
-      в День 1 после поставки две недели назад. Коэффициент ограничен 0.90–1.15.
+    2. Для SKU рассчитывается МИНИМАЛЬНОЕ значение нового плана:
+       - прошлый план съеден полностью в День 1 -> ceil(план × 1.50);
+       - прошлый план съеден полностью в День 2 -> ceil(план × 1.20);
+       - прошлый план съеден полностью в День 3 или позже -> прошлый план × 1.00;
+       - прошлый план НЕ съеден полностью -> ceil(фактически съедено).
+       Это именно нижняя граница: при дальнейшем распределении SKU не уменьшается ниже неё.
 
-    Прогноз категории на новый цикл = последний факт День 1 × K_КАТЕГОРИИ.
-    Этот объём распределяется между SKU текущего меню пропорционально
-    (прошлый план SKU × K_SKU), с защитой роста SKU не выше +50% за цикл.
+    3. Целевой объём категории берётся из ФАКТА предыдущего такого же дня меню,
+       то есть из меню ровно 7 дней назад. Для каждого SKU того меню считаем,
+       сколько реально съедено из его плановой партии в пределах срока жизни,
+       но не больше его планового количества. Суммируем по точке и категории.
+
+       Пример:
+       прошлое воскресенье:
+       пирожок: план 7, съедено 7
+       булка:    план 10, съедено 10
+       факт категории = 17.
+
+    4. Для текущего меню сначала ставим минимумы SKU.
+       Если сумма минимумов меньше факта категории прошлой недели, оставшееся
+       количество распределяем между SKU текущего меню пропорционально их
+       плановым значениям из цикла -14 дней.
+
+       Пример:
+       пирог:  план -14 = 8, съедено 4 -> минимум 4
+       вафля:  план -14 = 6, съедено полностью за 2 дня
+               -> ceil(6 × 1.20) = 8
+       минимум категории = 12
+       факт категории прошлой недели = 17
+       остаток = 5
+       остаток делится по весам прошлых планов 8:6.
+
+    5. Если сумма минимумов уже выше факта категории прошлой недели,
+       минимумы НЕ урезаются: скорость реализации конкретных SKU имеет приоритет.
+
+    6. SKU, которого нет в сопоставимом меню -14 дней, не рассчитывается:
+       «Проверить SKU».
     """
     columns = [
         "Дата плана",
         "День недели",
-        "Дата сравнения",
+        "Дата сравнения SKU",
+        "Дата прошлого меню категории",
         "Точка",
         "SKU",
         "Название блюда",
         "Категория",
-        "Прошлый план",
+        "Прошлый план SKU",
         "Факт SKU за срок",
         "Реализация SKU, %",
         "Зелёное окно, дней",
         "Полный срок, дней",
         "День полного съедания",
         "K SKU",
-        "База SKU",
-        "Категория факт -14, шт.",
-        "Категория факт -7, шт.",
-        "K категории",
-        "Прогноз категории, шт.",
-        "Доля SKU",
+        "Минимум SKU",
+        "Факт категории прошлой недели, шт.",
+        "Сумма минимумов категории, шт.",
+        "Остаток к распределению, шт.",
+        "Вес добора SKU",
+        "Добор SKU",
         "Новый план",
         "Статус",
     ]
@@ -9358,7 +9382,7 @@ def build_cycle_plan_v1(
             ["plan_date", "point_number", "sku"], keep="last"
         )
 
-    # Полная карта SKU -> Категория из актуального «Справочника».
+    # Полная карта SKU -> категория из актуального «Справочника».
     sku_category_map: dict[str, str] = {}
     entity_frame = entities.copy() if isinstance(entities, pd.DataFrame) else pd.DataFrame()
     if not entity_frame.empty and {"sku", "category"}.issubset(entity_frame.columns):
@@ -9370,20 +9394,23 @@ def build_cycle_plan_v1(
             & entity_frame["category"].fillna("").astype(str).ne("Не сопоставлено")
         ].drop_duplicates("sku", keep="last")
         for sku, category in entity_frame[["sku", "category"]].itertuples(index=False, name=None):
-            sku_category_map[str(sku)] = category
+            sku_category_map[str(sku)] = normalize_matrix_category(category)
 
-    # Резерв категории из меню, если SKU ещё нет в справочнике.
+    # Резерв категории из меню.
     for frame in (reference, target):
         if frame.empty:
             continue
         for sku, category in frame[["sku", "matrix_category"]].itertuples(index=False, name=None):
-            normalized_sku = normalize_sku(sku)
-            normalized_category = normalize_matrix_category(category)
-            if normalized_sku and normalized_category and str(normalized_sku) not in sku_category_map:
-                sku_category_map[str(normalized_sku)] = normalized_category
+            norm_sku = normalize_sku(sku)
+            norm_category = normalize_matrix_category(category)
+            if norm_sku and norm_category and str(norm_sku) not in sku_category_map:
+                sku_category_map[str(norm_sku)] = norm_category
 
+    # Фактические продажи.
     if sold.empty:
-        sold = pd.DataFrame(columns=["business_date", "shop_number", "sku", "sold_quantity", "cycle_category"])
+        sold = pd.DataFrame(
+            columns=["business_date", "shop_number", "sku", "sold_quantity", "cycle_category"]
+        )
     else:
         sold["business_date"] = pd.to_datetime(sold["business_date"], errors="coerce").dt.date
         sold["shop_number"] = pd.to_numeric(sold["shop_number"], errors="coerce")
@@ -9397,20 +9424,27 @@ def build_cycle_plan_v1(
             & sold["sku"].notna()
         ].copy()
         sold["shop_number"] = sold["shop_number"].astype(int)
-        sold["cycle_category"] = sold["sku"].map(lambda value: sku_category_map.get(str(value), ""))
+        sold["cycle_category"] = sold["sku"].map(
+            lambda value: sku_category_map.get(str(value), "")
+        )
 
+    # Плановые строки по дате/точке/SKU.
     ref_lookup = {
         (row.plan_date, int(row.point_number), str(row.sku)): row
         for row in reference.itertuples(index=False)
     } if not reference.empty else {}
 
-    ref_sku_lookup = {}
+    # Наличие SKU на дате независимо от точки.
+    ref_sku_lookup: dict[tuple[date, str], object] = {}
     if not reference.empty:
-        for (plan_date, sku), group in reference.groupby(["plan_date", "sku"], dropna=False, sort=False):
+        for (plan_date, sku), group in reference.groupby(
+            ["plan_date", "sku"], dropna=False, sort=False
+        ):
             if pd.isna(plan_date) or not sku:
                 continue
             ref_sku_lookup[(plan_date, str(sku))] = group.iloc[-1]
 
+    # Дневной факт SKU по точке.
     sales_lookup: dict[tuple[int, str], pd.DataFrame] = {}
     if not sold.empty:
         for (shop, sku), group in sold.groupby(["shop_number", "sku"], sort=False):
@@ -9420,153 +9454,211 @@ def build_cycle_plan_v1(
                 .sort_values("business_date")
             )
 
-    category_daily_lookup: dict[tuple[date, int, str], float] = {}
-    if not sold.empty:
-        category_sales = sold[sold["cycle_category"].astype(str).str.strip().ne("")].copy()
-        if not category_sales.empty:
-            grouped = category_sales.groupby(
-                ["business_date", "shop_number", "cycle_category"], as_index=False
-            )["sold_quantity"].sum()
-            category_daily_lookup = {
-                (row.business_date, int(row.shop_number), str(row.cycle_category)): float(row.sold_quantity)
-                for row in grouped.itertuples(index=False)
-            }
+    def _batch_consumption(
+        plan_date: date,
+        point_number: int,
+        sku: str,
+        category: str,
+        plan_qty: float,
+    ) -> tuple[float, int | None]:
+        """Факт конкретной плановой партии: не больше её планового количества."""
+        plan_qty = max(0.0, float(plan_qty or 0.0))
+        if plan_qty <= 0:
+            return 0.0, None
 
+        lifecycle_days = int(product_lifecycle_days(category))
+        sku_sales = sales_lookup.get((point_number, str(sku)), pd.DataFrame())
+
+        if sku_sales.empty:
+            daily_values = [0.0] * lifecycle_days
+        else:
+            daily = pd.DataFrame({
+                "business_date": [
+                    plan_date + timedelta(days=day_number)
+                    for day_number in range(1, lifecycle_days + 1)
+                ]
+            }).merge(
+                sku_sales[
+                    sku_sales["business_date"].between(
+                        plan_date + timedelta(days=1),
+                        plan_date + timedelta(days=lifecycle_days),
+                        inclusive="both",
+                    )
+                ],
+                on="business_date",
+                how="left",
+            )
+            daily["sold_quantity"] = pd.to_numeric(
+                daily["sold_quantity"], errors="coerce"
+            ).fillna(0.0).clip(lower=0)
+            daily_values = [float(value) for value in daily["sold_quantity"].tolist()]
+
+        total_consumed = min(plan_qty, sum(daily_values))
+
+        completion_day = None
+        cumulative = 0.0
+        for day_number, qty in enumerate(daily_values, start=1):
+            cumulative += qty
+            if cumulative + 1e-9 >= plan_qty:
+                completion_day = day_number
+                break
+
+        return total_consumed, completion_day
+
+    # ------------------------------------------------------------------
+    # Целевой факт категории по прошлому меню (-7 дней).
+    # Для каждого SKU прошлого меню считаем фактически съеденную часть партии.
+    # ------------------------------------------------------------------
+    category_fact_lookup: dict[tuple[date, int, str], float] = {}
+
+    if not reference.empty:
+        previous_week_rows = reference.copy()
+        previous_week_rows["matrix_category"] = previous_week_rows["matrix_category"].map(
+            normalize_matrix_category
+        )
+
+        # Берём только те даты -7, которые реально нужны текущему выбранному меню.
+        required_previous_dates = {
+            value - timedelta(days=7)
+            for value in target["plan_date"].dropna().tolist()
+        }
+        previous_week_rows = previous_week_rows[
+            previous_week_rows["plan_date"].isin(required_previous_dates)
+        ].copy()
+
+        for item in previous_week_rows.itertuples(index=False):
+            plan_date = item.plan_date
+            point_number = int(item.point_number)
+            sku = str(item.sku)
+            category = normalize_matrix_category(item.matrix_category)
+            plan_qty = max(0.0, float(item.analyst_plan or 0.0))
+
+            consumed_qty, _ = _batch_consumption(
+                plan_date,
+                point_number,
+                sku,
+                category,
+                plan_qty,
+            )
+
+            key = (plan_date, point_number, category)
+            category_fact_lookup[key] = category_fact_lookup.get(key, 0.0) + consumed_qty
+
+    # ------------------------------------------------------------------
+    # Первый проход: рассчитываем МИНИМУМ каждого текущего SKU по циклу -14.
+    # ------------------------------------------------------------------
     rows: list[dict[str, object]] = []
 
     for item in target.sort_values(
-        ["plan_date", "point_number", "matrix_category", "product_name"], kind="stable"
+        ["plan_date", "point_number", "matrix_category", "product_name"],
+        kind="stable",
     ).itertuples(index=False):
         target_date = item.plan_date
-        reference_date = target_date - timedelta(days=14)
-        recent_category_plan_date = target_date - timedelta(days=7)
-        previous_category_plan_date = target_date - timedelta(days=14)
-        recent_category_fact_date = recent_category_plan_date + timedelta(days=1)
-        previous_category_fact_date = previous_category_plan_date + timedelta(days=1)
+        sku_reference_date = target_date - timedelta(days=14)
+        category_reference_date = target_date - timedelta(days=7)
 
         point_number = int(item.point_number)
         sku = str(item.sku)
         category = normalize_matrix_category(item.matrix_category)
         name = str(item.product_name or "").strip()
+
         green_days = int(product_green_days(category))
         lifecycle_days = int(product_lifecycle_days(category))
-
-        category_fact_previous = float(category_daily_lookup.get(
-            (previous_category_fact_date, point_number, category), 0.0
-        ))
-        category_fact_recent = float(category_daily_lookup.get(
-            (recent_category_fact_date, point_number, category), 0.0
-        ))
-
-        if category_fact_previous > 0:
-            raw_category_k = category_fact_recent / category_fact_previous
-            category_k = min(1.15, max(0.90, raw_category_k))
-        else:
-            category_k = 1.0
-
-        category_forecast = max(0, int(round(category_fact_recent * category_k)))
+        category_fact = float(
+            category_fact_lookup.get(
+                (category_reference_date, point_number, category),
+                0.0,
+            )
+        )
 
         row = {
             "Дата плана": target_date,
             "День недели": WEEKDAY_RU.get(target_date.weekday(), ""),
-            "Дата сравнения": reference_date,
+            "Дата сравнения SKU": sku_reference_date,
+            "Дата прошлого меню категории": category_reference_date,
             "Точка": f"Т{point_number}",
             "SKU": sku,
             "Название блюда": name,
             "Категория": category,
-            "Прошлый план": pd.NA,
+            "Прошлый план SKU": pd.NA,
             "Факт SKU за срок": pd.NA,
             "Реализация SKU, %": pd.NA,
             "Зелёное окно, дней": green_days,
             "Полный срок, дней": lifecycle_days,
             "День полного съедания": pd.NA,
             "K SKU": pd.NA,
-            "База SKU": pd.NA,
-            "Категория факт -14, шт.": category_fact_previous,
-            "Категория факт -7, шт.": category_fact_recent,
-            "K категории": category_k,
-            "Прогноз категории, шт.": category_forecast,
-            "Доля SKU": pd.NA,
+            "Минимум SKU": pd.NA,
+            "Факт категории прошлой недели, шт.": category_fact,
+            "Сумма минимумов категории, шт.": pd.NA,
+            "Остаток к распределению, шт.": pd.NA,
+            "Вес добора SKU": pd.NA,
+            "Добор SKU": pd.NA,
             "Новый план": pd.NA,
             "Статус": "",
         }
 
-        if ref_sku_lookup.get((reference_date, sku)) is None:
+        if ref_sku_lookup.get((sku_reference_date, sku)) is None:
             row["Статус"] = "Проверить SKU"
             rows.append(row)
             continue
 
-        previous = ref_lookup.get((reference_date, point_number, sku))
+        previous = ref_lookup.get((sku_reference_date, point_number, sku))
         previous_plan = 0.0 if previous is None else max(
-            0.0, float(getattr(previous, "analyst_plan", 0.0) or 0.0)
+            0.0,
+            float(getattr(previous, "analyst_plan", 0.0) or 0.0),
         )
-        row["Прошлый план"] = previous_plan
+        row["Прошлый план SKU"] = previous_plan
 
-        first_sale_date = reference_date + timedelta(days=1)
-        last_sale_date = reference_date + timedelta(days=lifecycle_days)
-        sku_sales = sales_lookup.get((point_number, sku), pd.DataFrame())
-        all_dates = pd.DataFrame({
-            "business_date": [reference_date + timedelta(days=i) for i in range(1, lifecycle_days + 1)]
-        })
-        if sku_sales.empty:
-            daily = all_dates.copy()
-            daily["sold_quantity"] = 0.0
-        else:
-            daily = all_dates.merge(
-                sku_sales[sku_sales["business_date"].between(first_sale_date, last_sale_date, inclusive="both")],
-                on="business_date",
-                how="left",
-            )
-            daily["sold_quantity"] = pd.to_numeric(daily["sold_quantity"], errors="coerce").fillna(0.0).clip(lower=0)
+        consumed, completion_day = _batch_consumption(
+            sku_reference_date,
+            point_number,
+            sku,
+            category,
+            previous_plan,
+        )
+        realization_ratio = (
+            consumed / previous_plan
+            if previous_plan > 0
+            else 0.0
+        )
 
-        total_sales = float(daily["sold_quantity"].sum())
-        consumed = min(previous_plan, total_sales) if previous_plan > 0 else 0.0
-        realization_ratio = (consumed / previous_plan) if previous_plan > 0 else 0.0
-
-        completion_day = None
-        if previous_plan > 0:
-            cumulative = 0.0
-            for day_num, qty in enumerate(daily["sold_quantity"].tolist(), start=1):
-                cumulative += float(qty)
-                if cumulative + 1e-9 >= previous_plan:
-                    completion_day = day_num
-                    break
-
+        # Минимум SKU.
         if previous_plan <= 0:
-            sku_k = 0.70
-            sku_base = 0.0
-            status = "Прошлый план = 0"
+            sku_k = 1.0
+            minimum = 0
+            status = "Прошлый план SKU = 0"
+        elif consumed + 1e-9 < previous_plan:
+            sku_k = 1.0
+            minimum = int(math.ceil(consumed))
+            status = (
+                f"Не съеден полностью · факт {consumed:g} из {previous_plan:g} "
+                f"→ минимум по факту"
+            )
         elif completion_day == 1:
             sku_k = 1.50
-            sku_base = previous_plan * sku_k
-            status = "100% в День 1 · рост до +50%"
-        elif completion_day is not None and completion_day <= min(2, green_days):
+            minimum = int(math.ceil(previous_plan * sku_k))
+            status = "Съеден полностью в День 1 · минимум ×1.5"
+        elif completion_day == 2:
             sku_k = 1.20
-            sku_base = previous_plan * sku_k
-            status = f"100% за {completion_day} дня · рост +20%"
-        elif completion_day is not None and completion_day <= green_days:
-            sku_k = 1.00
-            sku_base = previous_plan
-            status = f"100% в зелёное окно · день {completion_day}"
-        elif realization_ratio >= 0.70:
-            sku_k = 0.90
-            sku_base = previous_plan * sku_k
-            status = f"Реализация {realization_ratio:.0%} · снижение 10%"
-        elif realization_ratio >= 0.50:
-            sku_k = 0.80
-            sku_base = previous_plan * sku_k
-            status = f"Реализация {realization_ratio:.0%} · снижение 20%"
+            minimum = int(math.ceil(previous_plan * sku_k))
+            status = "Съеден полностью в День 2 · минимум ×1.2"
         else:
-            sku_k = 0.70
-            sku_base = previous_plan * sku_k
-            status = f"Реализация {realization_ratio:.0%} · снижение 30%"
+            # День 3 и любой более поздний день: роста нет.
+            sku_k = 1.00
+            minimum = int(math.ceil(previous_plan))
+            day_text = completion_day if completion_day is not None else "?"
+            status = f"Съеден полностью в День {day_text} · минимум ×1.0"
 
         row.update({
             "Факт SKU за срок": consumed,
             "Реализация SKU, %": realization_ratio,
-            "День полного съедания": completion_day if completion_day is not None else pd.NA,
+            "День полного съедания": (
+                completion_day if completion_day is not None else pd.NA
+            ),
             "K SKU": sku_k,
-            "База SKU": float(sku_base),
+            "Минимум SKU": int(minimum),
+            # Вес ДОБОРА — исходный исторический план этого SKU.
+            "Вес добора SKU": float(previous_plan),
             "Статус": status,
         })
         rows.append(row)
@@ -9575,71 +9667,92 @@ def build_cycle_plan_v1(
     if result.empty:
         return result
 
-    # Итоговый объём категории = прогноз однодневного спроса категории.
-    # Распределяем его между SKU текущего меню по базе (прошлый план × K SKU).
+    # ------------------------------------------------------------------
+    # Второй проход: добираем категорию до факта прошлой недели.
+    # Минимумы не уменьшаем.
+    # ------------------------------------------------------------------
     group_columns = ["Дата плана", "Точка", "Категория"]
+
     for _, index_values in result.groupby(group_columns, sort=False).groups.items():
         group_idx = list(index_values)
         valid_idx = [
-            idx for idx in group_idx
+            idx
+            for idx in group_idx
             if str(result.at[idx, "Статус"] or "") != "Проверить SKU"
         ]
         if not valid_idx:
             continue
 
-        category_forecast = int(max(0, round(float(pd.to_numeric(
-            result.loc[valid_idx, "Прогноз категории, шт."], errors="coerce"
-        ).fillna(0).max()))))
+        category_fact = float(
+            pd.to_numeric(
+                result.loc[valid_idx, "Факт категории прошлой недели, шт."],
+                errors="coerce",
+            )
+            .fillna(0.0)
+            .max()
+        )
+        category_target = max(0, int(round(category_fact)))
 
-        weights = pd.to_numeric(result.loc[valid_idx, "База SKU"], errors="coerce").fillna(0.0).clip(lower=0)
-        if float(weights.sum()) <= 0 or category_forecast <= 0:
-            for idx in valid_idx:
-                result.at[idx, "Новый план"] = 0
-                result.at[idx, "Доля SKU"] = 0.0
-            continue
+        minimums = pd.to_numeric(
+            result.loc[valid_idx, "Минимум SKU"],
+            errors="coerce",
+        ).fillna(0.0).clip(lower=0).astype(int)
 
-        raw = weights / float(weights.sum()) * category_forecast
-
-        # Защита от скачков: отдельный SKU не растёт более чем на 50% относительно
-        # его прошлого плана. Снижение уже заложено в K SKU.
-        caps = {}
-        for idx in valid_idx:
-            previous_plan = float(pd.to_numeric(pd.Series([result.at[idx, "Прошлый план"]]), errors="coerce").fillna(0).iloc[0])
-            caps[idx] = max(0, int(math.ceil(previous_plan * 1.50))) if previous_plan > 0 else 0
-
-        allocation = {idx: min(int(math.floor(float(raw.loc[idx]))), caps[idx]) for idx in valid_idx}
-        remaining = category_forecast - sum(allocation.values())
-
-        # Дораспределяем остаток по наибольшей дробной части и более сильному SKU,
-        # но не выходим за индивидуальный потолок +50%.
-        while remaining > 0:
-            candidates = []
-            for idx in valid_idx:
-                if allocation[idx] >= caps[idx]:
-                    continue
-                fraction = float(raw.loc[idx]) - math.floor(float(raw.loc[idx]))
-                sku_k = float(pd.to_numeric(pd.Series([result.at[idx, "K SKU"]]), errors="coerce").fillna(0).iloc[0])
-                completion = pd.to_numeric(pd.Series([result.at[idx, "День полного съедания"]]), errors="coerce").iloc[0]
-                completion_sort = 999 if pd.isna(completion) else int(completion)
-                candidates.append((fraction, sku_k, -completion_sort, float(weights.loc[idx]), idx))
-            if not candidates:
-                break
-            candidates.sort(reverse=True)
-            progressed = False
-            for *_sort, idx in candidates:
-                if remaining <= 0:
-                    break
-                if allocation[idx] < caps[idx]:
-                    allocation[idx] += 1
-                    remaining -= 1
-                    progressed = True
-            if not progressed:
-                break
+        minimum_sum = int(minimums.sum())
+        remainder = max(0, category_target - minimum_sum)
 
         for idx in valid_idx:
-            final_plan = int(allocation.get(idx, 0))
-            result.at[idx, "Новый план"] = final_plan
-            result.at[idx, "Доля SKU"] = final_plan / category_forecast if category_forecast > 0 else 0.0
+            result.at[idx, "Сумма минимумов категории, шт."] = minimum_sum
+            result.at[idx, "Остаток к распределению, шт."] = remainder
+
+        # Итог начинается с обязательного минимума.
+        allocation = {idx: int(minimums.loc[idx]) for idx in valid_idx}
+        extra = {idx: 0 for idx in valid_idx}
+
+        if remainder > 0:
+            weights = pd.to_numeric(
+                result.loc[valid_idx, "Вес добора SKU"],
+                errors="coerce",
+            ).fillna(0.0).clip(lower=0)
+
+            # Если исторические планы нулевые, остаток делим равномерно.
+            if float(weights.sum()) <= 0:
+                weights = pd.Series(1.0, index=valid_idx, dtype=float)
+
+            raw_extra = weights / float(weights.sum()) * remainder
+            floor_extra = raw_extra.apply(math.floor).astype(int)
+            left = int(remainder - floor_extra.sum())
+
+            for idx in valid_idx:
+                extra[idx] = int(floor_extra.loc[idx])
+
+            # Метод наибольшего остатка.
+            ranking = pd.DataFrame({
+                "idx": valid_idx,
+                "fraction": [
+                    float(raw_extra.loc[idx] - floor_extra.loc[idx])
+                    for idx in valid_idx
+                ],
+                "weight": [float(weights.loc[idx]) for idx in valid_idx],
+                "completion_day": [
+                    999
+                    if pd.isna(result.at[idx, "День полного съедания"])
+                    else int(result.at[idx, "День полного съедания"])
+                    for idx in valid_idx
+                ],
+            }).sort_values(
+                ["fraction", "weight", "completion_day"],
+                ascending=[False, False, True],
+                kind="stable",
+            )
+
+            for idx in ranking["idx"].tolist()[:left]:
+                extra[idx] += 1
+
+        for idx in valid_idx:
+            allocation[idx] += int(extra[idx])
+            result.at[idx, "Добор SKU"] = int(extra[idx])
+            result.at[idx, "Новый план"] = int(allocation[idx])
 
     return result.sort_values(
         ["Дата плана", "Точка", "Категория", "Новый план", "Название блюда", "SKU"],
@@ -9830,7 +9943,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                         target_cell.value = None
                         continue
                     target_cell.value = int(new_plan)
-                    previous_plan = pd.to_numeric(pd.Series([record.get("Прошлый план")]), errors="coerce").iloc[0]
+                    previous_plan = pd.to_numeric(pd.Series([record.get("Прошлый план SKU")]), errors="coerce").iloc[0]
                     consumed = pd.to_numeric(pd.Series([record.get("Факт SKU за срок")]), errors="coerce").iloc[0]
                     coefficient = pd.to_numeric(pd.Series([record.get("K SKU")]), errors="coerce").iloc[0]
                     completion = record.get("День полного съедания")
@@ -9904,7 +10017,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
             green_days = int(first.get("Зелёное окно, дней", 0) or 0)
             reference_date = first.get("Дата сравнения", "")
             sheet.cell(diag_row, category_column).value = f"Окно свежести: {green_days} дн."
-            sheet.cell(diag_row, name_column).value = f"Сравнение с {reference_date} · план→факт SKU · K SKU · тренд категории · новый план"
+            sheet.cell(diag_row, name_column).value = f"Сравнение SKU с {reference_date} · минимум SKU · факт категории -7 · добор · новый план"
             sheet.cell(diag_row, category_column).font = Font(bold=True, color="7F6000")
             sheet.cell(diag_row, name_column).font = Font(bold=True, color="1F4E78")
 
@@ -9927,23 +10040,57 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                         "Циклический план",
                     )
                 else:
-                    previous_plan = pd.to_numeric(pd.Series([record.get("Прошлый план")]), errors="coerce").iloc[0]
-                    consumed = pd.to_numeric(pd.Series([record.get("Факт SKU за срок")]), errors="coerce").iloc[0]
-                    sku_k = pd.to_numeric(pd.Series([record.get("K SKU")]), errors="coerce").iloc[0]
-                    category_prev = pd.to_numeric(pd.Series([record.get("Категория факт -14, шт.")]), errors="coerce").iloc[0]
-                    category_recent = pd.to_numeric(pd.Series([record.get("Категория факт -7, шт.")]), errors="coerce").iloc[0]
-                    category_k = pd.to_numeric(pd.Series([record.get("K категории")]), errors="coerce").iloc[0]
-                    new_plan = pd.to_numeric(pd.Series([record.get("Новый план")]), errors="coerce").iloc[0]
+                    previous_plan = pd.to_numeric(
+                        pd.Series([record.get("Прошлый план SKU")]),
+                        errors="coerce",
+                    ).iloc[0]
+                    consumed = pd.to_numeric(
+                        pd.Series([record.get("Факт SKU за срок")]),
+                        errors="coerce",
+                    ).iloc[0]
+                    sku_k = pd.to_numeric(
+                        pd.Series([record.get("K SKU")]),
+                        errors="coerce",
+                    ).iloc[0]
+                    minimum = pd.to_numeric(
+                        pd.Series([record.get("Минимум SKU")]),
+                        errors="coerce",
+                    ).iloc[0]
+                    category_fact = pd.to_numeric(
+                        pd.Series([record.get("Факт категории прошлой недели, шт.")]),
+                        errors="coerce",
+                    ).iloc[0]
+                    minimum_sum = pd.to_numeric(
+                        pd.Series([record.get("Сумма минимумов категории, шт.")]),
+                        errors="coerce",
+                    ).iloc[0]
+                    remainder = pd.to_numeric(
+                        pd.Series([record.get("Остаток к распределению, шт.")]),
+                        errors="coerce",
+                    ).iloc[0]
+                    extra = pd.to_numeric(
+                        pd.Series([record.get("Добор SKU")]),
+                        errors="coerce",
+                    ).iloc[0]
+                    new_plan = pd.to_numeric(
+                        pd.Series([record.get("Новый план")]),
+                        errors="coerce",
+                    ).iloc[0]
+
                     prev_text = "-" if pd.isna(previous_plan) else f"{float(previous_plan):g}"
                     eaten_text = "-" if pd.isna(consumed) else f"{float(consumed):g}"
                     sku_k_text = "-" if pd.isna(sku_k) else f"×{float(sku_k):g}"
-                    cat_prev_text = "-" if pd.isna(category_prev) else f"{float(category_prev):g}"
-                    cat_recent_text = "-" if pd.isna(category_recent) else f"{float(category_recent):g}"
-                    cat_k_text = "-" if pd.isna(category_k) else f"×{float(category_k):.2f}"
+                    minimum_text = "-" if pd.isna(minimum) else f"{int(minimum)}"
+                    category_text = "-" if pd.isna(category_fact) else f"{float(category_fact):g}"
+                    min_sum_text = "-" if pd.isna(minimum_sum) else f"{int(minimum_sum)}"
+                    remainder_text = "-" if pd.isna(remainder) else f"{int(remainder)}"
+                    extra_text = "-" if pd.isna(extra) else f"+{int(extra)}"
                     new_text = "-" if pd.isna(new_plan) else f"{int(new_plan)}"
+
                     sheet.cell(diag_row, point_column).value = (
-                        f"{prev_text}→{eaten_text} {sku_k_text} | "
-                        f"кат {cat_prev_text}→{cat_recent_text} {cat_k_text} | {new_text}"
+                        f"{prev_text}→{eaten_text} {sku_k_text} = min {minimum_text} | "
+                        f"кат факт {category_text}; minΣ {min_sum_text}; ост {remainder_text} | "
+                        f"{extra_text} → {new_text}"
                     )
                     sheet.cell(diag_row, point_column).alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
@@ -9973,7 +10120,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
         total_new_plan = 0
         for _, record in group.sort_values("Точка", key=lambda s: s.map(_archive_point_sort_key)).iterrows():
             point = str(record.get("Точка", ""))
-            output_row[f"Прошлый план {point}"] = record.get("Прошлый план")
+            output_row[f"Прошлый план {point}"] = record.get("Прошлый план SKU")
             output_row[f"Съедено {point}"] = record.get("Факт SKU за срок")
             output_row[f"Коэф. {point}"] = record.get("K SKU")
             output_row[f"Новый план {point}"] = record.get("Новый план")
@@ -17908,13 +18055,36 @@ if tab_cycle_plan.open:
                         key="cycle_plan_calculate_v1",
                     ):
                         try:
-                            with st.spinner("Считаю план по факту SKU и недельному тренду категории…"):
-                                target_plans = cycle_matrix_plans[cycle_matrix_plans["plan_date"].isin(selected_dates)].copy()
-                                reference_dates = sorted({d - timedelta(days=14) for d in selected_dates})
+                            with st.spinner("Считаю минимумы SKU и добираю до факта категории прошлого меню…"):
+                                target_plans = cycle_matrix_plans[
+                                    cycle_matrix_plans["plan_date"].isin(selected_dates)
+                                ].copy()
 
-                                current_reference = cycle_matrix_plans[cycle_matrix_plans["plan_date"].isin(reference_dates)].copy()
-                                current_dates = set(current_reference["plan_date"].dropna().tolist())
-                                missing_dates = [d for d in reference_dates if d not in current_dates]
+                                # Для расчёта нужны две группы меню:
+                                # -14 дней: тот же SKU по циклу 1↔3 / 2↔4;
+                                # -7 дней: фактический объём категории прошлого меню.
+                                sku_reference_dates = {
+                                    d - timedelta(days=14)
+                                    for d in selected_dates
+                                }
+                                category_reference_dates = {
+                                    d - timedelta(days=7)
+                                    for d in selected_dates
+                                }
+                                reference_dates = sorted(
+                                    sku_reference_dates | category_reference_dates
+                                )
+
+                                current_reference = cycle_matrix_plans[
+                                    cycle_matrix_plans["plan_date"].isin(reference_dates)
+                                ].copy()
+                                current_dates = set(
+                                    current_reference["plan_date"].dropna().tolist()
+                                )
+                                missing_dates = [
+                                    d for d in reference_dates
+                                    if d not in current_dates
+                                ]
 
                                 archive_reference = pd.DataFrame()
                                 archive_error = ""
@@ -17937,18 +18107,37 @@ if tab_cycle_plan.open:
                                     .dropna().astype(int).unique().tolist()
                                 ))
                                 max_lifecycle = max(
-                                    [product_lifecycle_days(c) for c in target_plans["matrix_category"].dropna().tolist()] or [7]
+                                    [
+                                        product_lifecycle_days(c)
+                                        for c in pd.concat(
+                                            [
+                                                target_plans.get(
+                                                    "matrix_category",
+                                                    pd.Series(dtype=object),
+                                                ),
+                                                reference_plans.get(
+                                                    "matrix_category",
+                                                    pd.Series(dtype=object),
+                                                ),
+                                            ],
+                                            ignore_index=True,
+                                        ).dropna().tolist()
+                                    ]
+                                    or [7]
                                 )
-                                # Покрываем:
-                                # 1) весь срок жизни SKU после сопоставимого меню -14 дней;
-                                # 2) День 1 категории после меню -14 и -7 дней.
-                                freshness_history_from = min(reference_dates) + timedelta(days=1)
-                                freshness_history_to = max(reference_dates) + timedelta(days=max_lifecycle + 1)
-                                category_history_from = min(selected_dates) - timedelta(days=13)
-                                category_history_to = max(selected_dates) - timedelta(days=5)
-                                history_from = min(freshness_history_from, category_history_from)
-                                history_to = max(freshness_history_to, category_history_to)
-                                cycle_sales = load_forecast_history(history_from, history_to, points)
+
+                                # Продажи нужны по полному сроку жизни партий:
+                                # -14 дней для минимального значения текущего SKU;
+                                # -7 дней для факта категории прошлого меню.
+                                history_from = min(reference_dates) + timedelta(days=1)
+                                history_to = max(reference_dates) + timedelta(
+                                    days=max_lifecycle + 1
+                                )
+                                cycle_sales = load_forecast_history(
+                                    history_from,
+                                    history_to,
+                                    points,
+                                )
 
                                 cycle_entities, cycle_entity_source, cycle_entity_checked_at, cycle_entity_error, _ = (
                                     get_current_entity_reference()
