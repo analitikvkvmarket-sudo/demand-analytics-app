@@ -36,7 +36,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.58-CYCLE-SKU-FIRST-CATEGORY-CONTROL"
+BUILD_ID = "75.11.59-CYCLE-ENTITY-SALES-FALLBACK"
 
 
 def resolve_app_file(filename: str, *name_fragments: str) -> Path:
@@ -9471,6 +9471,9 @@ def build_cycle_plan_v1(
         sold["cycle_category"] = sold["sku"].map(
             lambda value: sku_category_map.get(str(value), "")
         )
+        sold["cycle_entity"] = sold["sku"].map(
+            lambda value: sku_entity_map.get(str(value), "")
+        )
 
     # Плановые строки по дате/точке/SKU.
     ref_lookup = {
@@ -9524,6 +9527,97 @@ def build_cycle_plan_v1(
                 .groupby("business_date", as_index=False)["sold_quantity"].sum()
                 .sort_values("business_date")
             )
+
+    def _entity_sales_proxy(
+        plan_date: date,
+        point_number: int,
+        current_sku: str,
+        current_name: str,
+        current_entity: str,
+        lifecycle_days: int,
+    ) -> tuple[str | None, str, float, int | None, bool]:
+        """Fallback по продажам сущности, даже если её нет в меню -14.
+
+        Возвращает:
+        proxy_sku, proxy_name, proxy_qty, completion_day, uncertain
+
+        Логика:
+        - только та же точка;
+        - окно от plan_date+1 до plan_date+lifecycle_days;
+        - все проданные SKU с той же сущностью;
+        - если несколько SKU, выбираем самый похожий по названию;
+        - если название не помогает, выбираем SKU с наибольшим фактом;
+        - факт proxy используется как консервативная база плана;
+        - всегда помечается как неуверенное сопоставление.
+        """
+        entity_key = _entity_key(current_entity)
+        if not entity_key or sold.empty or "cycle_entity" not in sold.columns:
+            return None, "", 0.0, None, True
+
+        start_date = plan_date + timedelta(days=1)
+        end_date = plan_date + timedelta(days=lifecycle_days)
+
+        entity_sales = sold[
+            sold["shop_number"].eq(point_number)
+            & sold["business_date"].between(start_date, end_date, inclusive="both")
+            & sold["cycle_entity"].map(_entity_key).eq(entity_key)
+        ].copy()
+
+        if entity_sales.empty:
+            return None, "", 0.0, None, True
+
+        sku_totals = (
+            entity_sales.groupby("sku", as_index=False)["sold_quantity"]
+            .sum()
+            .rename(columns={"sold_quantity": "qty"})
+        )
+        if sku_totals.empty:
+            return None, "", 0.0, None, True
+
+        sku_totals["proxy_name"] = sku_totals["sku"].map(
+            lambda value: sku_name_map.get(str(value), "")
+        )
+        sku_totals["similarity"] = sku_totals["proxy_name"].map(
+            lambda value: _name_similarity(current_name, value)
+        )
+
+        sku_totals = sku_totals.sort_values(
+            ["similarity", "qty"],
+            ascending=[False, False],
+            kind="stable",
+        )
+        chosen = sku_totals.iloc[0]
+        proxy_sku = str(chosen["sku"])
+        proxy_name = str(chosen["proxy_name"] or "").strip()
+        proxy_qty = max(0.0, float(chosen["qty"] or 0.0))
+
+        # Когда proxy выбран по сущности из продаж, прошлый "план" неизвестен.
+        # Поэтому считаем proxy_qty подтверждённым базовым количеством и
+        # определяем скорость по тому, к какому дню накопились все продажи proxy.
+        proxy_daily = (
+            entity_sales[entity_sales["sku"].astype(str).eq(proxy_sku)]
+            .groupby("business_date", as_index=False)["sold_quantity"]
+            .sum()
+            .sort_values("business_date")
+        )
+        completion_day = None
+        if proxy_qty > 0 and not proxy_daily.empty:
+            cumulative = 0.0
+            for day_number in range(1, lifecycle_days + 1):
+                current_date = plan_date + timedelta(days=day_number)
+                day_qty = float(
+                    proxy_daily.loc[
+                        proxy_daily["business_date"].eq(current_date),
+                        "sold_quantity",
+                    ].sum()
+                )
+                cumulative += day_qty
+                if cumulative + 1e-9 >= proxy_qty:
+                    completion_day = day_number
+                    break
+
+        return proxy_sku, proxy_name, proxy_qty, completion_day, True
+
 
     def _batch_consumption(
         plan_date: date,
@@ -9692,98 +9786,139 @@ def build_cycle_plan_v1(
                 )
             row["Тип сопоставления"] = "Точный SKU"
         else:
-            # Fallback: тот же entity + та же категория.
             current_entity = sku_entity_map.get(sku, "")
             entity_key_value = _entity_key(current_entity)
+
+            # ----------------------------------------------------------
+            # УРОВЕНЬ 1: та же сущность в меню -14.
+            # Сначала стараемся взять ту же категорию, затем снимаем это
+            # жёсткое ограничение и ищем сущность по всей дате.
+            # ----------------------------------------------------------
             candidates = reference_entity_rows.get(
                 (sku_reference_date, entity_key_value, category),
                 pd.DataFrame(),
             )
 
             if candidates is None or candidates.empty:
-                row["Статус"] = "Проверить SKU"
-                rows.append(row)
-                continue
-
-            # Предпочтение: та же точка. Если её нет — разрешаем другие точки,
-            # но это уже неуверенное сопоставление.
-            same_point = candidates[
-                pd.to_numeric(candidates["point_number"], errors="coerce")
-                .fillna(-1)
-                .astype(int)
-                .eq(point_number)
-            ].copy()
-
-            candidate_pool = same_point if not same_point.empty else candidates.copy()
-            if same_point.empty:
-                uncertain_entity_match = True
-
-            candidate_pool["name_similarity"] = candidate_pool["product_name"].map(
-                lambda value: _name_similarity(name, value)
-            )
-            candidate_pool["plan_numeric"] = pd.to_numeric(
-                candidate_pool["analyst_plan"],
-                errors="coerce",
-            ).fillna(0.0)
-
-            # Самое похожее название; при равенстве — больший исторический план.
-            candidate_pool = candidate_pool.sort_values(
-                ["name_similarity", "plan_numeric"],
-                ascending=[False, False],
-                kind="stable",
-            )
-            chosen = candidate_pool.iloc[0]
-            calculation_sku = str(chosen["sku"])
-            matched_name = str(chosen.get("product_name", "") or "").strip()
-
-            # Несколько кандидатов одной сущности = неуверенность.
-            distinct_candidate_skus = candidate_pool["sku"].astype(str).nunique()
-            if distinct_candidate_skus > 1:
-                uncertain_entity_match = True
-
-            # Если нашли на этой точке — берём её конкретный план.
-            # Если точка отсутствует — берём медиану плана выбранного proxy SKU по другим точкам.
-            chosen_same_point = candidate_pool[
-                pd.to_numeric(candidate_pool["point_number"], errors="coerce")
-                .fillna(-1)
-                .astype(int)
-                .eq(point_number)
-                & candidate_pool["sku"].astype(str).eq(calculation_sku)
-            ]
-
-            if not chosen_same_point.empty:
-                previous_plan = max(
-                    0.0,
-                    float(
-                        pd.to_numeric(
-                            chosen_same_point["analyst_plan"],
-                            errors="coerce",
-                        ).fillna(0.0).iloc[-1]
-                    ),
+                # Более мягкий поиск: сущность + дата, без обязательного совпадения категории.
+                candidate_parts = []
+                for (ref_date, ref_entity_key, _ref_category), frame in reference_entity_rows.items():
+                    if ref_date == sku_reference_date and ref_entity_key == entity_key_value:
+                        candidate_parts.append(frame)
+                candidates = (
+                    pd.concat(candidate_parts, ignore_index=True)
+                    if candidate_parts
+                    else pd.DataFrame()
                 )
-            else:
-                proxy_plans = pd.to_numeric(
-                    candidate_pool.loc[
-                        candidate_pool["sku"].astype(str).eq(calculation_sku),
-                        "analyst_plan",
-                    ],
+
+            if candidates is not None and not candidates.empty:
+                same_point = candidates[
+                    pd.to_numeric(candidates["point_number"], errors="coerce")
+                    .fillna(-1)
+                    .astype(int)
+                    .eq(point_number)
+                ].copy()
+
+                candidate_pool = same_point if not same_point.empty else candidates.copy()
+                if same_point.empty:
+                    uncertain_entity_match = True
+
+                candidate_pool["name_similarity"] = candidate_pool["product_name"].map(
+                    lambda value: _name_similarity(name, value)
+                )
+                candidate_pool["plan_numeric"] = pd.to_numeric(
+                    candidate_pool["analyst_plan"],
                     errors="coerce",
-                ).dropna()
-                previous_plan = max(
-                    0.0,
-                    float(proxy_plans.median()) if not proxy_plans.empty else 0.0,
+                ).fillna(0.0)
+
+                candidate_pool = candidate_pool.sort_values(
+                    ["name_similarity", "plan_numeric"],
+                    ascending=[False, False],
+                    kind="stable",
                 )
+                chosen = candidate_pool.iloc[0]
+                calculation_sku = str(chosen["sku"])
+                matched_name = str(chosen.get("product_name", "") or "").strip()
+
+                if candidate_pool["sku"].astype(str).nunique() > 1:
+                    uncertain_entity_match = True
+
+                chosen_same_point = candidate_pool[
+                    pd.to_numeric(candidate_pool["point_number"], errors="coerce")
+                    .fillna(-1)
+                    .astype(int)
+                    .eq(point_number)
+                    & candidate_pool["sku"].astype(str).eq(calculation_sku)
+                ]
+
+                if not chosen_same_point.empty:
+                    previous_plan = max(
+                        0.0,
+                        float(
+                            pd.to_numeric(
+                                chosen_same_point["analyst_plan"],
+                                errors="coerce",
+                            ).fillna(0.0).iloc[-1]
+                        ),
+                    )
+                else:
+                    proxy_plans = pd.to_numeric(
+                        candidate_pool.loc[
+                            candidate_pool["sku"].astype(str).eq(calculation_sku),
+                            "analyst_plan",
+                        ],
+                        errors="coerce",
+                    ).dropna()
+                    previous_plan = max(
+                        0.0,
+                        float(proxy_plans.median()) if not proxy_plans.empty else 0.0,
+                    )
+                    uncertain_entity_match = True
+
+                entity_fallback_used = True
+                row["SKU-основание"] = calculation_sku
+                row["Название основания"] = matched_name
+                row["Тип сопоставления"] = (
+                    "По сущности · неуверенно"
+                    if uncertain_entity_match
+                    else "По сущности"
+                )
+                row["Сопоставление неуверенное"] = bool(uncertain_entity_match)
+
+            else:
+                # ------------------------------------------------------
+                # УРОВЕНЬ 2: сущность отсутствует в меню -14.
+                # Ищем РЕАЛЬНЫЕ ПРОДАЖИ этой сущности на той же точке.
+                # Это снимает прежнее жёсткое условие "обязательно быть в меню".
+                # ------------------------------------------------------
+                proxy_sku, proxy_name, proxy_qty, proxy_completion_day, _ = _entity_sales_proxy(
+                    sku_reference_date,
+                    point_number,
+                    sku,
+                    name,
+                    current_entity,
+                    lifecycle_days,
+                )
+
+                if proxy_sku is None or proxy_qty <= 0:
+                    row["Статус"] = "Проверить SKU"
+                    rows.append(row)
+                    continue
+
+                calculation_sku = proxy_sku
+                matched_name = proxy_name
+                previous_plan = float(proxy_qty)
+                entity_fallback_used = True
                 uncertain_entity_match = True
 
-            entity_fallback_used = True
-            row["SKU-основание"] = calculation_sku
-            row["Название основания"] = matched_name
-            row["Тип сопоставления"] = (
-                "По сущности · неуверенно"
-                if uncertain_entity_match
-                else "По сущности"
-            )
-            row["Сопоставление неуверенное"] = bool(uncertain_entity_match)
+                row["SKU-основание"] = calculation_sku
+                row["Название основания"] = matched_name
+                row["Тип сопоставления"] = "По продажам сущности · неуверенно"
+                row["Сопоставление неуверенное"] = True
+
+                # Для этого уровня proxy_qty уже является подтверждённым фактом.
+                # Ниже не вызываем обычный batch-consumption как будто это был план.
+                row["_entity_sales_proxy_completion_day"] = proxy_completion_day
 
         row["Прошлый план SKU"] = previous_plan
 
@@ -9791,13 +9926,17 @@ def build_cycle_plan_v1(
         # фактические продажи proxy SKU этой точки.
         # Для cross-point entity fallback факта по текущей точке у proxy SKU может не быть;
         # тогда считаем consumed по доступному proxy SKU на текущей точке (0, если не было).
-        consumed, completion_day = _batch_consumption(
-            sku_reference_date,
-            point_number,
-            calculation_sku,
-            category,
-            previous_plan,
-        )
+        if row.get("Тип сопоставления") == "По продажам сущности · неуверенно":
+            consumed = float(previous_plan)
+            completion_day = row.pop("_entity_sales_proxy_completion_day", None)
+        else:
+            consumed, completion_day = _batch_consumption(
+                sku_reference_date,
+                point_number,
+                calculation_sku,
+                category,
+                previous_plan,
+            )
         realization_ratio = (
             consumed / previous_plan
             if previous_plan > 0
@@ -9857,8 +9996,9 @@ def build_cycle_plan_v1(
         if entity_fallback_used:
             entity_label = str(row.get("Сущность текущего SKU", "") or "").strip()
             confidence_text = "НЕУВЕРЕННО" if uncertain_entity_match else "уверенно"
+            match_kind = str(row.get("Тип сопоставления", "") or "")
             status = (
-                f"{status} · сопоставлено по сущности «{entity_label}» "
+                f"{status} · {match_kind.lower()} «{entity_label}» "
                 f"через SKU {calculation_sku} ({confidence_text})"
             )
 
@@ -10361,7 +10501,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                         diag_cell.font = Font(color="9C5700", bold=True)
                         diag_cell.comment = Comment(
                             (
-                                "Неуверенное сопоставление по сущности.\n"
+                                "Неуверенное сопоставление по сущности / продажам сущности.\n"
                                 f"Сущность: {record.get('Сущность текущего SKU', '')}\n"
                                 f"Использован SKU: {record.get('SKU-основание', '')}\n"
                                 f"Название основания: {record.get('Название основания', '')}\n"
