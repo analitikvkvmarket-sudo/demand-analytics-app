@@ -9284,11 +9284,13 @@ def build_cycle_plan_v1(
     3. Полностью съедено в День 1 -> факт x 1.50.
     4. Если полностью съедено в любой другой день -> факт x 1.00.
     5. Серый период или неполная реализация -> факт x 1.00.
-    6. Если точного SKU в меню -14 нет, ищется наиболее похожий SKU той же
-       сущности на той же точке. Такой результат всегда помечается оранжевым.
-    7. Если сущности нет в меню -14, разрешён резерв по фактическим продажам
-       той же сущности на той же точке в окне партии -14. Он тоже оранжевый.
-    8. Категория не корректирует и не ограничивает итоговый план SKU.
+    6. Если точного SKU в конкретной дате -14 нет, сначала ищется наиболее
+       похожий SKU той же сущности на той же точке в ЭТОЙ ЖЕ дате.
+    7. Если сущности в конкретной дате нет, ищется та же сущность на той же
+       точке по ВСЕМУ соответствующему плану цикла (1<->3, 2<->4).
+       Такой fallback всегда помечается оранжевым.
+    8. Если сущности нет и во всём сопоставимом плане, строка получает
+       статус «Проверить SKU». Категория итоговый план SKU не корректирует.
     """
     columns = [
         "Дата плана",
@@ -9547,53 +9549,80 @@ def build_cycle_plan_v1(
         )
         return candidates.iloc[0]
 
-    def _find_entity_sales_proxy(
+    def _find_entity_plan_proxy(
         reference_date: date,
         point_number: int,
         current_entity: str,
+        current_category: str,
         current_name: str,
-        lifecycle_days: int,
-    ) -> tuple[str | None, str, float]:
-        """Резерв: факт похожего SKU той же сущности на той же точке в окне -14."""
+    ) -> pd.Series | None:
+        """Ищет сущность по всему сопоставимому плану 1<->3 / 2<->4.
+
+        Сначала определяем лист/неделю, к которой относится точная дата -14,
+        затем ищем только внутри этого плана и только на той же точке.
+        """
         entity_key_value = _entity_key(current_entity)
-        if not entity_key_value or sold.empty:
-            return None, "", 0.0
+        if not entity_key_value or reference.empty:
+            return None
 
-        start_date = reference_date + timedelta(days=1)
-        end_date = reference_date + timedelta(days=lifecycle_days)
-        entity_sales = sold[
-            sold["shop_number"].eq(point_number)
-            & sold["business_date"].between(start_date, end_date, inclusive="both")
-            & sold["entity_match_key"].eq(entity_key_value)
+        scope = reference.copy()
+        sheet_scoped = False
+
+        # Лучший способ не смешать 1-ю и 2-ю (или 3-ю и 4-ю) недели —
+        # использовать plan_sheet той строки, которая относится к точной дате -14.
+        if "plan_sheet" in scope.columns:
+            exact_day = scope[scope["plan_date"].eq(reference_date)].copy()
+            sheet_values = [
+                str(value).strip()
+                for value in exact_day.get("plan_sheet", pd.Series(dtype=object)).dropna().tolist()
+                if str(value).strip()
+            ]
+            if sheet_values:
+                reference_sheet = sheet_values[0]
+                scope = scope[
+                    scope["plan_sheet"].fillna("").astype(str).str.strip().eq(reference_sheet)
+                ].copy()
+                sheet_scoped = True
+
+        # Резерв на случай архивного формата без определимого plan_sheet: не уходим
+        # дальше семи дней от сопоставимой даты, чтобы не смешивать соседние планы.
+        if not sheet_scoped:
+            scope = reference[
+                reference["plan_date"].map(
+                    lambda value: isinstance(value, date) and abs((value - reference_date).days) <= 6
+                )
+            ].copy()
+
+        candidates = scope[
+            scope["point_number"].eq(point_number)
+            & scope["entity_match_key"].eq(entity_key_value)
         ].copy()
-        if entity_sales.empty:
-            return None, "", 0.0
+        if candidates.empty:
+            return None
 
-        totals = (
-            entity_sales.groupby("sku", as_index=False)["sold_quantity"]
-            .sum()
-            .rename(columns={"sold_quantity": "fact_qty"})
-        )
-        if totals.empty:
-            return None, "", 0.0
+        same_category = candidates[
+            candidates["matrix_category"].map(normalize_matrix_category).eq(
+                normalize_matrix_category(current_category)
+            )
+        ].copy()
+        if not same_category.empty:
+            candidates = same_category
 
-        totals["proxy_name"] = totals["sku"].map(
-            lambda value: sku_name_map.get(str(value), "")
-        )
-        totals["name_similarity"] = totals["proxy_name"].map(
+        candidates["name_similarity"] = candidates["product_name"].map(
             lambda value: _name_similarity(current_name, value)
         )
-        totals = totals.sort_values(
-            ["name_similarity", "fact_qty"],
-            ascending=[False, False],
+        candidates["date_distance"] = candidates["plan_date"].map(
+            lambda value: abs((value - reference_date).days) if isinstance(value, date) else 999
+        )
+        candidates["plan_numeric"] = pd.to_numeric(
+            candidates["analyst_plan"], errors="coerce"
+        ).fillna(0.0)
+        candidates = candidates.sort_values(
+            ["name_similarity", "date_distance", "plan_numeric"],
+            ascending=[False, True, False],
             kind="stable",
         )
-        chosen = totals.iloc[0]
-        return (
-            str(chosen["sku"]),
-            str(chosen["proxy_name"] or "").strip(),
-            max(0.0, float(chosen["fact_qty"] or 0.0)),
-        )
+        return candidates.iloc[0]
 
     rows: list[dict[str, object]] = []
 
@@ -9650,7 +9679,6 @@ def build_cycle_plan_v1(
         consumed = 0.0
         completion_day: int | None = None
         entity_fallback_used = False
-        fact_only_entity_fallback = False
 
         # Точное совпадение считается точным только на ЭТОЙ ЖЕ точке.
         previous = ref_lookup.get((reference_date, point_number, sku))
@@ -9705,27 +9733,47 @@ def build_cycle_plan_v1(
                 row["Тип сопоставления"] = "По сущности · меню -14"
                 row["Сопоставление неуверенное"] = True
             else:
-                proxy_sku, proxy_name, proxy_fact = _find_entity_sales_proxy(
+                proxy_row = _find_entity_plan_proxy(
                     reference_date,
                     point_number,
                     current_entity,
+                    category,
                     name,
-                    lifecycle_days,
                 )
-                if proxy_sku is None or proxy_fact <= 0:
+                if proxy_row is None:
                     row["Статус"] = "Проверить SKU"
                     rows.append(row)
                     continue
 
-                calculation_sku = proxy_sku
-                previous_plan = 0.0
-                consumed = float(proxy_fact)
-                completion_day = None
+                calculation_sku = str(proxy_row["sku"])
+                matched_name = str(proxy_row.get("product_name", "") or "").strip()
+                basis_reference_date = proxy_row.get("plan_date")
+                if not isinstance(basis_reference_date, date):
+                    basis_reference_date = reference_date
+                previous_plan = max(
+                    0.0,
+                    float(
+                        pd.to_numeric(
+                            pd.Series([proxy_row.get("analyst_plan")]),
+                            errors="coerce",
+                        ).fillna(0.0).iloc[0]
+                    ),
+                )
+                basis_category = normalize_matrix_category(
+                    proxy_row.get("matrix_category", category)
+                )
+                consumed, completion_day = _batch_consumption(
+                    basis_reference_date,
+                    point_number,
+                    calculation_sku,
+                    basis_category,
+                    previous_plan,
+                )
                 entity_fallback_used = True
-                fact_only_entity_fallback = True
+                row["Дата сравнения SKU"] = basis_reference_date
                 row["SKU-основание"] = calculation_sku
-                row["Название основания"] = proxy_name
-                row["Тип сопоставления"] = "По сущности · факт -14"
+                row["Название основания"] = matched_name
+                row["Тип сопоставления"] = "По сущности · весь план цикла"
                 row["Сопоставление неуверенное"] = True
 
         realization_ratio = (
@@ -9743,11 +9791,7 @@ def build_cycle_plan_v1(
         # Основа плана всегда ФАКТ, а не прошлый план.
         base_fact = max(0.0, float(consumed))
 
-        if fact_only_entity_fallback:
-            sku_k = 1.00
-            strength_priority = 1
-            status = f"Fallback сущности: факт {base_fact:g} ×1.0"
-        elif sold_out and completion_day == 1:
+        if sold_out and completion_day == 1:
             sku_k = 1.50
             strength_priority = 4
             status = "Съеден полностью в День 1 · факт ×1.5"
@@ -10181,7 +10225,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                         diag_cell.font = Font(color="9C5700", bold=True)
                         diag_cell.comment = Comment(
                             (
-                                "Неуверенное сопоставление по сущности / продажам сущности.\n"
+                                "Неуверенное сопоставление по сущности.\n"
                                 f"Сущность: {record.get('Сущность текущего SKU', '')}\n"
                                 f"Использован SKU: {record.get('SKU-основание', '')}\n"
                                 f"Название основания: {record.get('Название основания', '')}\n"
@@ -18109,8 +18153,9 @@ if tab_cycle_plan.open:
             "План переносится из факта партии ровно −14 дней (цикл 1↔3, 2↔4) отдельно по каждому SKU и точке. "
             "Съели полностью в День 1 → факт ×1,50; если полностью съели в любой другой день → факт ×1,00; "
             "если не съели полностью → факт ×1,00. "
-            "Если точного SKU нет, используется наиболее похожий SKU той же сущности на этой же точке; "
-            "такой расчёт помечается оранжевым. Синяя строка показывает только прошлое плановое значение."
+            "Если точного SKU нет, сначала ищется похожий SKU той же сущности в этой же дате −14; "
+            "если его нет — сущность ищется по всей соответствующей неделе плана на этой же точке. "
+            "Fallback помечается оранжевым. Синяя строка показывает только прошлое плановое значение."
         )
 
         matrix_bytes, matrix_source, matrix_checked_at, matrix_error = _load_matrix_context_for_active_tab()
@@ -18155,19 +18200,50 @@ if tab_cycle_plan.open:
                                     cycle_matrix_plans["plan_date"].isin(selected_dates)
                                 ].copy()
 
-                                # Для циклического расчёта нужен только сопоставимый план -14 дней:
-                                # цикл 1↔3 и 2↔4. Категория -7 больше не участвует.
+                                # Основное сравнение всегда идёт по точной дате -14 дней.
+                                # Если SKU/сущность в этот день не найдены, fallback может смотреть
+                                # ВСЮ соответствующую неделю плана цикла 1↔3 / 2↔4.
                                 reference_dates = sorted({
                                     d - timedelta(days=14)
                                     for d in selected_dates
                                 })
 
-                                current_reference = cycle_matrix_plans[
+                                exact_current_reference = cycle_matrix_plans[
                                     cycle_matrix_plans["plan_date"].isin(reference_dates)
                                 ].copy()
                                 current_dates = set(
-                                    current_reference["plan_date"].dropna().tolist()
+                                    exact_current_reference["plan_date"].dropna().tolist()
                                 )
+
+                                # Находим лист исторического плана по самой дате -14 и добавляем
+                                # в reference все его даты. Так поиск сущности не смешивает 1/2 недели.
+                                current_reference = exact_current_reference.copy()
+                                if (
+                                    not exact_current_reference.empty
+                                    and "plan_sheet" in exact_current_reference.columns
+                                    and "plan_sheet" in cycle_matrix_plans.columns
+                                ):
+                                    reference_sheet_names = {
+                                        str(value).strip()
+                                        for value in exact_current_reference["plan_sheet"].dropna().tolist()
+                                        if str(value).strip()
+                                    }
+                                    if reference_sheet_names:
+                                        full_cycle_reference = cycle_matrix_plans[
+                                            cycle_matrix_plans["plan_sheet"]
+                                            .fillna("")
+                                            .astype(str)
+                                            .str.strip()
+                                            .isin(reference_sheet_names)
+                                        ].copy()
+                                        current_reference = pd.concat(
+                                            [exact_current_reference, full_cycle_reference],
+                                            ignore_index=True,
+                                        ).drop_duplicates(
+                                            ["plan_date", "point_number", "sku"],
+                                            keep="last",
+                                        )
+
                                 missing_dates = [
                                     d for d in reference_dates
                                     if d not in current_dates
@@ -18213,10 +18289,22 @@ if tab_cycle_plan.open:
                                     or [7]
                                 )
 
-                                # Продажи нужны только для партии -14 дней
-                                # по полному сроку жизни сопоставимого SKU.
-                                history_from = min(reference_dates) + timedelta(days=1)
-                                history_to = max(reference_dates) + timedelta(
+                                # Продажи нужны для всех партий сопоставимого плана: точной
+                                # даты -14 и, при необходимости, сущности из другого дня той же недели.
+                                loaded_reference_dates = (
+                                    sorted(
+                                        value
+                                        for value in reference_plans.get(
+                                            "plan_date", pd.Series(dtype=object)
+                                        ).dropna().tolist()
+                                        if isinstance(value, date)
+                                    )
+                                    if not reference_plans.empty
+                                    else []
+                                )
+                                sales_reference_dates = loaded_reference_dates or reference_dates
+                                history_from = min(sales_reference_dates) + timedelta(days=1)
+                                history_to = max(sales_reference_dates) + timedelta(
                                     days=max_lifecycle + 1
                                 )
                                 cycle_sales = load_forecast_history(
