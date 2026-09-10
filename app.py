@@ -1613,6 +1613,76 @@ def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]
     return frame
 
 
+@st.cache_data(ttl=900, show_spinner="Загружаю данные для сравнения…")
+def load_weekday_comparison_sales(
+    date_from: date,
+    date_to_exclusive: date,
+    shops: tuple[int, ...],
+) -> pd.DataFrame:
+    """Компактная загрузка продаж для плашки «Сравнение».
+
+    Здесь нужны только количество, дата, точка и SKU, поэтому SQL агрегирует
+    данные сразу на уровне день + точка + SKU и не тянет время чека/выручку.
+    """
+    if not shops:
+        return pd.DataFrame(
+            columns=["business_date", "shop_number", "sku", "product_name", "sold_quantity"]
+        )
+    query = """
+        SELECT
+            business_date,
+            shop_number,
+            COALESCE(
+                NULLIF(TRIM(erp_code), ''),
+                NULLIF(TRIM(product_code), ''),
+                NULLIF(TRIM(barcode), ''),
+                NULLIF(TRIM(product_hash), ''),
+                'БЕЗ_SKU'
+            ) AS sku,
+            MAX(product_name) AS product_name,
+            SUM(net_quantity)::numeric AS sold_quantity
+        FROM dwh.v_sales_item
+        WHERE business_date >= %(date_from)s
+          AND business_date < %(date_to)s
+          AND shop_number = ANY(%(shops)s)
+        GROUP BY business_date, shop_number,
+                 COALESCE(
+                     NULLIF(TRIM(erp_code), ''),
+                     NULLIF(TRIM(product_code), ''),
+                     NULLIF(TRIM(barcode), ''),
+                     NULLIF(TRIM(product_hash), ''),
+                     'БЕЗ_SKU'
+                 )
+        ORDER BY business_date, shop_number, sku
+    """
+    with pg_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                query,
+                {
+                    "date_from": date_from,
+                    "date_to": date_to_exclusive,
+                    "shops": list(shops),
+                },
+            )
+            records = cursor.fetchall()
+            columns = [description.name for description in cursor.description]
+    frame = pd.DataFrame(records, columns=columns)
+    if frame.empty:
+        return frame
+    frame["business_date"] = pd.to_datetime(frame["business_date"], errors="coerce").dt.date
+    frame["shop_number"] = pd.to_numeric(frame["shop_number"], errors="coerce")
+    frame["sku"] = frame["sku"].map(normalize_sku)
+    frame["sold_quantity"] = pd.to_numeric(
+        frame["sold_quantity"], errors="coerce"
+    ).fillna(0.0)
+    return frame[
+        frame["business_date"].notna()
+        & frame["shop_number"].notna()
+        & frame["sku"].notna()
+    ].copy()
+
+
 @st.cache_data(ttl=300, show_spinner="Ищу магазины с продажами…")
 def load_available_shops(date_from: date, date_to_exclusive: date) -> pd.DataFrame:
     """Возвращает ВСЕ номера точек, которые существуют в PostgreSQL.
@@ -10443,6 +10513,7 @@ period = st.session_state["period"]
 MENU_ITEMS = [
     ("Дашборд", ":material/dashboard:"),
     ("Отчет", ":material/description:"),
+    ("Сравнение", ":material/compare_arrows:"),
     ("Топ-3 сущности", ":material/account_tree:"),
     ("Сущности", ":material/storefront:"),
     ("Детализация", ":material/pie_chart:"),
@@ -10814,9 +10885,352 @@ class _MainSection:
         return False
 
 
-tab_dashboard, tab_report, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_cycle_plan, tab_plan_check = [
+tab_dashboard, tab_report, tab_comparison, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_cycle_plan, tab_plan_check = [
     _MainSection(label) for label, _ in MENU_ITEMS
 ]
+
+if tab_comparison.open:
+    with tab_comparison:
+        st.subheader("Сравнение продаж по дням недели")
+        st.caption(
+            "Только количество проданного. Выберите период, точку и день недели. "
+            "Например, для месяца все понедельники будут стоять рядом в одной таблице, "
+            "чтобы их можно было сравнить между собой. Ниже выбранная дата раскрывается по категориям."
+        )
+
+        comparison_point_map = {
+            int(shop_number): str(point_label).strip()
+            for shop_number, point_label in st.session_state.get("point_mapping", {}).items()
+            if str(point_label).strip() and re.fullmatch(r"Т\d+", str(point_label).strip())
+        }
+        comparison_point_to_shop = {
+            point_label: shop_number
+            for shop_number, point_label in comparison_point_map.items()
+        }
+        comparison_point_labels = sorted(
+            comparison_point_to_shop,
+            key=lambda value: int(re.search(r"(\d+)", value).group(1)),
+        )
+
+        comparison_controls = st.columns([1.7, 1.15, 1.15])
+        with comparison_controls[0]:
+            comparison_period_input = st.date_input(
+                "Период",
+                value=(previous_month_start, previous_month_end),
+                max_value=today,
+                format="DD.MM.YYYY",
+                key="weekday_comparison_period_v1",
+            )
+        with comparison_controls[1]:
+            comparison_point = st.selectbox(
+                "Точка",
+                options=["Все точки суммарно"] + comparison_point_labels,
+                index=0,
+                key="weekday_comparison_point_v1",
+            )
+        with comparison_controls[2]:
+            comparison_weekday = st.selectbox(
+                "День недели",
+                options=["Все дни", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"],
+                index=0,
+                key="weekday_comparison_weekday_v1",
+            )
+
+        comparison_period_valid = (
+            isinstance(comparison_period_input, tuple)
+            and len(comparison_period_input) == 2
+        )
+        comparison_build = st.button(
+            "Загрузить сравнение",
+            type="primary",
+            use_container_width=True,
+            key="weekday_comparison_build_v1",
+        )
+
+        if comparison_build:
+            if not comparison_period_valid:
+                st.error("Укажите дату начала и дату окончания периода.")
+            elif not comparison_point_map:
+                st.error("Нет сопоставленных точек между приложением и PostgreSQL.")
+            else:
+                comparison_start, comparison_end = comparison_period_input
+                if comparison_start > comparison_end:
+                    st.error("Дата начала периода не может быть позже даты окончания.")
+                else:
+                    try:
+                        with st.spinner("Загружаю продажи за выбранный период…"):
+                            comparison_raw = load_weekday_comparison_sales(
+                                comparison_start,
+                                comparison_end + timedelta(days=1),
+                                tuple(sorted(comparison_point_map)),
+                            )
+
+                        if comparison_raw.empty:
+                            comparison_frame = pd.DataFrame(
+                                columns=[
+                                    "business_date", "shop_number", "point",
+                                    "sku", "product_name", "category", "sold_quantity",
+                                ]
+                            )
+                        else:
+                            comparison_frame = comparison_raw.copy()
+                            comparison_frame["shop_number"] = pd.to_numeric(
+                                comparison_frame["shop_number"], errors="coerce"
+                            ).astype("Int64")
+                            comparison_frame["point"] = comparison_frame["shop_number"].map(
+                                comparison_point_map
+                            )
+                            comparison_frame = comparison_frame[
+                                comparison_frame["point"].notna()
+                            ].copy()
+
+                            comparison_entity_columns = [
+                                column
+                                for column in ["sku", "category"]
+                                if column in entities.columns
+                            ]
+                            if "sku" in comparison_entity_columns:
+                                comparison_entities = entities[comparison_entity_columns].copy()
+                                comparison_entities["sku"] = comparison_entities["sku"].map(normalize_sku)
+                                comparison_entities = comparison_entities.drop_duplicates("sku")
+                                comparison_frame = comparison_frame.merge(
+                                    comparison_entities,
+                                    on="sku",
+                                    how="left",
+                                    validate="many_to_one",
+                                )
+                            if "category" not in comparison_frame.columns:
+                                comparison_frame["category"] = "Не сопоставлено"
+                            comparison_frame["category"] = comparison_frame["category"].fillna(
+                                "Не сопоставлено"
+                            )
+                            comparison_frame["sold_quantity"] = pd.to_numeric(
+                                comparison_frame["sold_quantity"], errors="coerce"
+                            ).fillna(0.0)
+
+                        st.session_state["weekday_comparison_state_v1"] = {
+                            "frame": comparison_frame,
+                            "start": comparison_start,
+                            "end": comparison_end,
+                        }
+                    except Exception as error:
+                        st.error(f"Не удалось загрузить сравнение: {error}")
+
+        comparison_state = st.session_state.get("weekday_comparison_state_v1")
+        if comparison_state:
+            comparison_frame = comparison_state.get("frame", pd.DataFrame()).copy()
+            comparison_start = comparison_state.get("start")
+            comparison_end = comparison_state.get("end")
+
+            if not isinstance(comparison_start, date) or not isinstance(comparison_end, date):
+                st.warning("Период сравнения в памяти повреждён. Нажмите «Загрузить сравнение» ещё раз.")
+            else:
+                if comparison_point != "Все точки суммарно":
+                    comparison_visible = comparison_frame[
+                        comparison_frame.get("point", pd.Series(dtype=str)).astype(str).eq(comparison_point)
+                    ].copy()
+                else:
+                    comparison_visible = comparison_frame.copy()
+
+                all_period_dates = _report_date_span(comparison_start, comparison_end)
+                date_grid = pd.DataFrame({"Дата": all_period_dates})
+                date_grid["День недели"] = date_grid["Дата"].map(
+                    lambda value: REPORT_WEEKDAYS_RU.get(value.weekday(), "")
+                )
+
+                if comparison_visible.empty:
+                    sold_by_date = pd.DataFrame(columns=["Дата", "Продано, шт."])
+                else:
+                    sold_by_date = (
+                        comparison_visible.groupby("business_date", as_index=False)["sold_quantity"]
+                        .sum()
+                        .rename(columns={
+                            "business_date": "Дата",
+                            "sold_quantity": "Продано, шт.",
+                        })
+                    )
+                date_grid = date_grid.merge(sold_by_date, on="Дата", how="left")
+                date_grid["Продано, шт."] = pd.to_numeric(
+                    date_grid["Продано, шт."], errors="coerce"
+                ).fillna(0.0)
+
+                if comparison_weekday != "Все дни":
+                    date_grid = date_grid[
+                        date_grid["День недели"].eq(comparison_weekday)
+                    ].copy()
+
+                weekday_order = {label: index for index, label in REPORT_WEEKDAYS_RU.items()}
+                date_grid["_weekday_order"] = date_grid["День недели"].map(weekday_order).fillna(99)
+                date_grid = date_grid.sort_values(
+                    ["_weekday_order", "Дата"], kind="stable"
+                ).reset_index(drop=True)
+                date_grid["№ такого дня"] = (
+                    date_grid.groupby("День недели", sort=False).cumcount() + 1
+                )
+                date_grid["Изм. к пред. такому дню, шт."] = (
+                    date_grid.groupby("День недели", sort=False)["Продано, шт."].diff()
+                )
+                date_grid["Изм. к пред. такому дню, %"] = (
+                    date_grid.groupby("День недели", sort=False)["Продано, шт."].pct_change(fill_method=None)
+                    * 100
+                )
+                zero_previous = (
+                    date_grid.groupby("День недели", sort=False)["Продано, шт."].shift(1).eq(0)
+                )
+                date_grid.loc[zero_previous, "Изм. к пред. такому дню, %"] = pd.NA
+
+                st.markdown("#### Сверка одинаковых дней недели")
+                comparison_daily_table = date_grid[
+                    [
+                        "День недели",
+                        "№ такого дня",
+                        "Дата",
+                        "Продано, шт.",
+                        "Изм. к пред. такому дню, шт.",
+                        "Изм. к пред. такому дню, %",
+                    ]
+                ].copy()
+                st.dataframe(
+                    comparison_daily_table,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(760, 38 * len(comparison_daily_table) + 80),
+                    column_config={
+                        "Дата": st.column_config.DateColumn(format="DD.MM.YYYY"),
+                        "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
+                        "Изм. к пред. такому дню, шт.": st.column_config.NumberColumn(format="%+.0f"),
+                        "Изм. к пред. такому дню, %": st.column_config.NumberColumn(format="%+.1f%%"),
+                    },
+                )
+
+                if not date_grid.empty:
+                    weekday_summary = (
+                        date_grid.groupby("День недели", as_index=False, sort=False)
+                        .agg(
+                            **{
+                                "Дней": ("Дата", "count"),
+                                "Продано всего, шт.": ("Продано, шт.", "sum"),
+                                "Среднее за день, шт.": ("Продано, шт.", "mean"),
+                                "Минимум, шт.": ("Продано, шт.", "min"),
+                                "Максимум, шт.": ("Продано, шт.", "max"),
+                            }
+                        )
+                    )
+                    weekday_summary["_weekday_order"] = weekday_summary["День недели"].map(weekday_order)
+                    weekday_summary = weekday_summary.sort_values("_weekday_order").drop(columns="_weekday_order")
+                    st.markdown("#### Итог по дням недели")
+                    st.dataframe(
+                        weekday_summary,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Продано всего, шт.": st.column_config.NumberColumn(format="%.0f"),
+                            "Среднее за день, шт.": st.column_config.NumberColumn(format="%.1f"),
+                            "Минимум, шт.": st.column_config.NumberColumn(format="%.0f"),
+                            "Максимум, шт.": st.column_config.NumberColumn(format="%.0f"),
+                        },
+                    )
+
+                    comparison_dates_for_detail = date_grid["Дата"].tolist()
+                    selected_comparison_date = st.selectbox(
+                        "Дата для разбивки по категориям",
+                        options=comparison_dates_for_detail,
+                        format_func=lambda value: (
+                            f"{value:%d.%m.%Y} · {REPORT_WEEKDAYS_RU.get(value.weekday(), '')}"
+                        ),
+                        key="weekday_comparison_detail_date_v1",
+                    )
+
+                    detail_source = comparison_visible[
+                        comparison_visible.get("business_date", pd.Series(dtype=object)).eq(
+                            selected_comparison_date
+                        )
+                    ].copy()
+                    if detail_source.empty:
+                        category_table = pd.DataFrame(columns=["Категория", "Продано, шт."])
+                    else:
+                        category_table = (
+                            detail_source.groupby("category", as_index=False)["sold_quantity"]
+                            .sum()
+                            .rename(columns={
+                                "category": "Категория",
+                                "sold_quantity": "Продано, шт.",
+                            })
+                            .sort_values("Продано, шт.", ascending=False, kind="stable")
+                        )
+                        category_total = float(category_table["Продано, шт."].sum())
+                        category_table = pd.concat(
+                            [
+                                category_table,
+                                pd.DataFrame([
+                                    {
+                                        "Категория": "ВСЕГО",
+                                        "Продано, шт.": category_total,
+                                    }
+                                ]),
+                            ],
+                            ignore_index=True,
+                        )
+
+                    st.markdown(
+                        f"#### Категории внутри {selected_comparison_date:%d.%m.%Y}"
+                    )
+                    if category_table.empty:
+                        st.info("В выбранную дату продаж нет.")
+                    else:
+                        st.dataframe(
+                            category_table,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
+                            },
+                        )
+
+                    if comparison_point == "Все точки суммарно":
+                        if detail_source.empty:
+                            point_table = pd.DataFrame(columns=["Точка", "Продано, шт."])
+                        else:
+                            point_table = (
+                                detail_source.groupby("point", as_index=False)["sold_quantity"]
+                                .sum()
+                                .rename(columns={
+                                    "point": "Точка",
+                                    "sold_quantity": "Продано, шт.",
+                                })
+                            )
+                            point_table["_point_number"] = point_table["Точка"].map(
+                                lambda value: int(re.search(r"(\d+)", str(value)).group(1))
+                                if re.search(r"(\d+)", str(value)) else 9999
+                            )
+                            point_table = point_table.sort_values("_point_number").drop(columns="_point_number")
+                            point_total = float(point_table["Продано, шт."].sum())
+                            point_table = pd.concat(
+                                [
+                                    point_table,
+                                    pd.DataFrame([
+                                        {
+                                            "Точка": "ВСЕ ТОЧКИ",
+                                            "Продано, шт.": point_total,
+                                        }
+                                    ]),
+                                ],
+                                ignore_index=True,
+                            )
+                        st.markdown(
+                            f"#### Точки внутри {selected_comparison_date:%d.%m.%Y}"
+                        )
+                        if point_table.empty:
+                            st.info("В выбранную дату продаж по точкам нет.")
+                        else:
+                            st.dataframe(
+                                point_table,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                },
+                            )
 
 if tab_report.open:
     with tab_report:
