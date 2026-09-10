@@ -9,7 +9,6 @@ import json
 import math
 import os
 import re
-import tempfile
 import queue
 import threading
 import time
@@ -36,73 +35,9 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.62-CYCLE-DAY1-FACT-ENTITY"
+BUILD_ID = "75.11.64-NO-BUNDLED-XLSX"
 
 
-def resolve_app_file(filename: str, *name_fragments: str) -> Path:
-    """Find a bundled workbook next to app.py, including renamed legacy files."""
-    search_dirs = []
-    for folder in (APP_DIR, Path.cwd(), APP_DIR.parent):
-        try:
-            resolved = folder.resolve()
-        except OSError:
-            resolved = folder
-        if resolved not in search_dirs:
-            search_dirs.append(resolved)
-
-    aliases = {
-        "entities.xlsx": ("таблица сущности.xlsx",),
-        "combo_matrix.xlsx": ("2.3 Матрица КОМБО.xlsx",),
-        "analyst_logic.xlsx": ("логика аналитика.xlsx",),
-    }
-    exact_names = (filename, *aliases.get(filename, ()))
-    for folder in search_dirs:
-        for exact_name in exact_names:
-            candidate = folder / exact_name
-            if candidate.exists():
-                return candidate
-
-    fragments = tuple(fragment.casefold() for fragment in name_fragments if fragment)
-    if fragments:
-        for folder in search_dirs:
-            if not folder.exists() or not folder.is_dir():
-                continue
-            try:
-                workbooks = sorted(folder.glob("*.xlsx"))
-            except OSError:
-                continue
-            for candidate in workbooks:
-                stem = candidate.stem.casefold()
-                if any(fragment in stem for fragment in fragments):
-                    return candidate
-
-    # Last-resort content check for the entity dictionary. This also works if
-    # a ZIP extractor damaged a Cyrillic filename but left the .xlsx intact.
-    if filename == "entities.xlsx":
-        for folder in search_dirs:
-            if not folder.exists() or not folder.is_dir():
-                continue
-            try:
-                workbooks = sorted(folder.glob("*.xlsx"))
-            except OSError:
-                continue
-            for candidate in workbooks:
-                try:
-                    preview = pd.read_excel(candidate, header=None, nrows=20)
-                except Exception:
-                    continue
-                for _, row in preview.iterrows():
-                    values = {str(value).strip().casefold() for value in row if pd.notna(value)}
-                    if "код" in values and "название блюда" in values:
-                        return candidate
-
-    return APP_DIR / filename
-
-
-ENTITY_FILE = resolve_app_file("entities.xlsx", "сущност", "entit")
-ANALYST_LOGIC_FILE = resolve_app_file("analyst_logic.xlsx", "логика", "аналит", "analyst")
-COMBO_MATRIX_FILE = resolve_app_file("combo_matrix.xlsx", "матрица", "комбо", "combo")
-AUTO_UNIT_FILE = resolve_app_file("auto_unit_points_vm.xlsx", "авто юнит", "auto_unit", "точки вм")
 MATRIX_APPS_SCRIPT_URL = os.getenv(
     "MATRIX_APPS_SCRIPT_URL",
     "https://script.google.com/macros/s/AKfycbxzpVJGvkHTn8YogBOLO4PtvdQqmkoMx-chNCZ2ijmMIRc_-kcd2WUQ283PNyo5hCo/exec",
@@ -112,7 +47,6 @@ MATRIX_APPS_SCRIPT_KEY = os.getenv(
     "VK_MATRIX_2026_8f31c5a7d942",
 ).strip()
 GOOGLE_MATRIX_REFRESH_SECONDS = 15 * 60
-GOOGLE_MATRIX_CACHE_FILE = Path(tempfile.gettempdir()) / "vkusnomarket_combo_plan_cache_v2.xlsx"
 MATRIX_PLAN_SHEETS = [
     "План 1-я неделя",
     "План 2-я неделя",
@@ -375,52 +309,24 @@ def _fetch_apps_script_entity_reference(
 
 
 def get_current_combo_matrix_snapshot() -> tuple[bytes, str, str, str]:
-    """Return current PLAN snapshot; entity-reference failures are isolated from this path."""
+    """Return the live PLAN snapshot from Apps Script only.
+
+    The application no longer depends on bundled/local Excel workbooks.
+    Streamlit's cache on _fetch_apps_script_matrix_snapshot is the only cache layer.
+    """
     google_bytes, google_source, checked_at, google_error = _fetch_apps_script_matrix_snapshot(
         MATRIX_APPS_SCRIPT_URL,
         MATRIX_APPS_SCRIPT_KEY,
     )
     if google_bytes:
-        matrix_digest = hashlib.sha256(google_bytes).hexdigest()
-        digest_state_key = "google_matrix_cache_digest_perf_v1"
-        should_write_cache = (
-            not GOOGLE_MATRIX_CACHE_FILE.exists()
-            or st.session_state.get(digest_state_key) != matrix_digest
-        )
-        if should_write_cache:
-            try:
-                GOOGLE_MATRIX_CACHE_FILE.write_bytes(google_bytes)
-                st.session_state[digest_state_key] = matrix_digest
-            except OSError:
-                pass
         return google_bytes, google_source, checked_at, ""
 
-    if GOOGLE_MATRIX_CACHE_FILE.exists():
-        try:
-            cached_bytes = GOOGLE_MATRIX_CACHE_FILE.read_bytes()
-            if cached_bytes[:2] == b"PK":
-                return (
-                    cached_bytes,
-                    "Резерв · последняя Apps Script-копия",
-                    checked_at,
-                    google_error,
-                )
-        except OSError:
-            pass
-
-    if COMBO_MATRIX_FILE.exists():
-        try:
-            bundled_bytes = COMBO_MATRIX_FILE.read_bytes()
-            return (
-                bundled_bytes,
-                "Резерв · combo_matrix.xlsx из сборки",
-                checked_at,
-                google_error,
-            )
-        except OSError as error:
-            google_error = f"{google_error}; локальная матрица: {error}".strip("; ")
-
-    return b"", "Матрица недоступна", checked_at, google_error
+    return (
+        b"",
+        "Матрица недоступна",
+        checked_at,
+        google_error or "Apps Script не вернул актуальные планы 1–4 недель.",
+    )
 
 
 @st.cache_data(ttl=MENU_ARCHIVE_CACHE_SECONDS, show_spinner=False)
@@ -1347,30 +1253,6 @@ def _parse_entity_reference_raw(raw: pd.DataFrame) -> pd.DataFrame:
     ].reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False)
-def load_entities(path: str, modified_at: float) -> pd.DataFrame:
-    """Legacy fallback: read the old standalone entity workbook."""
-    raw = pd.read_excel(path, header=None)
-    return _parse_entity_reference_raw(raw)
-
-
-@st.cache_data(show_spinner=False)
-def load_entities_from_matrix_bytes(matrix_bytes: bytes) -> pd.DataFrame:
-    """Read SKU/category/entity mapping from «Справочник» in 2.3 Matrix COMBO."""
-    if not matrix_bytes or matrix_bytes[:2] != b"PK":
-        raise ValueError("Матрица 2.3 не содержит корректный XLSX.")
-    try:
-        raw = pd.read_excel(
-            io.BytesIO(matrix_bytes),
-            sheet_name=MATRIX_ENTITY_SHEET,
-            header=None,
-        )
-    except ValueError as error:
-        raise ValueError(
-            f"В матрице 2.3 не найден лист «{MATRIX_ENTITY_SHEET}»."
-        ) from error
-    return _parse_entity_reference_raw(raw)
-
 
 def _entity_reference_signature(frame: pd.DataFrame) -> str:
     columns = [
@@ -1383,15 +1265,15 @@ def _entity_reference_signature(frame: pd.DataFrame) -> str:
 
 
 def get_current_entity_reference() -> tuple[pd.DataFrame, str, str, str, str]:
-    """Load SKU/category/entity mapping independently from the live plan snapshot."""
+    """Load SKU/category/entity mapping from the live Apps Script reference only.
+
+    No entities.xlsx or combo_matrix.xlsx fallback is used. This prevents stale local
+    workbooks from silently replacing the current reference.
+    """
     live_frame, live_source, checked_at, live_error = _fetch_apps_script_entity_reference(
         MATRIX_APPS_SCRIPT_URL,
         MATRIX_APPS_SCRIPT_KEY,
     )
-    errors: list[str] = []
-    if live_error:
-        errors.append(live_error)
-
     if live_frame is not None and not live_frame.empty:
         return (
             live_frame,
@@ -1401,36 +1283,9 @@ def get_current_entity_reference() -> tuple[pd.DataFrame, str, str, str, str]:
             _entity_reference_signature(live_frame),
         )
 
-    # Reference fallback is independent: it may be old while PLAN sheets stay live.
-    # This branch must never replace the current plan snapshot.
-    if COMBO_MATRIX_FILE.exists():
-        try:
-            local_bytes = COMBO_MATRIX_FILE.read_bytes()
-            frame = load_entities_from_matrix_bytes(local_bytes)
-            return (
-                frame,
-                f"Резерв справочника · {COMBO_MATRIX_FILE.name} · лист «{MATRIX_ENTITY_SHEET}»",
-                checked_at,
-                "; ".join(errors),
-                _entity_reference_signature(frame),
-            )
-        except Exception as error:
-            errors.append(f"локальная матрица справочника: {error}")
-
-    if ENTITY_FILE.exists():
-        try:
-            frame = load_entities(str(ENTITY_FILE), ENTITY_FILE.stat().st_mtime)
-            return (
-                frame,
-                f"Аварийный резерв справочника · {ENTITY_FILE.name}",
-                checked_at,
-                "; ".join(errors),
-                _entity_reference_signature(frame),
-            )
-        except Exception as error:
-            errors.append(f"старый справочник: {error}")
-
-    raise RuntimeError("; ".join(errors) or "Справочник SKU/сущностей недоступен.")
+    raise RuntimeError(
+        live_error or "Лист «Справочник» недоступен через Apps Script."
+    )
 
 
 def connection_settings() -> dict[str, object]:
@@ -9164,6 +9019,7 @@ with st.sidebar:
     st.header("Параметры")
     st.caption("Аналитика спроса · версия 75.11.33 · ENTITY REFRESH")
     st.caption("Автозагрузка данных · SEPARATE-MENU")
+    st.caption("Источники: PostgreSQL + Apps Script · без обязательных локальных XLSX")
     st.caption(f"SKU / категории / сущности · {entity_reference_source}")
     if entity_reference_checked_at:
         checked_label = str(entity_reference_checked_at).replace("T", " ")
@@ -9175,11 +9031,7 @@ with st.sidebar:
         help="Сбрасывает только кэш SKU/категорий/сущностей и заново читает лист «Справочник» через Apps Script.",
     ):
         _fetch_apps_script_entity_reference.clear()
-        load_entities_from_matrix_bytes.clear()
-        load_entities.clear()
         st.rerun()
-    if entity_reference_warning and not entity_reference_source.startswith("Apps Script"):
-        st.caption(f"Автоисточник справочника временно недоступен: {entity_reference_warning}. Планы загружаются отдельно.")
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
         pg_host = st.text_input(
             "Сервер",
@@ -17778,7 +17630,7 @@ if tab_plan_check.open:
 
         check_matrix_bytes, check_matrix_source, check_matrix_checked_at, check_matrix_error = _load_matrix_context_for_active_tab()
         if not check_matrix_bytes:
-            st.error("Текущая матрица недоступна. Проверьте Apps Script или резервный combo_matrix.xlsx.")
+            st.error("Текущая матрица недоступна. Проверьте подключение Apps Script.")
             if check_matrix_error:
                 st.caption(f"Причина: {check_matrix_error}")
         else:
@@ -17786,7 +17638,7 @@ if tab_plan_check.open:
             checked_text = str(check_matrix_checked_at or "").replace("T", " ")
             st.success(f"Готовый план подключён: {source_text}" + (f" · проверено {checked_text}" if checked_text else ""))
             if check_matrix_error:
-                st.caption(f"Использован резервный источник. Основной источник сообщил: {check_matrix_error}")
+                st.caption(f"Источник сообщил предупреждение: {check_matrix_error}")
 
             try:
                 ready_matrix_plans = parse_analyst_plan_history(check_matrix_bytes)
@@ -17799,22 +17651,17 @@ if tab_plan_check.open:
             with st.expander("Авто Юнит точки ВМ · параметры точек и экономика", expanded=False):
                 st.caption(
                     "Используются график работы, ТОП-3 аудитории, дневная выручка, чеки и средний чек. "
-                    "Если файл auto_unit_points_vm.xlsx / «Авто Юнит точки ВМ.xlsx» лежит рядом с app.py, он подключается автоматически."
+                    "Авто Юнит теперь необязателен: приложение запускается и работает без локального Excel. "
+                    "При необходимости файл можно загрузить вручную только для этой проверки."
                 )
                 auto_unit_upload = st.file_uploader(
-                    "Заменить источник Авто Юнит (.xlsx)",
+                    "Дополнительно загрузить Авто Юнит (.xlsx)",
                     type=["xlsx"],
                     key="ready_plan_check_auto_unit_upload_v2",
                 )
                 if auto_unit_upload is not None:
                     auto_unit_bytes = auto_unit_upload.getvalue()
                     auto_unit_source = auto_unit_upload.name
-                elif AUTO_UNIT_FILE.exists():
-                    try:
-                        auto_unit_bytes = AUTO_UNIT_FILE.read_bytes()
-                        auto_unit_source = AUTO_UNIT_FILE.name
-                    except OSError:
-                        auto_unit_bytes = b""
 
             if auto_unit_bytes:
                 try:
@@ -18332,7 +18179,7 @@ if tab_forecast.open:
 
         matrix_bytes, matrix_source, matrix_checked_at, matrix_error = _load_matrix_context_for_active_tab()
         if not matrix_bytes:
-            st.error("Текущая матрица недоступна. Проверьте подключение Apps Script или резервный combo_matrix.xlsx.")
+            st.error("Текущая матрица недоступна. Проверьте подключение Apps Script.")
             if matrix_error:
                 st.caption(f"Причина: {matrix_error}")
         else:
@@ -18361,7 +18208,7 @@ if tab_forecast.open:
                 + (f" · проверено {checked_text}" if checked_text else "")
             )
             if matrix_error:
-                st.caption(f"Использован резервный источник. Основной источник сообщил: {matrix_error}")
+                st.caption(f"Источник сообщил предупреждение: {matrix_error}")
 
             try:
                 matrix_menu, matrix_capacity = parse_menu_matrix(matrix_bytes)
