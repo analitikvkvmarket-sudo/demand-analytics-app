@@ -9276,23 +9276,28 @@ def build_cycle_plan_v1(
     sales: pd.DataFrame,
     entities: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Циклический план: перенос факта партии -14 дней по SKU и точке.
+    """Циклический план: SKU -> SKU в неделе -> сущность по всей истории.
 
-    Логика:
-    1. Сравнение строго с датой -14 дней: цикл 1<->3, 2<->4.
-    2. База = фактически съеденное из плановой партии -14 дней на той же точке.
-    3. Если ДАТА НОВОГО ПЛАНА приходится на вторник -> факт x 2 x 0.75 (= x 1.50).
-       Это отдельное правило только для вторника.
-    4. В остальные дни: полностью съедено в День 1 -> факт x 1.50.
-    5. Если полностью съедено в любой другой день -> факт x 1.00.
-    6. Серый период или неполная реализация -> факт x 1.00.
-    7. Если точного SKU в конкретной дате -14 нет, сначала ищется наиболее
-       похожий SKU той же сущности на той же точке в ЭТОЙ ЖЕ дате.
-    8. Если сущности в конкретной дате нет, ищется та же сущность на той же
-       точке по ВСЕМУ соответствующему плану цикла (1<->3, 2<->4).
-       Такой fallback всегда помечается оранжевым.
-    9. Если сущности нет и во всём сопоставимом плане, строка получает
-       статус «Проверить SKU». Категория итоговый план SKU не корректирует.
+    Иерархия основания для каждой точки:
+    1. Тот же день недели позапрошлого цикла: точная дата -14 дней.
+    2. Точный SKU на этой же точке в точную дату -14.
+    3. Если его нет/план 0 — тот же SKU на этой же точке в пределах
+       сопоставимой календарной недели (неделя начинается в воскресенье).
+       Это остаётся точным SKU и цветом не помечается; в синей строке
+       показывается дата, где SKU был найден.
+    4. Если SKU во всей сопоставимой неделе не найден — ищем основание
+       среди всех прошлых планов до текущей даты плана на этой же точке.
+       Для сущности проверяем три критерия:
+         a) совпала категория;
+         b) похоже название/состав по тексту названия блюда;
+         c) полностью совпала внутрянка сущности (Атрибут 1/2/3).
+       3 из 3 -> сильный fallback по сущности (оранжевый).
+       2 из 3 -> допустимый fallback, но красный.
+       Меньше 2 -> кандидат не используется.
+    5. Если основания действительно нет — новый план остаётся пустым.
+    6. Основа расчёта — факт продаж найденной партии. Для понедельника
+       и вторника действует факт x1.5; остальные дни сохраняют правило:
+       полное съедание в День 1 -> x1.5, иначе x1.0.
     """
     columns = [
         "Дата плана",
@@ -9363,19 +9368,25 @@ def build_cycle_plan_v1(
             ["plan_date", "point_number", "sku"], keep="last"
         )
 
+    # ------------------------------------------------------------------
+    # Справочник SKU -> название / категория / внутрянка сущности.
+    # ------------------------------------------------------------------
     entity_frame = entities.copy() if isinstance(entities, pd.DataFrame) else pd.DataFrame()
     sku_entity_map: dict[str, str] = {}
     sku_name_map: dict[str, str] = {}
+    sku_category_map: dict[str, str] = {}
+    sku_attributes_map: dict[str, tuple[str, str, str]] = {}
+
+    def _norm_text(value: object) -> str:
+        text_value = str(value or "").strip().casefold().replace("ё", "е")
+        text_value = re.sub(r"\s+", " ", text_value)
+        if text_value in {"", "nan", "none", "не задана", "не сопоставлено"}:
+            return ""
+        return text_value
 
     if not entity_frame.empty and "sku" in entity_frame.columns:
         entity_frame["sku"] = entity_frame["sku"].map(normalize_sku)
         entity_frame = entity_frame[entity_frame["sku"].notna()].copy()
-
-        if "entity" in entity_frame.columns:
-            for sku_value, entity_value in entity_frame[["sku", "entity"]].itertuples(index=False, name=None):
-                entity_text = str(entity_value or "").strip()
-                if entity_text:
-                    sku_entity_map[str(sku_value)] = entity_text
 
         name_column = next(
             (
@@ -9390,28 +9401,40 @@ def build_cycle_plan_v1(
             ),
             None,
         )
-        if name_column:
-            for sku_value, name_value in entity_frame[["sku", name_column]].itertuples(index=False, name=None):
-                name_text = str(name_value or "").strip()
-                if name_text:
-                    sku_name_map[str(sku_value)] = name_text
 
-    # Названия из меню дополняют справочник и помогают выбрать наиболее похожий SKU.
+        for _, entity_row in entity_frame.iterrows():
+            sku_value = str(entity_row.get("sku"))
+            entity_value = str(entity_row.get("entity", "") or "").strip()
+            if entity_value and _norm_text(entity_value):
+                sku_entity_map[sku_value] = entity_value
+            if name_column:
+                name_value = str(entity_row.get(name_column, "") or "").strip()
+                if name_value:
+                    sku_name_map[sku_value] = name_value
+            category_value = normalize_matrix_category(entity_row.get("category", ""))
+            if category_value:
+                sku_category_map[sku_value] = category_value
+            sku_attributes_map[sku_value] = tuple(
+                _norm_text(entity_row.get(column, ""))
+                for column in ("attribute_1", "attribute_2", "attribute_3")
+            )
+
+    # Названия/категории из самого меню используются как резерв справочника.
     for frame in (reference, target):
         if frame.empty:
             continue
-        for sku_value, name_value in frame[["sku", "product_name"]].itertuples(index=False, name=None):
+        for sku_value, name_value, category_value in frame[
+            ["sku", "product_name", "matrix_category"]
+        ].itertuples(index=False, name=None):
             sku_text = str(sku_value)
             name_text = str(name_value or "").strip()
             if name_text and sku_text not in sku_name_map:
                 sku_name_map[sku_text] = name_text
+            if sku_text not in sku_category_map:
+                sku_category_map[sku_text] = normalize_matrix_category(category_value)
 
     def _entity_key(value: object) -> str:
-        return re.sub(
-            r"\s+",
-            " ",
-            str(value or "").strip().casefold().replace("ё", "е"),
-        )
+        return _norm_text(value)
 
     def _name_similarity(left: object, right: object) -> float:
         left_text = _cycle_plan_normalize_name(left)
@@ -9420,16 +9443,56 @@ def build_cycle_plan_v1(
             return 0.0
         return float(SequenceMatcher(None, left_text, right_text).ratio())
 
+    token_stopwords = {
+        "с", "со", "и", "из", "по", "под", "на", "в", "для", "а", "к",
+        "гр", "г", "мл", "л", "шт", "б", "без", "блюдо", "порция",
+    }
+
+    def _name_tokens(value: object) -> set[str]:
+        text_value = _cycle_plan_normalize_name(value)
+        raw_tokens = re.findall(r"[a-zа-я0-9]+", text_value)
+        tokens: set[str] = set()
+        for token in raw_tokens:
+            if token in token_stopwords or token.isdigit() or len(token) <= 2:
+                continue
+            # Небольшой морфологический якорь помогает сопоставлять, например,
+            # «курица» и «курицей», не прибегая к внешнему NLP.
+            tokens.add(token[:5] if len(token) >= 6 else token)
+        return tokens
+
+    def _name_composition_metrics(left: object, right: object) -> tuple[float, float, int, bool]:
+        ratio = _name_similarity(left, right)
+        left_tokens = _name_tokens(left)
+        right_tokens = _name_tokens(right)
+        common = len(left_tokens & right_tokens)
+        union = len(left_tokens | right_tokens)
+        jaccard = (common / union) if union else 0.0
+        similar = bool(ratio >= 0.45 or jaccard >= 0.30 or common >= 2)
+        score = max(ratio, jaccard)
+        return score, jaccard, common, similar
+
+    def _attribute_overlap(current_sku: str, candidate_sku: str) -> tuple[int, bool]:
+        current_attrs = sku_attributes_map.get(current_sku, ("", "", ""))
+        candidate_attrs = sku_attributes_map.get(candidate_sku, ("", "", ""))
+        current_nonempty = [value for value in current_attrs if value]
+        candidate_nonempty = [value for value in candidate_attrs if value]
+        if not current_nonempty or not candidate_nonempty:
+            return 0, False
+
+        overlap = sum(
+            1
+            for left, right in zip(current_attrs, candidate_attrs)
+            if left and right and left == right
+        )
+        full_match = bool(current_attrs == candidate_attrs and any(current_attrs))
+        return overlap, full_match
+
+    # ------------------------------------------------------------------
+    # Продажи и потребление плановой партии.
+    # ------------------------------------------------------------------
     if sold.empty:
         sold = pd.DataFrame(
-            columns=[
-                "business_date",
-                "shop_number",
-                "sku",
-                "sold_quantity",
-                "cycle_entity",
-                "entity_match_key",
-            ]
+            columns=["business_date", "shop_number", "sku", "sold_quantity"]
         )
     else:
         sold["business_date"] = pd.to_datetime(sold["business_date"], errors="coerce").dt.date
@@ -9444,10 +9507,6 @@ def build_cycle_plan_v1(
             & sold["sku"].notna()
         ].copy()
         sold["shop_number"] = sold["shop_number"].astype(int)
-        sold["cycle_entity"] = sold["sku"].map(
-            lambda value: sku_entity_map.get(str(value), "")
-        )
-        sold["entity_match_key"] = sold["cycle_entity"].map(_entity_key)
 
     sales_lookup: dict[tuple[int, str], pd.DataFrame] = {}
     if not sold.empty:
@@ -9465,7 +9524,6 @@ def build_cycle_plan_v1(
         category_value: str,
         plan_qty: float,
     ) -> tuple[float, int | None]:
-        """Сколько реально съели из партии -14 и на какой день партия закончилась."""
         plan_qty = max(0.0, float(plan_qty or 0.0))
         if plan_qty <= 0:
             return 0.0, None
@@ -9473,7 +9531,6 @@ def build_cycle_plan_v1(
         lifecycle_days = int(product_lifecycle_days(category_value))
         sku_sales = sales_lookup.get((point_number, str(sku_value)), pd.DataFrame())
         daily_values: list[float] = []
-
         for day_number in range(1, lifecycle_days + 1):
             fact_date = plan_date + timedelta(days=day_number)
             if sku_sales.empty:
@@ -9495,7 +9552,6 @@ def build_cycle_plan_v1(
             if cumulative + 1e-9 >= plan_qty:
                 completion_day = day_number
                 break
-
         return consumed, completion_day
 
     ref_lookup = {
@@ -9503,143 +9559,146 @@ def build_cycle_plan_v1(
         for row in reference.itertuples(index=False)
     } if not reference.empty else {}
 
-    if not reference.empty:
-        reference["entity_match_key"] = reference["sku"].map(
-            lambda value: _entity_key(sku_entity_map.get(str(value), ""))
-        )
-    else:
-        reference["entity_match_key"] = pd.Series(dtype=object)
+    def _cycle_week_bounds(reference_date: date) -> tuple[date, date]:
+        # Рабочий цикл меню начинается в воскресенье: Вс-Пн-Вт-Ср-Чт.
+        days_from_sunday = (reference_date.weekday() + 1) % 7
+        week_start = reference_date - timedelta(days=days_from_sunday)
+        return week_start, week_start + timedelta(days=6)
 
-    def _find_entity_menu_proxy(
+    def _find_same_sku_in_cycle_week(
         reference_date: date,
         point_number: int,
-        current_entity: str,
-        current_category: str,
-        current_name: str,
+        sku_value: str,
     ) -> pd.Series | None:
-        """Ищет аналог только на той же точке и только в меню -14 дней."""
-        entity_key_value = _entity_key(current_entity)
-        if not entity_key_value or reference.empty:
+        if reference.empty:
             return None
-
+        week_start, week_end = _cycle_week_bounds(reference_date)
         candidates = reference[
-            reference["plan_date"].eq(reference_date)
-            & reference["point_number"].eq(point_number)
-            & reference["entity_match_key"].eq(entity_key_value)
+            reference["point_number"].eq(point_number)
+            & reference["sku"].astype(str).eq(str(sku_value))
+            & reference["plan_date"].between(week_start, week_end, inclusive="both")
         ].copy()
         if candidates.empty:
             return None
-
-        same_category = candidates[
-            candidates["matrix_category"].map(normalize_matrix_category).eq(
-                normalize_matrix_category(current_category)
-            )
-        ].copy()
-        if not same_category.empty:
-            candidates = same_category
-
-        candidates["name_similarity"] = candidates["product_name"].map(
-            lambda value: _name_similarity(current_name, value)
-        )
         candidates["plan_numeric"] = pd.to_numeric(
             candidates["analyst_plan"], errors="coerce"
         ).fillna(0.0)
-
-        # Пустая/нулевая ячейка плана на конкретной точке не считается
-        # найденной сущностью. Иначе такой SKU блокирует поиск по всей
-        # сопоставимой неделе и ошибочно даёт новый план 0.
         candidates = candidates[candidates["plan_numeric"].gt(0)].copy()
         if candidates.empty:
             return None
-
-        candidates = candidates.sort_values(
-            ["name_similarity", "plan_numeric"],
-            ascending=[False, False],
-            kind="stable",
-        )
-        return candidates.iloc[0]
-
-    def _find_entity_plan_proxy(
-        reference_date: date,
-        point_number: int,
-        current_entity: str,
-        current_category: str,
-        current_name: str,
-    ) -> pd.Series | None:
-        """Ищет сущность по всему сопоставимому плану 1<->3 / 2<->4.
-
-        Сначала определяем лист/неделю, к которой относится точная дата -14,
-        затем ищем только внутри этого плана и только на той же точке.
-        """
-        entity_key_value = _entity_key(current_entity)
-        if not entity_key_value or reference.empty:
-            return None
-
-        scope = reference.copy()
-        sheet_scoped = False
-
-        # Лучший способ не смешать 1-ю и 2-ю (или 3-ю и 4-ю) недели —
-        # использовать plan_sheet той строки, которая относится к точной дате -14.
-        if "plan_sheet" in scope.columns:
-            exact_day = scope[scope["plan_date"].eq(reference_date)].copy()
-            sheet_values = [
-                str(value).strip()
-                for value in exact_day.get("plan_sheet", pd.Series(dtype=object)).dropna().tolist()
-                if str(value).strip()
-            ]
-            if sheet_values:
-                reference_sheet = sheet_values[0]
-                scope = scope[
-                    scope["plan_sheet"].fillna("").astype(str).str.strip().eq(reference_sheet)
-                ].copy()
-                sheet_scoped = True
-
-        # Резерв на случай архивного формата без определимого plan_sheet: не уходим
-        # дальше семи дней от сопоставимой даты, чтобы не смешивать соседние планы.
-        if not sheet_scoped:
-            scope = reference[
-                reference["plan_date"].map(
-                    lambda value: isinstance(value, date) and abs((value - reference_date).days) <= 6
-                )
-            ].copy()
-
-        candidates = scope[
-            scope["point_number"].eq(point_number)
-            & scope["entity_match_key"].eq(entity_key_value)
-        ].copy()
-        if candidates.empty:
-            return None
-
-        same_category = candidates[
-            candidates["matrix_category"].map(normalize_matrix_category).eq(
-                normalize_matrix_category(current_category)
-            )
-        ].copy()
-        if not same_category.empty:
-            candidates = same_category
-
-        candidates["name_similarity"] = candidates["product_name"].map(
-            lambda value: _name_similarity(current_name, value)
-        )
         candidates["date_distance"] = candidates["plan_date"].map(
             lambda value: abs((value - reference_date).days) if isinstance(value, date) else 999
         )
+        candidates = candidates.sort_values(
+            ["date_distance", "plan_date", "plan_numeric"],
+            ascending=[True, False, False],
+            kind="stable",
+        )
+        return candidates.iloc[0]
+
+    def _find_entity_history_proxy(
+        target_date: date,
+        point_number: int,
+        current_sku: str,
+        current_category: str,
+        current_name: str,
+    ) -> pd.Series | None:
+        """Поиск основания по всем прошлым планам этой точки до target_date."""
+        if reference.empty:
+            return None
+
+        candidates = reference[
+            reference["point_number"].eq(point_number)
+            & reference["plan_date"].map(
+                lambda value: isinstance(value, date) and value < target_date
+            )
+        ].copy()
+        if candidates.empty:
+            return None
+
         candidates["plan_numeric"] = pd.to_numeric(
             candidates["analyst_plan"], errors="coerce"
         ).fillna(0.0)
-
-        # В недельном fallback также используем только реальные плановые
-        # значения этой точки, а не строки меню с пустым/нулевым Т-планом.
         candidates = candidates[candidates["plan_numeric"].gt(0)].copy()
         if candidates.empty:
             return None
 
-        candidates = candidates.sort_values(
-            ["name_similarity", "date_distance", "plan_numeric"],
-            ascending=[False, True, False],
+        scored_rows: list[dict[str, object]] = []
+        current_category_norm = normalize_matrix_category(current_category)
+
+        for _, candidate in candidates.iterrows():
+            candidate_sku = str(candidate.get("sku", ""))
+            candidate_name = str(candidate.get("product_name", "") or "").strip()
+            candidate_category = normalize_matrix_category(
+                candidate.get("matrix_category", sku_category_map.get(candidate_sku, ""))
+            )
+
+            category_match = bool(
+                current_category_norm
+                and candidate_category
+                and current_category_norm == candidate_category
+            )
+            name_score, name_jaccard, common_tokens, name_match = _name_composition_metrics(
+                current_name,
+                candidate_name,
+            )
+            attribute_overlap, entity_full_match = _attribute_overlap(
+                current_sku,
+                candidate_sku,
+            )
+
+            # Если в справочнике entity есть, но отдельные атрибуты отсутствуют,
+            # точное совпадение строки entity тоже считается полной внутрянкой.
+            if not entity_full_match:
+                current_entity_key = _entity_key(sku_entity_map.get(current_sku, ""))
+                candidate_entity_key = _entity_key(sku_entity_map.get(candidate_sku, ""))
+                if current_entity_key and current_entity_key == candidate_entity_key:
+                    entity_full_match = True
+
+            criteria_count = int(category_match) + int(name_match) + int(entity_full_match)
+            if criteria_count < 2:
+                continue
+
+            scored_rows.append({
+                "candidate_index": candidate.name,
+                "criteria_count": criteria_count,
+                "category_match": int(category_match),
+                "name_match": int(name_match),
+                "entity_full_match": int(entity_full_match),
+                "name_score": float(name_score),
+                "name_jaccard": float(name_jaccard),
+                "common_tokens": int(common_tokens),
+                "attribute_overlap": int(attribute_overlap),
+                "plan_date": candidate.get("plan_date"),
+                "plan_numeric": float(candidate.get("plan_numeric", 0.0)),
+            })
+
+        if not scored_rows:
+            return None
+
+        scored = pd.DataFrame(scored_rows)
+        scored = scored.sort_values(
+            [
+                "criteria_count",
+                "entity_full_match",
+                "category_match",
+                "name_score",
+                "attribute_overlap",
+                "plan_date",
+                "plan_numeric",
+            ],
+            ascending=[False, False, False, False, False, False, False],
             kind="stable",
         )
-        return candidates.iloc[0]
+        best = scored.iloc[0]
+        chosen = candidates.loc[best["candidate_index"]].copy()
+        chosen["_criteria_count"] = int(best["criteria_count"])
+        chosen["_category_match"] = bool(best["category_match"])
+        chosen["_name_match"] = bool(best["name_match"])
+        chosen["_entity_full_match"] = bool(best["entity_full_match"])
+        chosen["_name_score"] = float(best["name_score"])
+        chosen["_attribute_overlap"] = int(best["attribute_overlap"])
+        return chosen
 
     rows: list[dict[str, object]] = []
 
@@ -9692,131 +9751,120 @@ def build_cycle_plan_v1(
 
         calculation_sku = sku
         basis_category = category
+        basis_reference_date = reference_date
         previous_plan = 0.0
         consumed = 0.0
         completion_day: int | None = None
         entity_fallback_used = False
+        red_entity_fallback = False
+        exact_week_fallback = False
 
-        # Точное совпадение считается точным только на ЭТОЙ ЖЕ точке.
+        # 1) Точный SKU в том же дне недели (-14 дней).
         previous = ref_lookup.get((reference_date, point_number, sku))
         if previous is not None:
             previous_plan = max(
                 0.0,
                 float(getattr(previous, "analyst_plan", 0.0) or 0.0),
             )
-            # SKU с пустым/нулевым планом на этой точке фактически не был
-            # поставлен сюда. Не останавливаемся на нуле — запускаем fallback.
             if previous_plan <= 0:
                 previous = None
 
-        if previous is not None:
-            basis_category = normalize_matrix_category(
-                getattr(previous, "matrix_category", category)
-            )
-            consumed, completion_day = _batch_consumption(
+        # 2) Тот же SKU где угодно в сопоставимой неделе 1<->3 / 2<->4.
+        if previous is None:
+            week_sku = _find_same_sku_in_cycle_week(
                 reference_date,
+                point_number,
+                sku,
+            )
+            if week_sku is not None:
+                calculation_sku = sku
+                basis_reference_date = week_sku.get("plan_date")
+                if not isinstance(basis_reference_date, date):
+                    basis_reference_date = reference_date
+                previous_plan = max(0.0, float(week_sku.get("plan_numeric", 0.0) or 0.0))
+                basis_category = normalize_matrix_category(
+                    week_sku.get("matrix_category", category)
+                )
+                basis_name = str(week_sku.get("product_name", "") or "").strip() or name
+                row["Дата сравнения SKU"] = basis_reference_date
+                row["SKU-основание"] = sku
+                row["Название основания"] = basis_name
+                row["Тип сопоставления"] = "Точный SKU · найден в неделе"
+                row["Сопоставление неуверенное"] = False
+                exact_week_fallback = True
+                previous = week_sku
+
+        if previous is not None:
+            if not exact_week_fallback:
+                basis_category = normalize_matrix_category(
+                    getattr(previous, "matrix_category", category)
+                )
+                basis_reference_date = reference_date
+            consumed, completion_day = _batch_consumption(
+                basis_reference_date,
                 point_number,
                 calculation_sku,
                 basis_category,
                 previous_plan,
             )
         else:
-            proxy_row = _find_entity_menu_proxy(
-                reference_date,
+            # 3) SKU не найден во всей сопоставимой неделе -> сущность / название
+            # по всей доступной истории планов до текущей даты.
+            proxy_row = _find_entity_history_proxy(
+                target_date,
                 point_number,
-                current_entity,
+                sku,
                 category,
                 name,
             )
-            if proxy_row is not None:
-                calculation_sku = str(proxy_row["sku"])
-                matched_name = str(proxy_row.get("product_name", "") or "").strip()
-                previous_plan = max(
-                    0.0,
-                    float(
-                        pd.to_numeric(
-                            pd.Series([proxy_row.get("analyst_plan")]),
-                            errors="coerce",
-                        ).fillna(0.0).iloc[0]
-                    ),
-                )
-                basis_category = normalize_matrix_category(
-                    proxy_row.get("matrix_category", category)
-                )
-                consumed, completion_day = _batch_consumption(
-                    reference_date,
-                    point_number,
-                    calculation_sku,
-                    basis_category,
-                    previous_plan,
-                )
-                entity_fallback_used = True
-                row["SKU-основание"] = calculation_sku
-                row["Название основания"] = matched_name
-                row["Тип сопоставления"] = "По сущности · меню -14"
-                row["Сопоставление неуверенное"] = True
-            else:
-                proxy_row = _find_entity_plan_proxy(
-                    reference_date,
-                    point_number,
-                    current_entity,
-                    category,
-                    name,
-                )
-                if proxy_row is None:
-                    row["Статус"] = "Проверить SKU"
-                    rows.append(row)
-                    continue
+            if proxy_row is None:
+                row["Статус"] = "Нет основания для расчёта"
+                row["Тип сопоставления"] = "Не найдено"
+                rows.append(row)
+                continue
 
-                calculation_sku = str(proxy_row["sku"])
-                matched_name = str(proxy_row.get("product_name", "") or "").strip()
-                basis_reference_date = proxy_row.get("plan_date")
-                if not isinstance(basis_reference_date, date):
-                    basis_reference_date = reference_date
-                previous_plan = max(
-                    0.0,
-                    float(
-                        pd.to_numeric(
-                            pd.Series([proxy_row.get("analyst_plan")]),
-                            errors="coerce",
-                        ).fillna(0.0).iloc[0]
-                    ),
-                )
-                basis_category = normalize_matrix_category(
-                    proxy_row.get("matrix_category", category)
-                )
-                consumed, completion_day = _batch_consumption(
-                    basis_reference_date,
-                    point_number,
-                    calculation_sku,
-                    basis_category,
-                    previous_plan,
-                )
-                entity_fallback_used = True
-                row["Дата сравнения SKU"] = basis_reference_date
-                row["SKU-основание"] = calculation_sku
-                row["Название основания"] = matched_name
-                row["Тип сопоставления"] = "По сущности · весь план цикла"
-                row["Сопоставление неуверенное"] = True
+            calculation_sku = str(proxy_row.get("sku", ""))
+            matched_name = str(proxy_row.get("product_name", "") or "").strip()
+            basis_reference_date = proxy_row.get("plan_date")
+            if not isinstance(basis_reference_date, date):
+                basis_reference_date = reference_date
+            previous_plan = max(
+                0.0,
+                float(proxy_row.get("plan_numeric", proxy_row.get("analyst_plan", 0.0)) or 0.0),
+            )
+            basis_category = normalize_matrix_category(
+                proxy_row.get("matrix_category", sku_category_map.get(calculation_sku, category))
+            )
+            consumed, completion_day = _batch_consumption(
+                basis_reference_date,
+                point_number,
+                calculation_sku,
+                basis_category,
+                previous_plan,
+            )
 
-        realization_ratio = (
-            consumed / previous_plan
-            if previous_plan > 0
-            else pd.NA
-        )
+            criteria_count = int(proxy_row.get("_criteria_count", 2) or 2)
+            red_entity_fallback = criteria_count == 2
+            entity_fallback_used = True
+            row["Дата сравнения SKU"] = basis_reference_date
+            row["SKU-основание"] = calculation_sku
+            row["Название основания"] = matched_name
+            row["Тип сопоставления"] = (
+                "По сущности/названию · 2/3 критерия · КРАСНЫЙ"
+                if red_entity_fallback
+                else "По сущности/названию · 3/3 критерия"
+            )
+            row["Сопоставление неуверенное"] = True
 
+        realization_ratio = consumed / previous_plan if previous_plan > 0 else pd.NA
         sold_out = (
             previous_plan > 0
             and consumed + 1e-9 >= previous_plan
             and completion_day is not None
         )
-
-        # Основа плана всегда ФАКТ, а не прошлый план.
         base_fact = max(0.0, float(consumed))
 
-        # Отдельное правило для даты плана: ПОНЕДЕЛЬНИК и ВТОРНИК.
-        # Важно: привязка идёт именно к target_date, а не к дате продаж/сравнения.
-        # В оба дня новый план = факт продаж партии × 1.50.
+        # Коэффициенты оставляем по последнему согласованному правилу.
         if target_date.weekday() in (0, 1):  # Понедельник, Вторник
             sku_k = 1.50
             strength_priority = 4
@@ -9836,31 +9884,33 @@ def build_cycle_plan_v1(
         else:
             sku_k = 1.00
             strength_priority = 1
-            if previous_plan > 0:
-                status = (
-                    f"Не съеден полностью · факт {base_fact:g} из {previous_plan:g} ×1.0"
-                )
-            else:
-                status = f"Перенос факта {base_fact:g} ×1.0"
+            status = (
+                f"Не съеден полностью · факт {base_fact:g} из {previous_plan:g} ×1.0"
+                if previous_plan > 0
+                else f"Перенос факта {base_fact:g} ×1.0"
+            )
 
         new_plan = int(math.ceil(base_fact * sku_k)) if base_fact > 0 else 0
 
-        if entity_fallback_used:
-            entity_label = str(current_entity or "").strip()
-            basis_name = str(row.get("Название основания", "") or "").strip()
+        if exact_week_fallback:
             status = (
-                f"{status} · {row['Тип сопоставления']} «{entity_label}» · "
-                f"сравниваем с блюдом «{basis_name}» (SKU {calculation_sku}) · "
-                f"плановое значение основания {previous_plan:g} · ОРАНЖЕВЫЙ"
+                f"{status} · точный SKU найден в сопоставимой неделе "
+                f"{basis_reference_date:%d.%m.%Y} · план основания {previous_plan:g}"
+            )
+        elif entity_fallback_used:
+            basis_name = str(row.get("Название основания", "") or "").strip()
+            criteria_text = "2/3 · КРАСНЫЙ" if red_entity_fallback else "3/3 · ОРАНЖЕВЫЙ"
+            status = (
+                f"{status} · {row['Тип сопоставления']} · "
+                f"сравниваем с «{basis_name}» · план основания {previous_plan:g} · "
+                f"критерии {criteria_text}"
             )
 
         row.update({
             "Прошлый план SKU": float(previous_plan),
             "Факт SKU за срок": base_fact,
             "Реализация SKU, %": realization_ratio,
-            "День полного съедания": (
-                completion_day if completion_day is not None else pd.NA
-            ),
+            "День полного съедания": completion_day if completion_day is not None else pd.NA,
             "K SKU": float(sku_k),
             "Минимум SKU": int(new_plan),
             "Вес добора SKU": float(previous_plan),
@@ -9881,7 +9931,6 @@ def build_cycle_plan_v1(
         ascending=[True, True, True, False, True, True],
         kind="stable",
     ).reset_index(drop=True)
-
 
 def _cycle_plan_find_block_header(sheet, date_row: int, next_date_row: int) -> int | None:
     """Find the menu header row inside one matrix date block."""
@@ -10046,15 +10095,13 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                         continue
                     target_cell = sheet.cell(row_number, point_column)
                     status = str(record.get("Статус", "") or "")
-                    if status == "Проверить SKU":
+                    if status in {"Проверить SKU", "Нет основания для расчёта"}:
                         target_cell.value = None
-                        target_cell.fill = PatternFill("solid", fgColor="F4CCCC")
-                        target_cell.font = Font(color="9C0006")
                         target_cell.comment = Comment(
                             (
-                                "Проверить SKU.\n"
-                                f"Дата сравнения: {record.get('Дата сравнения SKU', '')}\n"
-                                "SKU отсутствует в сопоставимом меню даты сравнения."
+                                "Нет основания для расчёта.\n"
+                                f"Базовая дата цикла: {record.get('Дата прошлого меню категории', '')}\n"
+                                "Точный SKU не найден в сопоставимой неделе, а по истории не найден кандидат, прошедший минимум 2 из 3 критериев."
                             ),
                             "Циклический план",
                         )
@@ -10068,7 +10115,11 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
 
                     uncertain_match = bool(record.get("Сопоставление неуверенное", False))
                     match_type = str(record.get("Тип сопоставления", "") or "")
-                    if uncertain_match:
+                    red_entity_match = "КРАСНЫЙ" in match_type.upper()
+                    if red_entity_match:
+                        target_cell.fill = PatternFill("solid", fgColor="F4CCCC")
+                        target_cell.font = Font(color="9C0006", bold=True)
+                    elif uncertain_match:
                         target_cell.fill = PatternFill("solid", fgColor="FCE4D6")
                         target_cell.font = Font(color="9C5700", bold=True)
 
@@ -10157,7 +10208,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
             green_days = int(first.get("Зелёное окно, дней", 0) or 0)
             reference_date = first.get("Дата сравнения SKU", "")
             sheet.cell(diag_row, category_column).value = f"Окно свежести: {green_days} дн."
-            sheet.cell(diag_row, name_column).value = f"Сравнение SKU с {reference_date} · синяя строка = прошлый план + блюдо сравнения"
+            sheet.cell(diag_row, name_column).value = "Синяя строка: точный день — план; SKU из недели — план + дата; сущность — план + блюдо сравнения"
             sheet.cell(diag_row, category_column).font = Font(bold=True, color="7F6000")
             sheet.cell(diag_row, name_column).font = Font(bold=True, color="1F4E78")
 
@@ -10166,17 +10217,13 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                 point_column = headers.get(point_label)
                 if point_column is None:
                     continue
-                if str(record.get("Статус", "") or "") == "Проверить SKU":
+                if str(record.get("Статус", "") or "") in {"Проверить SKU", "Нет основания для расчёта"}:
                     diag_cell = sheet.cell(diag_row, point_column)
                     diag_cell.value = None
-                    diag_cell.fill = PatternFill("solid", fgColor="F4CCCC")
-                    diag_cell.font = Font(color="9C0006", bold=True)
+                    diag_cell.fill = PatternFill("solid", fgColor="DDEBF7")
+                    diag_cell.font = Font(color="1F4E78", bold=True)
                     diag_cell.comment = Comment(
-                        (
-                            "Проверить SKU.\n"
-                            f"Дата сравнения: {record.get('Дата сравнения SKU', '')}\n"
-                            "SKU отсутствует в сопоставимом меню даты сравнения."
-                        ),
+                        "Основание не найдено — план оставлен пустым.",
                         "Циклический план",
                     )
                 else:
@@ -10254,35 +10301,54 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                     if not basis_name:
                         basis_name = str(record.get("Название блюда", "") or "").strip()
 
-                    diag_cell.value = (
-                        None
-                        if pd.isna(previous_plan)
-                        else f"План {prev_text}\n{basis_name}"
-                    )
+                    basis_date = record.get("Дата сравнения SKU")
+                    if isinstance(basis_date, pd.Timestamp):
+                        basis_date = basis_date.date()
+                    if match_type == "Точный SKU · найден в неделе":
+                        date_label = (
+                            basis_date.strftime("%d.%m.%Y")
+                            if isinstance(basis_date, date)
+                            else str(basis_date or "")
+                        )
+                        diag_cell.value = (
+                            None if pd.isna(previous_plan) else f"План {prev_text}\n{date_label}"
+                        )
+                    elif match_type.startswith("По сущности/названию"):
+                        # По просьбе пользователя здесь только план основания и
+                        # конкретное название блюда, с которым сравнивали.
+                        diag_cell.value = (
+                            None if pd.isna(previous_plan) else f"План {prev_text}\n{basis_name}"
+                        )
+                    else:
+                        diag_cell.value = None if pd.isna(previous_plan) else f"План {prev_text}"
+
                     diag_cell.alignment = Alignment(
                         horizontal="center",
                         vertical="center",
                         wrap_text=True,
                         shrink_to_fit=True,
                     )
-                    # Диагностическая строка всегда остаётся синей.
-                    # Оранжевым помечается только рассчитанная ячейка основного плана,
-                    # если использован fallback по сущности.
                     diag_cell.fill = PatternFill("solid", fgColor="DDEBF7")
+                    red_entity_match = "КРАСНЫЙ" in match_type.upper()
                     diag_cell.font = Font(
-                        color="9C5700" if uncertain_match else "1F4E78",
+                        color=(
+                            "9C0006" if red_entity_match
+                            else ("9C5700" if uncertain_match else "1F4E78")
+                        ),
                         bold=True,
                         size=8,
                     )
                     if uncertain_match:
                         diag_cell.comment = Comment(
                             (
-                                "Неуверенное сопоставление по сущности.\n"
-                                f"Сущность: {record.get('Сущность текущего SKU', '')}\n"
-                                f"Использован SKU: {record.get('SKU-основание', '')}\n"
+                                f"Тип сопоставления: {match_type}\n"
                                 f"Сравниваем с блюдом: {record.get('Название основания', '')}\n"
                                 f"Плановое значение основания: {prev_text}\n"
-                                "Число рассчитано и поставлено в план, но рекомендуется проверить соответствие."
+                                + (
+                                    "Совпало только 2 из 3 критериев — основная ячейка помечена красным."
+                                    if red_entity_match
+                                    else "Совпали все 3 критерия; основная ячейка помечена оранжевым как fallback."
+                                )
                             ),
                             "Циклический план",
                         )
@@ -18203,12 +18269,12 @@ if tab_cycle_plan.open:
     with tab_cycle_plan:
         st.subheader("Циклический план · сравнение с позапрошлой неделей")
         st.caption(
-            "План переносится из факта партии ровно −14 дней (цикл 1↔3, 2↔4) отдельно по каждому SKU и точке. "
-            "Для даты плана в понедельник и вторник: факт ×1,50. "
-            "В остальные дни: съели полностью в День 1 → факт ×1,50; если полностью съели позже или не съели полностью → факт ×1,00. "
-            "Если точного SKU нет, сначала ищется похожий SKU той же сущности в этой же дате −14; "
-            "если его нет — сущность ищется по всей соответствующей неделе плана на этой же точке. "
-            "Fallback помечается оранжевым. Синяя строка показывает только прошлое плановое значение."
+            "Проверка идёт по циклу −14 дней (1↔3, 2↔4): сначала тот же день недели и точный SKU. "
+            "Если SKU в этом дне нет, тот же SKU ищется по всей сопоставимой неделе на этой же точке — без цветовой метки, "
+            "а в синей строке показывается дата найденной партии. Если SKU во всей неделе нет, основание ищется по всем прошлым "
+            "планам до текущей даты: категория + схожее название/состав + внутрянка сущности. 3/3 критерия — оранжевый fallback; "
+            "2/3 — красный. Если надёжного основания нет, ячейка остаётся пустой. Для понедельника и вторника факт ×1,50; "
+            "в остальные дни День 1 ×1,50, иначе ×1,00. При сущности синяя строка показывает только план основания и название блюда сравнения."
         )
 
         matrix_bytes, matrix_source, matrix_checked_at, matrix_error = _load_matrix_context_for_active_tab()
@@ -18253,69 +18319,63 @@ if tab_cycle_plan.open:
                                     cycle_matrix_plans["plan_date"].isin(selected_dates)
                                 ].copy()
 
-                                # Основное сравнение всегда идёт по точной дате -14 дней.
-                                # Если SKU/сущность в этот день не найдены, fallback может смотреть
-                                # ВСЮ соответствующую неделю плана цикла 1↔3 / 2↔4.
+                                # Для точного SKU сначала нужен цикл -14, а для сущности —
+                                # вся доступная история планов до последней выбранной даты.
                                 reference_dates = sorted({
                                     d - timedelta(days=14)
                                     for d in selected_dates
                                 })
+                                history_cutoff = max(selected_dates)
 
-                                exact_current_reference = cycle_matrix_plans[
-                                    cycle_matrix_plans["plan_date"].isin(reference_dates)
+                                # Текущая матрица: берём все плановые даты до cutoff.
+                                current_history = cycle_matrix_plans[
+                                    cycle_matrix_plans["plan_date"].map(
+                                        lambda value: isinstance(value, date) and value < history_cutoff
+                                    )
                                 ].copy()
-                                current_dates = set(
-                                    exact_current_reference["plan_date"].dropna().tolist()
+
+                                # Системный архив: подгружаем все сохранённые прошлые даты.
+                                archive_date_isos, archive_dates_error = _fetch_system_menu_archive_dates(
+                                    MENU_ARCHIVE_APPS_SCRIPT_URL,
+                                    MENU_ARCHIVE_APPS_SCRIPT_KEY,
                                 )
-
-                                # Находим лист исторического плана по самой дате -14 и добавляем
-                                # в reference все его даты. Так поиск сущности не смешивает 1/2 недели.
-                                current_reference = exact_current_reference.copy()
-                                if (
-                                    not exact_current_reference.empty
-                                    and "plan_sheet" in exact_current_reference.columns
-                                    and "plan_sheet" in cycle_matrix_plans.columns
-                                ):
-                                    reference_sheet_names = {
-                                        str(value).strip()
-                                        for value in exact_current_reference["plan_sheet"].dropna().tolist()
-                                        if str(value).strip()
-                                    }
-                                    if reference_sheet_names:
-                                        full_cycle_reference = cycle_matrix_plans[
-                                            cycle_matrix_plans["plan_sheet"]
-                                            .fillna("")
-                                            .astype(str)
-                                            .str.strip()
-                                            .isin(reference_sheet_names)
-                                        ].copy()
-                                        current_reference = pd.concat(
-                                            [exact_current_reference, full_cycle_reference],
-                                            ignore_index=True,
-                                        ).drop_duplicates(
-                                            ["plan_date", "point_number", "sku"],
-                                            keep="last",
-                                        )
-
-                                missing_dates = [
-                                    d for d in reference_dates
-                                    if d not in current_dates
-                                ]
+                                archive_history_dates: list[str] = []
+                                for iso_value in archive_date_isos:
+                                    try:
+                                        archive_date_value = date.fromisoformat(str(iso_value))
+                                    except Exception:
+                                        continue
+                                    if archive_date_value < history_cutoff:
+                                        archive_history_dates.append(archive_date_value.isoformat())
 
                                 archive_reference = pd.DataFrame()
-                                archive_error = ""
-                                if missing_dates:
-                                    archive_reference, archive_error = _fetch_system_menu_archive_freshness_range(
+                                archive_error = archive_dates_error or ""
+                                if archive_history_dates:
+                                    archive_reference, archive_load_error = _fetch_system_menu_archive_freshness_range(
                                         MENU_ARCHIVE_APPS_SCRIPT_URL,
                                         MENU_ARCHIVE_APPS_SCRIPT_KEY,
-                                        tuple(d.isoformat() for d in missing_dates),
+                                        tuple(sorted(set(archive_history_dates))),
                                     )
+                                    if archive_load_error:
+                                        archive_error = "; ".join(
+                                            value for value in [archive_error, archive_load_error] if value
+                                        )
 
-                                parts = [f for f in [current_reference, archive_reference] if f is not None and not f.empty]
-                                reference_plans = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+                                # Архив идёт первым, актуальная матрица — последней, чтобы при
+                                # одинаковой дате текущая матрица имела приоритет.
+                                parts = [
+                                    frame
+                                    for frame in [archive_reference, current_history]
+                                    if frame is not None and not frame.empty
+                                ]
+                                reference_plans = (
+                                    pd.concat(parts, ignore_index=True)
+                                    if parts
+                                    else pd.DataFrame()
+                                )
                                 if not reference_plans.empty:
                                     reference_plans = reference_plans.drop_duplicates(
-                                        ["plan_date","point_number","sku"], keep="last"
+                                        ["plan_date", "point_number", "sku"], keep="last"
                                     )
 
                                 points = tuple(sorted(
