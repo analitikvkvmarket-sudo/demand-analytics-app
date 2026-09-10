@@ -9814,13 +9814,14 @@ def build_cycle_plan_v1(
         # Основа плана всегда ФАКТ, а не прошлый план.
         base_fact = max(0.0, float(consumed))
 
-        # Отдельное правило ТОЛЬКО для даты плана, которая приходится на вторник.
-        # Важно: привязка идёт к target_date, а не к дате продаж/дате сравнения.
-        # Формула пользователя: факт × 2 × 0.75 = факт × 1.50.
-        if target_date.weekday() == 1:  # Вторник
-            sku_k = 2.00 * 0.75
+        # Отдельное правило для даты плана: ПОНЕДЕЛЬНИК и ВТОРНИК.
+        # Важно: привязка идёт именно к target_date, а не к дате продаж/сравнения.
+        # В оба дня новый план = факт продаж партии × 1.50.
+        if target_date.weekday() in (0, 1):  # Понедельник, Вторник
+            sku_k = 1.50
             strength_priority = 4
-            status = "Вторник · факт ×2 ×0.75 = ×1.5"
+            weekday_name = WEEKDAY_RU.get(target_date.weekday(), "")
+            status = f"{weekday_name} · факт ×1.5"
         elif sold_out and completion_day == 1:
             sku_k = 1.50
             strength_priority = 4
@@ -9846,9 +9847,11 @@ def build_cycle_plan_v1(
 
         if entity_fallback_used:
             entity_label = str(current_entity or "").strip()
+            basis_name = str(row.get("Название основания", "") or "").strip()
             status = (
-                f"{status} · {row['Тип сопоставления']} «{entity_label}» "
-                f"через SKU {calculation_sku} · ОРАНЖЕВЫЙ"
+                f"{status} · {row['Тип сопоставления']} «{entity_label}» · "
+                f"сравниваем с блюдом «{basis_name}» (SKU {calculation_sku}) · "
+                f"плановое значение основания {previous_plan:g} · ОРАНЖЕВЫЙ"
             )
 
         row.update({
@@ -10074,10 +10077,17 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                     coefficient = pd.to_numeric(pd.Series([record.get("K SKU")]), errors="coerce").iloc[0]
                     completion = record.get("День полного съедания")
                     completion_text = "не съеден полностью" if pd.isna(completion) else f"день {int(completion)}"
+                    previous_plan_text = 0 if pd.isna(previous_plan) else float(previous_plan)
+                    basis_name = str(record.get("Название основания", "") or "").strip()
+                    entity_compare_line = (
+                        f"Сравниваем с блюдом: {basis_name}\n"
+                        if match_type.startswith("По сущности")
+                        else ""
+                    )
                     target_cell.comment = Comment(
                         (
                             f"Дата сравнения: {record.get('Дата сравнения SKU', '')}\n"
-                            f"Прошлый план: {0 if pd.isna(previous_plan) else float(previous_plan):g}\n"
+                            f"Плановое значение основания: {previous_plan_text:g}\n"
                             f"Съедено в срок: {0 if pd.isna(consumed) else float(consumed):g}\n"
                             f"Полное съедание: {completion_text}\n"
                             f"Зелёное окно: {int(record.get('Зелёное окно, дней', 0) or 0)} дн.\n"
@@ -10086,7 +10096,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                             f"Тип сопоставления: {match_type}\n"
                             f"Сущность: {record.get('Сущность текущего SKU', '')}\n"
                             f"SKU-основание: {record.get('SKU-основание', '')}\n"
-                            f"Название основания: {record.get('Название основания', '')}\n"
+                            f"{entity_compare_line}"
                             f"Статус: {status}"
                         ),
                         "Циклический план",
@@ -10258,7 +10268,8 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                                 "Неуверенное сопоставление по сущности.\n"
                                 f"Сущность: {record.get('Сущность текущего SKU', '')}\n"
                                 f"Использован SKU: {record.get('SKU-основание', '')}\n"
-                                f"Название основания: {record.get('Название основания', '')}\n"
+                                f"Сравниваем с блюдом: {record.get('Название основания', '')}\n"
+                                f"Плановое значение основания: {prev_text}\n"
                                 "Число рассчитано и поставлено в план, но рекомендуется проверить соответствие."
                             ),
                             "Циклический план",
@@ -18181,7 +18192,7 @@ if tab_cycle_plan.open:
         st.subheader("Циклический план · сравнение с позапрошлой неделей")
         st.caption(
             "План переносится из факта партии ровно −14 дней (цикл 1↔3, 2↔4) отдельно по каждому SKU и точке. "
-            "ТОЛЬКО для даты плана во вторник: факт ×2 ×0,75 (= ×1,50). "
+            "Для даты плана в понедельник и вторник: факт ×1,50. "
             "В остальные дни: съели полностью в День 1 → факт ×1,50; если полностью съели позже или не съели полностью → факт ×1,00. "
             "Если точного SKU нет, сначала ищется похожий SKU той же сущности в этой же дате −14; "
             "если его нет — сущность ищется по всей соответствующей неделе плана на этой же точке. "
