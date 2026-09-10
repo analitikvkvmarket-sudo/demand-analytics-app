@@ -10137,7 +10137,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                 continue
             sheet.insert_rows(source_row + 1, amount=1)
             diag_row = source_row + 1
-            sheet.row_dimensions[diag_row].height = sheet.row_dimensions[source_row].height
+            sheet.row_dimensions[diag_row].height = max(32, sheet.row_dimensions[source_row].height or 15)
             for column in range(1, sheet.max_column + 1):
                 source_cell = sheet.cell(source_row, column)
                 target_cell = sheet.cell(diag_row, column)
@@ -10157,7 +10157,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
             green_days = int(first.get("Зелёное окно, дней", 0) or 0)
             reference_date = first.get("Дата сравнения SKU", "")
             sheet.cell(diag_row, category_column).value = f"Окно свежести: {green_days} дн."
-            sheet.cell(diag_row, name_column).value = f"Сравнение SKU с {reference_date} · синяя строка = прошлый план"
+            sheet.cell(diag_row, name_column).value = f"Сравнение SKU с {reference_date} · синяя строка = прошлый план + блюдо сравнения"
             sheet.cell(diag_row, category_column).font = Font(bold=True, color="7F6000")
             sheet.cell(diag_row, name_column).font = Font(bold=True, color="1F4E78")
 
@@ -10250,19 +10250,31 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                             f" | сущность→SKU {record.get('SKU-основание', '')}"
                         )
 
+                    basis_name = str(record.get("Название основания", "") or "").strip()
+                    if not basis_name:
+                        basis_name = str(record.get("Название блюда", "") or "").strip()
+
                     diag_cell.value = (
                         None
                         if pd.isna(previous_plan)
-                        else int(round(float(previous_plan)))
+                        else f"План {prev_text}\n{basis_name}"
                     )
                     diag_cell.alignment = Alignment(
                         horizontal="center",
                         vertical="center",
                         wrap_text=True,
+                        shrink_to_fit=True,
+                    )
+                    # Диагностическая строка всегда остаётся синей.
+                    # Оранжевым помечается только рассчитанная ячейка основного плана,
+                    # если использован fallback по сущности.
+                    diag_cell.fill = PatternFill("solid", fgColor="DDEBF7")
+                    diag_cell.font = Font(
+                        color="9C5700" if uncertain_match else "1F4E78",
+                        bold=True,
+                        size=8,
                     )
                     if uncertain_match:
-                        diag_cell.fill = PatternFill("solid", fgColor="FCE4D6")
-                        diag_cell.font = Font(color="9C5700", bold=True)
                         diag_cell.comment = Comment(
                             (
                                 "Неуверенное сопоставление по сущности.\n"
