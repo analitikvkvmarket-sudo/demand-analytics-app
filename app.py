@@ -10604,17 +10604,144 @@ with st.container(key="section_header_v759"):
 st.session_state["main_tabs_v1"] = selected_main_section
 
 if selected_main_section == "Аналитика DataLens":
-    st.subheader("Аналитика DataLens")
-    st.caption(
-        "Основной дашборд «свежак». Дата меню и точки "
-        "выбираются непосредственно внутри DataLens."
+    # DataLens is already a complete analytical interface. On this page we
+    # deliberately remove the global Streamlit sidebar and extra page chrome,
+    # so the embedded dashboard gets the maximum useful width. Other sections
+    # keep the standard application layout unchanged.
+    st.markdown(
+        """
+<style>
+/* ===== DataLens full-width mode ===== */
+section[data-testid="stSidebar"] {
+    display: none !important;
+}
+button[data-testid="stSidebarCollapsedControl"],
+[data-testid="stSidebarCollapsedControl"] {
+    display: none !important;
+}
+header[data-testid="stHeader"] {
+    background: transparent !important;
+}
+
+/* Use almost the entire browser width for the embedded dashboard. */
+[data-testid="stMainBlockContainer"],
+.main .block-container {
+    max-width: none !important;
+    width: 100% !important;
+    padding-left: 0.85rem !important;
+    padding-right: 0.85rem !important;
+    padding-top: 0.55rem !important;
+    padding-bottom: 1rem !important;
+}
+
+/* Compact app navigation: one slim row above DataLens. */
+.st-key-section_header_v759 {
+    margin: 0 0 0.55rem 0 !important;
+    padding: 0.2rem 0 0.45rem 0 !important;
+    border-bottom: 1px solid #e8ecf2 !important;
+}
+.st-key-section_header_v759 div[data-testid="stButton"] > button {
+    min-height: 38px !important;
+    border-radius: 10px !important;
+}
+.vk-current-section {
+    min-height: 38px !important;
+    font-size: 20px !important;
+}
+
+/* Clean dashboard shell. */
+.vk-datalens-shell {
+    width: 100%;
+    margin: 0;
+    padding: 0;
+}
+.vk-datalens-meta {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-height: 34px;
+    margin: 0 0 0.45rem 0;
+    padding: 0 0.15rem;
+    color: #667085;
+    font-size: 12px;
+}
+.vk-datalens-meta strong {
+    color: #252a34;
+    font-size: 13px;
+    font-weight: 700;
+}
+.vk-datalens-live-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: #2fb36f;
+    box-shadow: 0 0 0 4px rgba(47, 179, 111, .10);
+    flex: 0 0 auto;
+}
+.st-key-datalens_frame_v1 {
+    width: 100%;
+    padding: 4px !important;
+    background: #ffffff;
+    border: 1px solid #e5e9f0;
+    border-radius: 16px;
+    box-shadow: 0 8px 28px rgba(16, 24, 40, .055);
+    overflow: hidden;
+}
+
+/* Streamlit wraps components in a container; make it flush with our shell. */
+div[data-testid="stCustomComponentV1"],
+div[data-testid="stIFrame"] {
+    width: 100% !important;
+    margin: 0 !important;
+}
+div[data-testid="stCustomComponentV1"] iframe,
+div[data-testid="stIFrame"] iframe,
+iframe[title="streamlit_components.v1.components.iframe"] {
+    width: 100% !important;
+    border: 0 !important;
+    border-radius: 12px !important;
+    background: #ffffff !important;
+}
+
+/* DataLens page gets a neutral background, other sections are unaffected
+   because this style exists only during this selected section rerun. */
+[data-testid="stAppViewContainer"] {
+    background: #f7f8fa !important;
+}
+
+@media (max-width: 900px) {
+    [data-testid="stMainBlockContainer"],
+    .main .block-container {
+        padding-left: 0.35rem !important;
+        padding-right: 0.35rem !important;
+    }
+    .vk-datalens-meta {
+        font-size: 11px;
+    }
+}
+</style>
+<div class="vk-datalens-shell">
+    <div class="vk-datalens-meta">
+        <span class="vk-datalens-live-dot"></span>
+        <strong>свежак</strong>
+        <span>Дата меню и точки выбираются прямо внутри DataLens</span>
+    </div>
+</div>
+        """,
+        unsafe_allow_html=True,
     )
+
     try:
-        components.iframe(
-            _build_datalens_embed_url(),
-            height=1250,
-            scrolling=True,
-        )
+        datalens_embed_url = _build_datalens_embed_url()
+
+        # A tall frame gives the dashboard a natural page-like scroll instead
+        # of visually squeezing the lower analytical blocks.
+        with st.container(key="datalens_frame_v1"):
+            components.iframe(
+                datalens_embed_url,
+                height=1500,
+                scrolling=True,
+            )
     except Exception as error:
         st.error(
             "Не удалось открыть DataLens. Проверьте "
