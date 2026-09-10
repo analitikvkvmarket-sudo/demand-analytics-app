@@ -25,7 +25,9 @@ import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
 import psycopg
+import jwt
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from openpyxl import load_workbook
 from openpyxl.comments import Comment
@@ -74,6 +76,37 @@ def _read_runtime_secret(name: str, default: str = "") -> str:
     except Exception:
         secret_value = default
     return str(secret_value or "").strip()
+
+
+def _build_datalens_embed_url() -> str:
+    """Build a short-lived signed URL for the private DataLens dashboard."""
+    embed_id = _read_runtime_secret("DATALENS_EMBED_ID", "11uf22uhla1ck")
+    private_key = _read_runtime_secret("DATALENS_PRIVATE_KEY")
+
+    if not embed_id:
+        raise RuntimeError("DATALENS_EMBED_ID is not configured in Streamlit Secrets.")
+    if not private_key:
+        raise RuntimeError("DATALENS_PRIVATE_KEY is not configured in Streamlit Secrets.")
+
+    # Streamlit Secrets may contain either real PEM newlines or escaped \n sequences.
+    private_key = private_key.replace("\\n", "\n")
+
+    now = int(time.time())
+    payload = {
+        "embedId": embed_id,
+        "dlEmbedService": "YC_DATALENS_EMBEDDING_SERVICE_MARK",
+        "iat": now,
+        "exp": now + 8 * 60 * 60,
+        # Keep dashboard selectors unsigned so menu_date and point_filter
+        # remain editable inside DataLens.
+        "params": {},
+    }
+    token = jwt.encode(
+        payload,
+        private_key.encode("utf-8"),
+        algorithm="PS256",
+    )
+    return f"https://datalens.ru/embeds/dash#dl_embed_token={token}"
 
 
 MENU_ARCHIVE_APPS_SCRIPT_URL = _read_runtime_secret(
@@ -10364,6 +10397,7 @@ period = st.session_state["period"]
 
 MENU_ITEMS = [
     ("Дашборд", ":material/dashboard:"),
+    ("Аналитика DataLens", ":material/analytics:"),
     ("Отчет", ":material/description:"),
     ("Сравнение", ":material/compare_arrows:"),
     ("Топ-3 сущности", ":material/account_tree:"),
@@ -10569,6 +10603,26 @@ with st.container(key="section_header_v759"):
 # Совместимость с внутренними участками, которые могут читать прежний ключ навигации.
 st.session_state["main_tabs_v1"] = selected_main_section
 
+if selected_main_section == "Аналитика DataLens":
+    st.subheader("Аналитика DataLens")
+    st.caption(
+        "Основной дашборд «свежак». Дата меню и точки "
+        "выбираются непосредственно внутри DataLens."
+    )
+    try:
+        components.iframe(
+            _build_datalens_embed_url(),
+            height=1250,
+            scrolling=True,
+        )
+    except Exception as error:
+        st.error(
+            "Не удалось открыть DataLens. Проверьте "
+            "DATALENS_EMBED_ID и DATALENS_PRIVATE_KEY в Streamlit Secrets."
+        )
+        st.caption(f"Техническая ошибка: {error}")
+    st.stop()
+
 categories = sorted(category_profile["category"].unique())
 filter_columns = st.columns(2)
 with filter_columns[0]:
@@ -10737,7 +10791,7 @@ class _MainSection:
         return False
 
 
-tab_dashboard, tab_report, tab_comparison, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_cycle_plan, tab_plan_check = [
+tab_dashboard, tab_datalens, tab_report, tab_comparison, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_cycle_plan, tab_plan_check = [
     _MainSection(label) for label, _ in MENU_ITEMS
 ]
 
