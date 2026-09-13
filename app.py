@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.04-T30-RAW-REVENUE-DIAG"
+BUILD_ID = "75.12.05-T30-UNFILTERED-ALL-SHOPS-DIAG"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -1484,6 +1484,58 @@ def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]
             records = cursor.fetchall()
             columns = [description.name for description in cursor.description]
     return _normalize_sales_frame(pd.DataFrame(records, columns=columns))
+
+
+@st.cache_data(ttl=1800, show_spinner="Проверяю все точки напрямую в PostgreSQL…")
+def load_all_shop_daily_totals(date_from: date, date_to_exclusive: date) -> pd.DataFrame:
+    """Unfiltered raw totals for every shop_number in the selected period.
+
+    This diagnostic intentionally does NOT use point_mapping and does NOT pass a
+    list of shops into SQL. Therefore a new/mis-mapped point cannot disappear
+    before we see the raw PostgreSQL result.
+    """
+    query = """
+        SELECT
+            business_date,
+            shop_number,
+            SUM(net_quantity)::numeric AS sold_quantity,
+            SUM(net_line_amount)::numeric AS revenue,
+            COUNT(DISTINCT source_purchase_id)::bigint AS receipts,
+            COUNT(DISTINCT COALESCE(
+                NULLIF(TRIM(erp_code), ''),
+                NULLIF(TRIM(product_code), ''),
+                NULLIF(TRIM(barcode), ''),
+                NULLIF(TRIM(product_hash), ''),
+                'БЕЗ_SKU'
+            ))::bigint AS sku_count
+        FROM dwh.v_sales_item
+        WHERE business_date >= %(date_from)s
+          AND business_date < %(date_to)s
+        GROUP BY business_date, shop_number
+        ORDER BY business_date, shop_number
+    """
+    with pg_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                query,
+                {"date_from": date_from, "date_to": date_to_exclusive},
+            )
+            records = cursor.fetchall()
+            columns = [description.name for description in cursor.description]
+    frame = pd.DataFrame(records, columns=columns)
+    if frame.empty:
+        return frame
+    frame["business_date"] = pd.to_datetime(
+        frame["business_date"], errors="coerce"
+    ).dt.date
+    frame["shop_number"] = pd.to_numeric(frame["shop_number"], errors="coerce")
+    frame["sold_quantity"] = pd.to_numeric(
+        frame["sold_quantity"], errors="coerce"
+    ).fillna(0.0)
+    frame["revenue"] = pd.to_numeric(frame["revenue"], errors="coerce").fillna(0.0)
+    frame["receipts"] = pd.to_numeric(frame["receipts"], errors="coerce").fillna(0).astype(int)
+    frame["sku_count"] = pd.to_numeric(frame["sku_count"], errors="coerce").fillna(0).astype(int)
+    return frame
 
 
 @st.cache_data(ttl=1800, show_spinner="Загружаю продажи по часам…")
@@ -9253,7 +9305,7 @@ with st.sidebar:
         help="Сбрасывает кэш продаж и заново читает выбранный период из PostgreSQL.",
     ):
         for cached_loader in (
-            load_sales, load_sales_hourly, load_sales_timed,
+            load_sales, load_all_shop_daily_totals, load_sales_hourly, load_sales_timed,
             load_weekday_comparison_sales, load_available_shops,
             load_forecast_history, load_forecast_history_timed,
             load_planning_history_daily,
@@ -9265,6 +9317,7 @@ with st.sidebar:
         for state_key in (
             "analysis", "analysis_auto_signature_v751200",
             "lazy_detail_frame_v751200", "lazy_detail_signature_v751200",
+            "raw_all_shops_daily_v751205", "raw_all_shops_signature_v751205",
             "raw_sales_daily_v751204", "raw_sales_signature_v751204",
         ):
             st.session_state.pop(state_key, None)
@@ -12394,35 +12447,28 @@ if tab_dashboard.open:
     with tab_dashboard:
         col1, col2 = st.columns(2)
 
-        # Доход по точкам считаем прямо из сырого дневного факта PostgreSQL.
-        # Здесь нет merge со справочником сущностей и нет категорий, поэтому
-        # фактическая выручка точки не может исчезнуть из-за последующей обработки.
-        dashboard_raw_sales = st.session_state.get("raw_sales_daily_v751204")
+        # Доход по точкам считаем по НЕФИЛЬТРОВАННОМУ сырому факту PostgreSQL.
+        # В SQL здесь нет point_mapping и нет списка разрешённых точек. Это важно:
+        # новая/неверно сопоставленная точка (включая Т30) сначала обязана появиться
+        # как реальный shop_number, и только потом мы пытаемся дать ей метку Т.
+        dashboard_raw_sales = st.session_state.get("raw_all_shops_daily_v751205")
         raw_signature_expected = (
             period[0].isoformat(),
             period[1].isoformat(),
-            tuple(sorted(int(number) for number in st.session_state.get("point_mapping", {}).keys())),
+            "all_shops_unfiltered",
         )
-        raw_signature_saved = st.session_state.get("raw_sales_signature_v751204")
-        raw_signature_matches = (
-            isinstance(raw_signature_saved, tuple)
-            and len(raw_signature_saved) >= 3
-            and tuple(raw_signature_saved[:3]) == raw_signature_expected
-        )
-        if not isinstance(dashboard_raw_sales, pd.DataFrame) or dashboard_raw_sales.empty or not raw_signature_matches:
-            dashboard_shop_numbers = tuple(
-                sorted(int(number) for number in st.session_state.get("point_mapping", {}).keys())
+        raw_signature_saved = st.session_state.get("raw_all_shops_signature_v751205")
+        raw_signature_matches = raw_signature_saved == raw_signature_expected
+        if (
+            not isinstance(dashboard_raw_sales, pd.DataFrame)
+            or dashboard_raw_sales.empty
+            or not raw_signature_matches
+        ):
+            dashboard_raw_sales = load_all_shop_daily_totals(
+                period[0], period[1] + timedelta(days=1)
             )
-            dashboard_raw_sales = load_sales(
-                period[0], period[1] + timedelta(days=1), dashboard_shop_numbers
-            )
-            st.session_state["raw_sales_daily_v751204"] = dashboard_raw_sales.copy()
-            st.session_state["raw_sales_signature_v751204"] = (
-                period[0].isoformat(),
-                period[1].isoformat(),
-                dashboard_shop_numbers,
-                "dashboard",
-            )
+            st.session_state["raw_all_shops_daily_v751205"] = dashboard_raw_sales.copy()
+            st.session_state["raw_all_shops_signature_v751205"] = raw_signature_expected
 
         raw_point_revenue = pd.DataFrame(columns=["shop_number", "point", "revenue"])
         if isinstance(dashboard_raw_sales, pd.DataFrame) and not dashboard_raw_sales.empty:
@@ -12443,14 +12489,20 @@ if tab_dashboard.open:
                 int(shop): str(label).strip()
                 for shop, label in st.session_state.get("point_mapping", {}).items()
             }
-            raw_point_revenue["point"] = raw_point_revenue["shop_number"].map(dashboard_mapping)
-            raw_point_revenue["point"] = raw_point_revenue["point"].fillna(
-                raw_point_revenue["shop_number"].map(lambda value: f"shop {int(value)}")
+            raw_point_revenue["mapped_point"] = raw_point_revenue["shop_number"].map(dashboard_mapping)
+            # Если текущая карта ещё не знает точку, НЕ теряем её: показываем
+            # техническую метку Т<shop_number>. Так shop_number=30 сразу виден как Т30.
+            raw_point_revenue["point"] = raw_point_revenue["mapped_point"].fillna(
+                raw_point_revenue["shop_number"].map(lambda value: f"Т{int(value)}")
             )
-            # Глобальный фильтр точек сохраняем: показываем только выбранные Т-точки.
+
+            # Уважаем пользовательский фильтр для уже известных точек, но новые/
+            # отсутствующие в старой карте точки оставляем видимыми для диагностики.
             selected_dashboard_points = set(point_filter)
+            known_point_options = set(point_options)
             raw_point_revenue = raw_point_revenue[
                 raw_point_revenue["point"].isin(selected_dashboard_points)
+                | ~raw_point_revenue["point"].isin(known_point_options)
             ].copy()
             raw_point_revenue["point_number"] = pd.to_numeric(
                 raw_point_revenue["point"].astype(str).str.extract(r"(\d+)", expand=False),
@@ -12525,7 +12577,8 @@ if tab_dashboard.open:
                         .agg(
                             raw_revenue=("revenue", "sum"),
                             sold_quantity=("sold_quantity", "sum"),
-                            sku_count=("sku", "nunique"),
+                            receipts=("receipts", "sum"),
+                            sku_count=("sku_count", "sum"),
                         )
                         .sort_values("shop_number", kind="stable")
                     )
@@ -12534,6 +12587,9 @@ if tab_dashboard.open:
                         for shop, label in st.session_state.get("point_mapping", {}).items()
                     }
                     diag_table["app_point"] = diag_table["shop_number"].map(dashboard_mapping).fillna("Не сопоставлена")
+                    diag_table["technical_point"] = diag_table["shop_number"].map(
+                        lambda value: f"Т{int(value)}"
+                    )
 
                     # Сравниваем тот же день с результатом после prepare_analysis.
                     analysis_day = daily_detail.copy()
@@ -12557,19 +12613,22 @@ if tab_dashboard.open:
                     diag_display = diag_table.rename(
                         columns={
                             "shop_number": "shop_number",
+                            "technical_point": "Техническая метка",
                             "app_point": "Точка в приложении",
                             "raw_revenue": "Доход сырой, ₽",
                             "analysis_revenue": "После анализа, ₽",
                             "delta": "Разница, ₽",
                             "sold_quantity": "Продано, шт.",
+                            "receipts": "Чеков",
                             "sku_count": "SKU",
                         }
                     )
                     st.dataframe(
                         diag_display[
                             [
-                                "shop_number", "Точка в приложении", "Доход сырой, ₽",
-                                "После анализа, ₽", "Разница, ₽", "Продано, шт.", "SKU",
+                                "shop_number", "Техническая метка", "Точка в приложении",
+                                "Доход сырой, ₽", "После анализа, ₽", "Разница, ₽",
+                                "Продано, шт.", "Чеков", "SKU",
                             ]
                         ],
                         use_container_width=True,
@@ -12580,19 +12639,26 @@ if tab_dashboard.open:
                             "После анализа, ₽": st.column_config.NumberColumn(format="%.0f"),
                             "Разница, ₽": st.column_config.NumberColumn(format="%.0f"),
                             "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
+                            "Чеков": st.column_config.NumberColumn(format="%d"),
                             "SKU": st.column_config.NumberColumn(format="%d"),
                         },
                     )
 
-                    t30_diag = diag_table[diag_table["app_point"].eq("Т30")]
+                    t30_diag = diag_table[diag_table["shop_number"].eq(30)]
                     if t30_diag.empty:
                         st.warning(
-                            f"{diag_date:%d.%m.%Y}: PostgreSQL не вернул строку, которую текущая карта называет Т30. "
-                            "Посмотрите shop_number с ненулевым доходом — возможно, Т30 приходит под другим номером."
+                            f"{diag_date:%d.%m.%Y}: в НЕФИЛЬТРОВАННОМ PostgreSQL нет shop_number=30. "
+                            "Значит, если SET показывает Т30, она либо приходит под другим shop_number, "
+                            "либо SET использует другой источник/поле точки. Смотрите все строки таблицы выше."
                         )
                     else:
                         t30_raw = float(t30_diag["raw_revenue"].sum())
                         t30_after = float(t30_diag["analysis_revenue"].sum())
+                        mapped_value = str(t30_diag["app_point"].iloc[0])
+                        st.info(
+                            f"{diag_date:%d.%m.%Y}: сырой shop_number=30 найден. "
+                            f"Доход {t30_raw:,.0f} ₽; текущая карта приложения: {mapped_value}.".replace(",", " ")
+                        )
                         if abs(t30_raw) > 0.005:
                             st.success(
                                 f"{diag_date:%d.%m.%Y}: сырой доход Т30 = {t30_raw:,.0f} ₽; "
