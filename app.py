@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.01-DASHBOARD-POINT-REVENUE-TABLE"
+BUILD_ID = "75.12.02-HISTORICAL-REFRESH-POINTS-FIX"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -9289,19 +9289,17 @@ if start_date > end_date:
     st.error("Дата начала периода не может быть позже даты окончания.")
     st.stop()
 
-# Исторический период не пересчитываем сам по себе: данные за закрытые даты стабильны.
-# Если выбран сегодняшний/вчерашний день, основной дневной срез автоматически обновляется
-# не чаще одного раза в час. В любой момент пользователь может нажать «Обновить продажи сейчас».
+# Продажи могут дозагружаться/исправляться задним числом, поэтому даже исторический
+# период не держим в session_state бесконечно. Для сегодняшнего/вчерашнего дня
+# обновляемся не чаще раза в час, для закрытых дат — раз в 6 часов.
+# Кнопка «Обновить продажи сейчас» по-прежнему сбрасывает кэш немедленно.
 password_signature = (
     hashlib.sha256(pg_password.encode("utf-8")).hexdigest()[:12]
     if pg_password else "no-password"
 )
 is_live_period = end_date >= (today - timedelta(days=1))
-refresh_bucket = (
-    int(datetime.now().timestamp() // (60 * 60))
-    if is_live_period
-    else "historical"
-)
+refresh_seconds = 60 * 60 if is_live_period else 6 * 60 * 60
+refresh_bucket = int(datetime.now().timestamp() // refresh_seconds)
 auto_signature = (
     start_date.isoformat(),
     end_date.isoformat(),
@@ -12390,7 +12388,20 @@ if tab_dashboard.open:
         point_sales["point_number"] = point_sales["point"].str[1:].astype(int)
         point_sales = point_sales.sort_values("point_number")
 
-        point_revenue_table = point_sales[["point", "revenue"]].rename(
+        # Показываем все выбранные точки, даже если в загруженном срезе у точки
+        # временно нет строк продаж. Это не даёт Т30 и другим точкам исчезать
+        # из таблицы из-за задержки/дозагрузки факта.
+        dashboard_points = pd.DataFrame({"point": list(point_filter)})
+        dashboard_points["point_number"] = dashboard_points["point"].str[1:].astype(int)
+        dashboard_points = dashboard_points.sort_values("point_number")
+        point_revenue_table = (
+            dashboard_points[["point"]]
+            .merge(point_sales[["point", "revenue"]], on="point", how="left")
+        )
+        point_revenue_table["revenue"] = pd.to_numeric(
+            point_revenue_table["revenue"], errors="coerce"
+        ).fillna(0.0)
+        point_revenue_table = point_revenue_table.rename(
             columns={"point": "Точка", "revenue": "Доход, ₽"}
         )
         col1.markdown("#### Доход по точкам")
