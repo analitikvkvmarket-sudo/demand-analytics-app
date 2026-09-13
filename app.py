@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.05-T30-UNFILTERED-ALL-SHOPS-DIAG"
+BUILD_ID = "75.12.06-T30-MAPPING-FINDER"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -9246,7 +9246,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.12.00 · LAZY LOAD")
+    st.caption("Аналитика спроса · версия 75.12.06 · LAZY LOAD")
     st.caption("Автозагрузка · дневной срез + ленивая детализация")
     st.caption("Источники: PostgreSQL + Apps Script · без обязательных локальных XLSX")
     st.caption(f"SKU / категории / сущности · {entity_reference_source}")
@@ -9354,6 +9354,25 @@ password_signature = (
 is_live_period = end_date >= (today - timedelta(days=1))
 refresh_seconds = 60 * 60 if is_live_period else 6 * 60 * 60
 refresh_bucket = int(datetime.now().timestamp() // refresh_seconds)
+
+# Временные ручные переопределения нужны, чтобы диагностировать новые точки,
+# у которых бизнес-номер Т не совпадает с raw shop_number в PostgreSQL.
+# После подтверждения соответствия его можно зафиксировать в коде/настройках.
+point_mapping_overrides_raw = st.session_state.get(
+    "point_mapping_overrides_v751206", {}
+)
+point_mapping_overrides: dict[int, str] = {}
+if isinstance(point_mapping_overrides_raw, dict):
+    for raw_shop, point_label in point_mapping_overrides_raw.items():
+        try:
+            shop_int = int(raw_shop)
+        except (TypeError, ValueError):
+            continue
+        label = str(point_label or "").strip()
+        if shop_int > 0 and re.fullmatch(r"Т\d+", label):
+            point_mapping_overrides[shop_int] = label
+point_mapping_override_signature = tuple(sorted(point_mapping_overrides.items()))
+
 auto_signature = (
     start_date.isoformat(),
     end_date.isoformat(),
@@ -9364,6 +9383,7 @@ auto_signature = (
     password_signature,
     refresh_bucket,
     entity_reference_signature[:16],
+    point_mapping_override_signature,
 )
 
 analysis_needs_refresh = (
@@ -9401,6 +9421,10 @@ if analysis_needs_refresh:
 
             selected_shop_numbers = tuple(selected["shop_number"].tolist())
             point_mapping = {number: f"Т{number}" for number in selected_shop_numbers}
+            # Если диагностика показала, что бизнес-точка Т30 приходит под другим
+            # raw shop_number, применяем переопределение ко всему анализу, а не
+            # только к таблице Дашборда.
+            point_mapping.update(point_mapping_overrides)
             perf_sales_started = time.perf_counter()
             sales = load_sales(
                 start_date,
@@ -10885,6 +10909,13 @@ with filter_columns[1]:
         key=lambda value: int(value[1:]),
     )
     point_filter = st.multiselect("Показать точки", point_options, default=point_options)
+
+# Если диагностикой только что назначена новая бизнес-метка (например Т30),
+# старое состояние multiselect может ещё не содержать её. Для текущего расчёта
+# автоматически добавляем подтверждённые переопределения в активный фильтр.
+for override_label in point_mapping_overrides.values():
+    if override_label in point_options and override_label not in point_filter:
+        point_filter.append(override_label)
 
 filtered_category = category_profile[
     category_profile["category"].isin(category_filter) & category_profile["point"].isin(point_filter)
@@ -12648,9 +12679,178 @@ if tab_dashboard.open:
                     if t30_diag.empty:
                         st.warning(
                             f"{diag_date:%d.%m.%Y}: в НЕФИЛЬТРОВАННОМ PostgreSQL нет shop_number=30. "
-                            "Значит, если SET показывает Т30, она либо приходит под другим shop_number, "
-                            "либо SET использует другой источник/поле точки. Смотрите все строки таблицы выше."
+                            "По скриншоту это уже подтверждено: бизнес-точка Т30 в SET должна быть "
+                            "привязана к другому raw shop_number."
                         )
+
+                        # Сначала отдельно показываем номера, выходящие за обычную сетку Т1-Т30.
+                        # Именно там чаще всего оказываются новые/перенумерованные магазины.
+                        outside_candidates = diag_table[
+                            (diag_table["shop_number"] > 30)
+                            | (diag_table["shop_number"] < 1)
+                        ].copy()
+                        if not outside_candidates.empty:
+                            st.markdown("**Кандидаты вне диапазона 1–30**")
+                            candidate_display = outside_candidates[
+                                ["shop_number", "raw_revenue", "sold_quantity", "receipts"]
+                            ].rename(
+                                columns={
+                                    "raw_revenue": "Доход, ₽",
+                                    "sold_quantity": "Продано, шт.",
+                                    "receipts": "Чеков",
+                                }
+                            )
+                            st.dataframe(
+                                candidate_display,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "shop_number": st.column_config.NumberColumn(format="%d"),
+                                    "Доход, ₽": st.column_config.NumberColumn(format="%.0f"),
+                                    "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                    "Чеков": st.column_config.NumberColumn(format="%d"),
+                                },
+                            )
+
+                        st.markdown("**Найти Т30 по доходу из SET**")
+                        expected_t30_revenue = st.number_input(
+                            f"Доход Т30 в SET за {diag_date:%d.%m.%Y}, ₽",
+                            min_value=0.0,
+                            value=0.0,
+                            step=1.0,
+                            key="t30_expected_set_revenue_v751206",
+                            help="Введите сумму Т30 из DataLens SET за эту же дату. Приложение покажет ближайшие raw shop_number.",
+                        )
+                        candidate_source = diag_table.copy()
+                        if expected_t30_revenue > 0 and not candidate_source.empty:
+                            candidate_source["difference"] = (
+                                pd.to_numeric(candidate_source["raw_revenue"], errors="coerce").fillna(0.0)
+                                - float(expected_t30_revenue)
+                            ).abs()
+                            nearest = candidate_source.sort_values(
+                                ["difference", "shop_number"], kind="stable"
+                            ).head(7)
+                            nearest_display = nearest[
+                                ["shop_number", "raw_revenue", "difference", "sold_quantity", "receipts"]
+                            ].rename(
+                                columns={
+                                    "raw_revenue": "Доход PostgreSQL, ₽",
+                                    "difference": "Разница с SET, ₽",
+                                    "sold_quantity": "Продано, шт.",
+                                    "receipts": "Чеков",
+                                }
+                            )
+                            st.dataframe(
+                                nearest_display,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "shop_number": st.column_config.NumberColumn(format="%d"),
+                                    "Доход PostgreSQL, ₽": st.column_config.NumberColumn(format="%.0f"),
+                                    "Разница с SET, ₽": st.column_config.NumberColumn(format="%.0f"),
+                                    "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                    "Чеков": st.column_config.NumberColumn(format="%d"),
+                                },
+                            )
+                            best = nearest.iloc[0]
+                            if float(best["difference"]) <= 1.0:
+                                st.success(
+                                    f"Практически точное совпадение: shop_number={int(best['shop_number'])}, "
+                                    f"доход {float(best['raw_revenue']):,.0f} ₽.".replace(",", " ")
+                                )
+
+                        # Позволяем сразу проверить найденное соответствие без очередной правки кода.
+                        raw_shop_options = [
+                            int(value)
+                            for value in diag_table["shop_number"].dropna().astype(int).tolist()
+                        ]
+                        if raw_shop_options:
+                            suggested_shop = raw_shop_options[0]
+                            if expected_t30_revenue > 0 and not candidate_source.empty:
+                                ranked = candidate_source.assign(
+                                    _diff=(
+                                        pd.to_numeric(candidate_source["raw_revenue"], errors="coerce").fillna(0.0)
+                                        - float(expected_t30_revenue)
+                                    ).abs()
+                                ).sort_values(["_diff", "shop_number"], kind="stable")
+                                if not ranked.empty:
+                                    suggested_shop = int(ranked.iloc[0]["shop_number"])
+                            elif not outside_candidates.empty:
+                                suggested_shop = int(outside_candidates.iloc[0]["shop_number"])
+
+                            selected_t30_raw_shop = st.selectbox(
+                                "Какой raw shop_number считать точкой Т30?",
+                                raw_shop_options,
+                                index=raw_shop_options.index(suggested_shop),
+                                key="t30_raw_shop_candidate_v751206",
+                                format_func=lambda value: (
+                                    f"shop_number {value} · доход "
+                                    f"{float(diag_table.loc[diag_table['shop_number'].eq(value), 'raw_revenue'].sum()):,.0f} ₽"
+                                ).replace(",", " "),
+                            )
+                            action_cols = st.columns(2)
+                            with action_cols[0]:
+                                if st.button(
+                                    "Применить как Т30",
+                                    type="primary",
+                                    use_container_width=True,
+                                    key="apply_t30_raw_mapping_v751206",
+                                ):
+                                    overrides = dict(
+                                        st.session_state.get("point_mapping_overrides_v751206", {})
+                                    )
+                                    # Т30 должна иметь только один raw shop_number.
+                                    overrides = {
+                                        int(shop): str(label)
+                                        for shop, label in overrides.items()
+                                        if str(label).strip() != "Т30"
+                                    }
+                                    overrides[int(selected_t30_raw_shop)] = "Т30"
+                                    st.session_state["point_mapping_overrides_v751206"] = overrides
+                                    for state_key in (
+                                        "analysis",
+                                        "analysis_auto_signature_v751200",
+                                        "lazy_detail_frame_v751200",
+                                        "lazy_detail_signature_v751200",
+                                    ):
+                                        st.session_state.pop(state_key, None)
+                                    st.rerun()
+                            with action_cols[1]:
+                                if st.button(
+                                    "Сбросить привязку Т30",
+                                    use_container_width=True,
+                                    key="reset_t30_raw_mapping_v751206",
+                                ):
+                                    overrides = dict(
+                                        st.session_state.get("point_mapping_overrides_v751206", {})
+                                    )
+                                    overrides = {
+                                        int(shop): str(label)
+                                        for shop, label in overrides.items()
+                                        if str(label).strip() != "Т30"
+                                    }
+                                    st.session_state["point_mapping_overrides_v751206"] = overrides
+                                    for state_key in (
+                                        "analysis",
+                                        "analysis_auto_signature_v751200",
+                                        "lazy_detail_frame_v751200",
+                                        "lazy_detail_signature_v751200",
+                                    ):
+                                        st.session_state.pop(state_key, None)
+                                    st.rerun()
+
+                        active_t30_override = [
+                            int(shop)
+                            for shop, label in st.session_state.get(
+                                "point_mapping_overrides_v751206", {}
+                            ).items()
+                            if str(label).strip() == "Т30"
+                        ]
+                        if active_t30_override:
+                            st.info(
+                                f"Текущая тестовая привязка: raw shop_number={active_t30_override[0]} → Т30. "
+                                "Она уже применяется ко всему анализу в этой сессии."
+                            )
                     else:
                         t30_raw = float(t30_diag["raw_revenue"].sum())
                         t30_after = float(t30_diag["analysis_revenue"].sum())
