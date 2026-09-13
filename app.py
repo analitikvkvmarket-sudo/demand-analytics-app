@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.02-HISTORICAL-REFRESH-POINTS-FIX"
+BUILD_ID = "75.12.03-T30-DASHBOARD-VISIBLE-FIX"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -9408,6 +9408,7 @@ if "analysis" not in st.session_state:
     st.stop()
 
 with st.sidebar:
+    st.caption(f"Сборка приложения: {BUILD_ID}")
     with st.expander("Диагностика скорости", expanded=False):
         perf_diag = st.session_state.get("performance_diag_v751200", {})
         if perf_diag:
