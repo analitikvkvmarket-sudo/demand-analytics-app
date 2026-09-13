@@ -25,9 +25,7 @@ import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
 import psycopg
-import jwt
 import streamlit as st
-import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from openpyxl import load_workbook
 from openpyxl.comments import Comment
@@ -37,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.11.64-NO-BUNDLED-XLSX"
+BUILD_ID = "75.12.01-DASHBOARD-POINT-REVENUE-TABLE"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -78,37 +76,6 @@ def _read_runtime_secret(name: str, default: str = "") -> str:
     return str(secret_value or "").strip()
 
 
-def _build_datalens_embed_url() -> str:
-    """Build a short-lived signed URL for the private DataLens dashboard."""
-    embed_id = _read_runtime_secret("DATALENS_EMBED_ID", "11uf22uhla1ck")
-    private_key = _read_runtime_secret("DATALENS_PRIVATE_KEY")
-
-    if not embed_id:
-        raise RuntimeError("DATALENS_EMBED_ID is not configured in Streamlit Secrets.")
-    if not private_key:
-        raise RuntimeError("DATALENS_PRIVATE_KEY is not configured in Streamlit Secrets.")
-
-    # Streamlit Secrets may contain either real PEM newlines or escaped \n sequences.
-    private_key = private_key.replace("\\n", "\n")
-
-    now = int(time.time())
-    payload = {
-        "embedId": embed_id,
-        "dlEmbedService": "YC_DATALENS_EMBEDDING_SERVICE_MARK",
-        "iat": now,
-        "exp": now + 8 * 60 * 60,
-        # Keep dashboard selectors unsigned so menu_date and point_filter
-        # remain editable inside DataLens.
-        "params": {},
-    }
-    token = jwt.encode(
-        payload,
-        private_key.encode("utf-8"),
-        algorithm="PS256",
-    )
-    return f"https://datalens.ru/embeds/dash#dl_embed_token={token}"
-
-
 MENU_ARCHIVE_APPS_SCRIPT_URL = _read_runtime_secret(
     "MENU_ARCHIVE_APPS_SCRIPT_URL",
     "https://script.google.com/macros/s/AKfycbxFFSAo2Psisj1cR0WLQu8HeI-8iFjSxAx-xTKxi_s35euGNP6ZIcUxqMyBBgkr5Xe8/exec",
@@ -116,7 +83,7 @@ MENU_ARCHIVE_APPS_SCRIPT_URL = _read_runtime_secret(
 # Ключ намеренно НЕ зашит в исходник. На Streamlit Cloud задайте
 # MENU_ARCHIVE_APPS_SCRIPT_KEY в Secrets.
 MENU_ARCHIVE_APPS_SCRIPT_KEY = _read_runtime_secret("MENU_ARCHIVE_APPS_SCRIPT_KEY")
-MENU_ARCHIVE_CACHE_SECONDS = 5 * 60
+MENU_ARCHIVE_CACHE_SECONDS = 30 * 60
 
 REMEMBERED_PG_FILE = APP_DIR / ".remembered_pg.json"
 REMEMBERED_PG_DAYS = 30
@@ -1446,8 +1413,136 @@ def pg_connection():
         yield connection
 
 
-@st.cache_data(ttl=900, show_spinner="Загружаю продажи из PostgreSQL…")
+def _normalize_sales_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Normalise a PostgreSQL sales result without changing business totals."""
+    if frame.empty:
+        return frame
+    result = frame.copy()
+    result["sku"] = result["sku"].map(normalize_sku)
+    if "business_date" in result.columns:
+        result["business_date"] = pd.to_datetime(
+            result["business_date"], errors="coerce"
+        ).dt.date
+    if "sale_datetime" in result.columns:
+        result["sale_datetime"] = pd.to_datetime(
+            result["sale_datetime"], errors="coerce"
+        )
+    result["sold_quantity"] = pd.to_numeric(
+        result["sold_quantity"], errors="coerce"
+    ).fillna(0.0)
+    result["revenue"] = pd.to_numeric(
+        result.get("revenue", 0.0), errors="coerce"
+    ).fillna(0.0)
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner="Загружаю дневные продажи из PostgreSQL…")
 def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]) -> pd.DataFrame:
+    """Light main source: one row per day × point × SKU.
+
+    Most application sections need totals by day, SKU, category or point and do not
+    need every transaction timestamp. Aggregating in PostgreSQL keeps all quantity
+    and revenue totals while sharply reducing the dataframe transferred to Streamlit.
+    MAX(sale_datetime) is kept only as a harmless daily diagnostic timestamp.
+    """
+    if not points:
+        return pd.DataFrame()
+    query = """
+        SELECT
+            business_date,
+            MAX(sale_datetime) AS sale_datetime,
+            shop_number,
+            COALESCE(
+                NULLIF(TRIM(erp_code), ''),
+                NULLIF(TRIM(product_code), ''),
+                NULLIF(TRIM(barcode), ''),
+                NULLIF(TRIM(product_hash), ''),
+                'БЕЗ_SKU'
+            ) AS sku,
+            MAX(product_name) AS product_name,
+            SUM(net_quantity)::numeric AS sold_quantity,
+            SUM(net_line_amount)::numeric AS revenue
+        FROM dwh.v_sales_item
+        WHERE business_date >= %(date_from)s
+          AND business_date < %(date_to)s
+          AND shop_number = ANY(%(points)s)
+        GROUP BY business_date, shop_number,
+                 COALESCE(
+                     NULLIF(TRIM(erp_code), ''),
+                     NULLIF(TRIM(product_code), ''),
+                     NULLIF(TRIM(barcode), ''),
+                     NULLIF(TRIM(product_hash), ''),
+                     'БЕЗ_SKU'
+                 )
+    """
+    with pg_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                query,
+                {"date_from": date_from, "date_to": date_to_exclusive, "points": list(points)},
+            )
+            records = cursor.fetchall()
+            columns = [description.name for description in cursor.description]
+    return _normalize_sales_frame(pd.DataFrame(records, columns=columns))
+
+
+@st.cache_data(ttl=1800, show_spinner="Загружаю продажи по часам…")
+def load_sales_hourly(
+    date_from: date,
+    date_to_exclusive: date,
+    points: tuple[int, ...],
+) -> pd.DataFrame:
+    """Hourly detail for Dashboard time-of-day analytics only."""
+    if not points:
+        return pd.DataFrame()
+    query = """
+        SELECT
+            business_date,
+            date_trunc('hour', sale_datetime) AS sale_datetime,
+            shop_number,
+            COALESCE(
+                NULLIF(TRIM(erp_code), ''),
+                NULLIF(TRIM(product_code), ''),
+                NULLIF(TRIM(barcode), ''),
+                NULLIF(TRIM(product_hash), ''),
+                'БЕЗ_SKU'
+            ) AS sku,
+            MAX(product_name) AS product_name,
+            SUM(net_quantity)::numeric AS sold_quantity,
+            SUM(net_line_amount)::numeric AS revenue
+        FROM dwh.v_sales_item
+        WHERE business_date >= %(date_from)s
+          AND business_date < %(date_to)s
+          AND shop_number = ANY(%(points)s)
+        GROUP BY business_date, date_trunc('hour', sale_datetime), shop_number,
+                 COALESCE(
+                     NULLIF(TRIM(erp_code), ''),
+                     NULLIF(TRIM(product_code), ''),
+                     NULLIF(TRIM(barcode), ''),
+                     NULLIF(TRIM(product_hash), ''),
+                     'БЕЗ_SKU'
+                 )
+    """
+    with pg_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                query,
+                {"date_from": date_from, "date_to": date_to_exclusive, "points": list(points)},
+            )
+            records = cursor.fetchall()
+            columns = [description.name for description in cursor.description]
+    return _normalize_sales_frame(pd.DataFrame(records, columns=columns))
+
+
+@st.cache_data(ttl=1800, show_spinner="Загружаю детальные продажи только для выбранного раздела…")
+def load_sales_timed(
+    date_from: date,
+    date_to_exclusive: date,
+    points: tuple[int, ...],
+) -> pd.DataFrame:
+    """Transaction-time detail, loaded lazily only where exact time/FIFO is needed."""
+    if not points:
+        return pd.DataFrame()
     query = """
         SELECT
             business_date,
@@ -1475,14 +1570,6 @@ def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]
                      NULLIF(TRIM(product_hash), ''),
                      'БЕЗ_SKU'
                  )
-        ORDER BY business_date, sale_datetime, shop_number,
-                 COALESCE(
-                     NULLIF(TRIM(erp_code), ''),
-                     NULLIF(TRIM(product_code), ''),
-                     NULLIF(TRIM(barcode), ''),
-                     NULLIF(TRIM(product_hash), ''),
-                     'БЕЗ_SKU'
-                 )
     """
     with pg_connection() as connection:
         with connection.cursor() as cursor:
@@ -1492,13 +1579,7 @@ def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]
             )
             records = cursor.fetchall()
             columns = [description.name for description in cursor.description]
-    frame = pd.DataFrame(records, columns=columns)
-    if frame.empty:
-        return frame
-    frame["sku"] = frame["sku"].map(normalize_sku)
-    frame["sold_quantity"] = pd.to_numeric(frame["sold_quantity"], errors="coerce").fillna(0.0)
-    frame["revenue"] = pd.to_numeric(frame["revenue"], errors="coerce").fillna(0.0)
-    return frame
+    return _normalize_sales_frame(pd.DataFrame(records, columns=columns))
 
 
 @st.cache_data(ttl=900, show_spinner="Загружаю данные для сравнения…")
@@ -1571,7 +1652,7 @@ def load_weekday_comparison_sales(
     ].copy()
 
 
-@st.cache_data(ttl=300, show_spinner="Ищу магазины с продажами…")
+@st.cache_data(ttl=14400, show_spinner="Ищу магазины с продажами…")
 def load_available_shops(date_from: date, date_to_exclusive: date) -> pd.DataFrame:
     """Возвращает ВСЕ номера точек, которые существуют в PostgreSQL.
 
@@ -1633,12 +1714,19 @@ def ensure_required_shops(frame: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-@st.cache_data(ttl=900, show_spinner="Загружаю историю для прогноза…")
+@st.cache_data(ttl=3600, show_spinner="Загружаю дневную историю для расчётов…")
 def load_forecast_history(date_from: date, date_to_exclusive: date, points: tuple[int, ...]) -> pd.DataFrame:
+    """Daily history for ABC, forecasts, plan checks and cyclic plan.
+
+    All quantity/revenue totals are preserved; only redundant transaction timestamps
+    are collapsed in PostgreSQL before transfer to Streamlit.
+    """
+    if not points:
+        return pd.DataFrame()
     query = """
         SELECT
             business_date,
-            sale_datetime,
+            MAX(sale_datetime) AS sale_datetime,
             shop_number,
             COALESCE(
                 NULLIF(TRIM(erp_code), ''),
@@ -1654,7 +1742,7 @@ def load_forecast_history(date_from: date, date_to_exclusive: date, points: tupl
         WHERE business_date >= %(date_from)s
           AND business_date < %(date_to)s
           AND shop_number = ANY(%(points)s)
-        GROUP BY business_date, sale_datetime, shop_number,
+        GROUP BY business_date, shop_number,
                  COALESCE(
                      NULLIF(TRIM(erp_code), ''),
                      NULLIF(TRIM(product_code), ''),
@@ -1671,15 +1759,17 @@ def load_forecast_history(date_from: date, date_to_exclusive: date, points: tupl
             )
             records = cursor.fetchall()
             columns = [description.name for description in cursor.description]
-    result = pd.DataFrame(records, columns=columns)
-    if result.empty:
-        return result
-    result["sku"] = result["sku"].map(normalize_sku)
-    result["business_date"] = pd.to_datetime(result["business_date"]).dt.date
-    result["sale_datetime"] = pd.to_datetime(result["sale_datetime"], errors="coerce")
-    result["sold_quantity"] = pd.to_numeric(result["sold_quantity"], errors="coerce").fillna(0.0)
-    result["revenue"] = pd.to_numeric(result["revenue"], errors="coerce").fillna(0.0)
-    return result
+    return _normalize_sales_frame(pd.DataFrame(records, columns=columns))
+
+
+@st.cache_data(ttl=1800, show_spinner="Загружаю точную историю продаж для FIFO…")
+def load_forecast_history_timed(
+    date_from: date,
+    date_to_exclusive: date,
+    points: tuple[int, ...],
+) -> pd.DataFrame:
+    """Exact sale timestamps only for freshness/FIFO calculations that need them."""
+    return load_sales_timed(date_from, date_to_exclusive, points)
 
 
 
@@ -4353,7 +4443,7 @@ def rebuild_freshness_writeoff_source_by_point(
         shop_numbers = tuple(point_to_shop[point] for point in valid_points)
         history_start = shipment_start - timedelta(days=8)
         history_end = shipment_end + timedelta(days=8)
-        sales_history = load_forecast_history(history_start, history_end, shop_numbers)
+        sales_history = load_forecast_history_timed(history_start, history_end, shop_numbers)
 
         point_results: list[pd.DataFrame] = []
         for point_label, point_number, shop_number in zip(valid_points, point_numbers, shop_numbers):
@@ -5909,6 +5999,60 @@ def prepare_analysis(
     ).astype(int)
     return sku_point, category_profile, entity_profile, daily_detail
 
+
+def prepare_sales_detail_only(
+    sales: pd.DataFrame,
+    entities: pd.DataFrame,
+    point_mapping: dict[int, str],
+) -> pd.DataFrame:
+    """Build only detailed rows; skip the three extra profile groupbys.
+
+    Used by lazy Dashboard/Detail loads so opening a time-sensitive section does not
+    rebuild the complete application analysis a second time.
+    """
+    if sales is None or sales.empty:
+        return pd.DataFrame(
+            columns=[
+                "business_date", "sale_datetime", "point", "shop_number", "sku",
+                "product_name", "category", "entity", "sales", "revenue",
+            ]
+        )
+    work = sales.copy()
+    work["point"] = pd.to_numeric(work["shop_number"], errors="coerce").map(point_mapping)
+    work = work[work["point"].notna()].copy()
+    merged = work.merge(entities, on="sku", how="left", validate="many_to_one")
+    merged["category"] = merged["category"].fillna("Не сопоставлено")
+    merged["entity"] = merged["entity"].fillna("Не сопоставлено")
+    if "entity_product_name" in merged.columns:
+        sql_names = merged["product_name"].fillna("").astype(str).str.strip()
+        matrix_names = merged["entity_product_name"].fillna("").astype(str).str.strip()
+        merged["product_name"] = matrix_names.where(matrix_names.ne(""), sql_names)
+    detail = (
+        merged.groupby(
+            [
+                "business_date", "sale_datetime", "point", "shop_number", "sku",
+                "product_name", "category", "entity",
+            ],
+            dropna=False,
+            as_index=False,
+        )
+        .agg(sales=("sold_quantity", "sum"), revenue=("revenue", "sum"))
+        .sort_values(
+            ["business_date", "sale_datetime", "point", "category", "entity", "sales"],
+            ascending=[True, True, True, True, True, False],
+            kind="stable",
+        )
+    )
+    return detail
+
+
+def _frame_memory_mb(frame: pd.DataFrame) -> float:
+    if frame is None or frame.empty:
+        return 0.0
+    try:
+        return float(frame.memory_usage(index=True, deep=True).sum()) / (1024.0 ** 2)
+    except Exception:
+        return 0.0
 
 
 def plan_check_minimum(category: object) -> int:
@@ -9050,8 +9194,8 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.11.33 · ENTITY REFRESH")
-    st.caption("Автозагрузка данных · SEPARATE-MENU")
+    st.caption("Аналитика спроса · версия 75.12.00 · LAZY LOAD")
+    st.caption("Автозагрузка · дневной срез + ленивая детализация")
     st.caption("Источники: PostgreSQL + Apps Script · без обязательных локальных XLSX")
     st.caption(f"SKU / категории / сущности · {entity_reference_source}")
     if entity_reference_checked_at:
@@ -9092,7 +9236,7 @@ with st.sidebar:
             forget_remembered_pg_credentials()
             os.environ.pop("PGPASSWORD", None)
             st.session_state.pop("analysis", None)
-            st.session_state.pop("analysis_auto_signature_v7590", None)
+            st.session_state.pop("analysis_auto_signature_v751200", None)
             st.success("Сохранённый пароль удалён. При следующем подключении введите его снова.")
             st.rerun()
     date_range = st.date_input(
@@ -9102,8 +9246,30 @@ with st.sidebar:
         format="DD.MM.YYYY",
         key="main_period_v7590",
     )
+    if st.button(
+        "Обновить продажи сейчас",
+        use_container_width=True,
+        key="refresh_sales_now_v751200",
+        help="Сбрасывает кэш продаж и заново читает выбранный период из PostgreSQL.",
+    ):
+        for cached_loader in (
+            load_sales, load_sales_hourly, load_sales_timed,
+            load_weekday_comparison_sales, load_available_shops,
+            load_forecast_history, load_forecast_history_timed,
+            load_planning_history_daily,
+        ):
+            try:
+                cached_loader.clear()
+            except Exception:
+                pass
+        for state_key in (
+            "analysis", "analysis_auto_signature_v751200",
+            "lazy_detail_frame_v751200", "lazy_detail_signature_v751200",
+        ):
+            st.session_state.pop(state_key, None)
+        st.rerun()
     auto_status = st.empty()
-    auto_status.caption("Точки и продажи загружаются автоматически.")
+    auto_status.caption("Основные продажи загружаются в дневном виде; детальное время — только по необходимости.")
 
 os.environ["PGHOST"] = pg_host.strip()
 os.environ["PGPORT"] = str(int(pg_port))
@@ -9123,13 +9289,19 @@ if start_date > end_date:
     st.error("Дата начала периода не может быть позже даты окончания.")
     st.stop()
 
-# Автозагрузка выполняется только при изменении периода/подключения либо раз в 15 минут.
-# Обычные переходы по разделам используют уже подготовленный analysis из session_state.
+# Исторический период не пересчитываем сам по себе: данные за закрытые даты стабильны.
+# Если выбран сегодняшний/вчерашний день, основной дневной срез автоматически обновляется
+# не чаще одного раза в час. В любой момент пользователь может нажать «Обновить продажи сейчас».
 password_signature = (
     hashlib.sha256(pg_password.encode("utf-8")).hexdigest()[:12]
     if pg_password else "no-password"
 )
-refresh_bucket = int(datetime.now().timestamp() // (15 * 60))
+is_live_period = end_date >= (today - timedelta(days=1))
+refresh_bucket = (
+    int(datetime.now().timestamp() // (60 * 60))
+    if is_live_period
+    else "historical"
+)
 auto_signature = (
     start_date.isoformat(),
     end_date.isoformat(),
@@ -9144,15 +9316,18 @@ auto_signature = (
 
 analysis_needs_refresh = (
     "analysis" not in st.session_state
-    or st.session_state.get("analysis_auto_signature_v7590") != auto_signature
+    or st.session_state.get("analysis_auto_signature_v751200") != auto_signature
 )
 
 if analysis_needs_refresh:
     try:
-        with st.spinner("Автоматически загружаю точки и продажи из PostgreSQL…"):
+        with st.spinner("Автоматически загружаю лёгкий дневной срез из PostgreSQL…"):
+            perf_total_started = time.perf_counter()
+            perf_shops_started = time.perf_counter()
             available_shops = load_available_shops(
                 start_date, end_date + timedelta(days=1)
             )
+            perf_shops_seconds = time.perf_counter() - perf_shops_started
             if available_shops.empty:
                 raise RuntimeError("PostgreSQL не вернул ни одной точки")
 
@@ -9174,19 +9349,33 @@ if analysis_needs_refresh:
 
             selected_shop_numbers = tuple(selected["shop_number"].tolist())
             point_mapping = {number: f"Т{number}" for number in selected_shop_numbers}
+            perf_sales_started = time.perf_counter()
             sales = load_sales(
                 start_date,
                 end_date + timedelta(days=1),
                 selected_shop_numbers,
             )
+            perf_sales_seconds = time.perf_counter() - perf_sales_started
             if sales.empty:
                 raise RuntimeError("за выбранный период продаж не найдено")
 
-            st.session_state["analysis"] = prepare_analysis(sales, entities, point_mapping)
+            perf_prepare_started = time.perf_counter()
+            analysis_result = prepare_analysis(sales, entities, point_mapping)
+            perf_prepare_seconds = time.perf_counter() - perf_prepare_started
+            st.session_state["analysis"] = analysis_result
             st.session_state["period"] = (start_date, end_date)
             st.session_state["point_mapping"] = point_mapping
-            st.session_state["analysis_auto_signature_v7590"] = auto_signature
+            st.session_state["analysis_auto_signature_v751200"] = auto_signature
             st.session_state["auto_loaded_shops_v7590"] = selected_shop_numbers
+            st.session_state["performance_diag_v751200"] = {
+                "Режим основной загрузки": "день × точка × SKU",
+                "Строк основного SQL": int(len(sales)),
+                "Память основного SQL, MB": round(_frame_memory_mb(sales), 2),
+                "Поиск точек, сек": round(perf_shops_seconds, 3),
+                "Основной SQL, сек": round(perf_sales_seconds, 3),
+                "Подготовка pandas, сек": round(perf_prepare_seconds, 3),
+                "Основная загрузка всего, сек": round(time.perf_counter() - perf_total_started, 3),
+            }
             # Старое ручное сопоставление больше не управляет новой навигацией/автозагрузкой.
             st.session_state.pop("shop_mapping", None)
 
@@ -9219,6 +9408,22 @@ else:
 if "analysis" not in st.session_state:
     st.info("Данные ещё не подготовлены.")
     st.stop()
+
+with st.sidebar:
+    with st.expander("Диагностика скорости", expanded=False):
+        perf_diag = st.session_state.get("performance_diag_v751200", {})
+        if perf_diag:
+            st.caption(
+                "Основная загрузка агрегируется в PostgreSQL до уровня день × точка × SKU. "
+                "Детальные timestamps появляются только в нужных разделах."
+            )
+            diag_rows = [
+                {"Этап": str(key), "Значение": str(value)}
+                for key, value in perf_diag.items()
+            ]
+            st.dataframe(pd.DataFrame(diag_rows), hide_index=True, use_container_width=True)
+        else:
+            st.caption("Диагностика появится после первой загрузки выбранного периода.")
 
 
 def _cycle_plan_normalize_name(value: object) -> str:
@@ -10397,7 +10602,6 @@ period = st.session_state["period"]
 
 MENU_ITEMS = [
     ("Дашборд", ":material/dashboard:"),
-    ("Аналитика DataLens", ":material/analytics:"),
     ("Отчет", ":material/description:"),
     ("Сравнение", ":material/compare_arrows:"),
     ("Топ-3 сущности", ":material/account_tree:"),
@@ -10603,153 +10807,6 @@ with st.container(key="section_header_v759"):
 # Совместимость с внутренними участками, которые могут читать прежний ключ навигации.
 st.session_state["main_tabs_v1"] = selected_main_section
 
-if selected_main_section == "Аналитика DataLens":
-    # DataLens is already a complete analytical interface. On this page we
-    # deliberately remove the global Streamlit sidebar and extra page chrome,
-    # so the embedded dashboard gets the maximum useful width. Other sections
-    # keep the standard application layout unchanged.
-    st.markdown(
-        """
-<style>
-/* ===== DataLens full-width mode ===== */
-section[data-testid="stSidebar"] {
-    display: none !important;
-}
-button[data-testid="stSidebarCollapsedControl"],
-[data-testid="stSidebarCollapsedControl"] {
-    display: none !important;
-}
-header[data-testid="stHeader"] {
-    background: transparent !important;
-}
-
-/* Use almost the entire browser width for the embedded dashboard. */
-[data-testid="stMainBlockContainer"],
-.main .block-container {
-    max-width: none !important;
-    width: 100% !important;
-    padding-left: 0.85rem !important;
-    padding-right: 0.85rem !important;
-    padding-top: 0.55rem !important;
-    padding-bottom: 1rem !important;
-}
-
-/* Compact app navigation: one slim row above DataLens. */
-.st-key-section_header_v759 {
-    margin: 0 0 0.55rem 0 !important;
-    padding: 0.2rem 0 0.45rem 0 !important;
-    border-bottom: 1px solid #e8ecf2 !important;
-}
-.st-key-section_header_v759 div[data-testid="stButton"] > button {
-    min-height: 38px !important;
-    border-radius: 10px !important;
-}
-.vk-current-section {
-    min-height: 38px !important;
-    font-size: 20px !important;
-}
-
-/* Clean dashboard shell. */
-.vk-datalens-shell {
-    width: 100%;
-    margin: 0;
-    padding: 0;
-}
-.vk-datalens-meta {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    min-height: 34px;
-    margin: 0 0 0.45rem 0;
-    padding: 0 0.15rem;
-    color: #667085;
-    font-size: 12px;
-}
-.vk-datalens-meta strong {
-    color: #252a34;
-    font-size: 13px;
-    font-weight: 700;
-}
-.vk-datalens-live-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 999px;
-    background: #2fb36f;
-    box-shadow: 0 0 0 4px rgba(47, 179, 111, .10);
-    flex: 0 0 auto;
-}
-.st-key-datalens_frame_v1 {
-    width: 100%;
-    padding: 4px !important;
-    background: #ffffff;
-    border: 1px solid #e5e9f0;
-    border-radius: 16px;
-    box-shadow: 0 8px 28px rgba(16, 24, 40, .055);
-    overflow: hidden;
-}
-
-/* Streamlit wraps components in a container; make it flush with our shell. */
-div[data-testid="stCustomComponentV1"],
-div[data-testid="stIFrame"] {
-    width: 100% !important;
-    margin: 0 !important;
-}
-div[data-testid="stCustomComponentV1"] iframe,
-div[data-testid="stIFrame"] iframe,
-iframe[title="streamlit_components.v1.components.iframe"] {
-    width: 100% !important;
-    border: 0 !important;
-    border-radius: 12px !important;
-    background: #ffffff !important;
-}
-
-/* DataLens page gets a neutral background, other sections are unaffected
-   because this style exists only during this selected section rerun. */
-[data-testid="stAppViewContainer"] {
-    background: #f7f8fa !important;
-}
-
-@media (max-width: 900px) {
-    [data-testid="stMainBlockContainer"],
-    .main .block-container {
-        padding-left: 0.35rem !important;
-        padding-right: 0.35rem !important;
-    }
-    .vk-datalens-meta {
-        font-size: 11px;
-    }
-}
-</style>
-<div class="vk-datalens-shell">
-    <div class="vk-datalens-meta">
-        <span class="vk-datalens-live-dot"></span>
-        <strong>свежак</strong>
-        <span>Дата меню и точки выбираются прямо внутри DataLens</span>
-    </div>
-</div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    try:
-        datalens_embed_url = _build_datalens_embed_url()
-
-        # A tall frame gives the dashboard a natural page-like scroll instead
-        # of visually squeezing the lower analytical blocks.
-        with st.container(key="datalens_frame_v1"):
-            components.iframe(
-                datalens_embed_url,
-                height=1500,
-                scrolling=True,
-            )
-    except Exception as error:
-        st.error(
-            "Не удалось открыть DataLens. Проверьте "
-            "DATALENS_EMBED_ID и DATALENS_PRIVATE_KEY в Streamlit Secrets."
-        )
-        st.caption(f"Техническая ошибка: {error}")
-    st.stop()
-
 categories = sorted(category_profile["category"].unique())
 filter_columns = st.columns(2)
 with filter_columns[0]:
@@ -10773,6 +10830,64 @@ filtered_entity = entity_profile[
     entity_profile["category"].isin(category_filter) & entity_profile["point"].isin(point_filter)
 ]
 filtered_sku = sku_point[sku_point["category"].isin(category_filter) & sku_point["point"].isin(point_filter)]
+
+# Основной analysis хранит только дневной срез. Подробное время поднимается лениво
+# лишь в разделах, где оно реально используется. Дашборду достаточно часовой агрегации;
+# Детализации и Детализации категории нужны точные timestamps.
+lazy_detail_mode = None
+if selected_main_section == "Дашборд":
+    lazy_detail_mode = "hourly"
+elif selected_main_section in {"Детализация", "Детализация категории"}:
+    lazy_detail_mode = "timed"
+
+if lazy_detail_mode:
+    point_to_shop_lazy = {
+        str(label).strip(): int(shop_number)
+        for shop_number, label in st.session_state.get("point_mapping", {}).items()
+        if re.fullmatch(r"Т\d+", str(label).strip())
+    }
+    lazy_shop_numbers = tuple(
+        sorted(
+            point_to_shop_lazy[label]
+            for label in point_filter
+            if label in point_to_shop_lazy
+        )
+    )
+    lazy_signature = (
+        lazy_detail_mode,
+        period[0].isoformat(),
+        period[1].isoformat(),
+        lazy_shop_numbers,
+        entity_reference_signature[:16],
+    )
+    if (
+        st.session_state.get("lazy_detail_signature_v751200") != lazy_signature
+        or not isinstance(st.session_state.get("lazy_detail_frame_v751200"), pd.DataFrame)
+    ):
+        lazy_started = time.perf_counter()
+        if lazy_detail_mode == "hourly":
+            lazy_sales = load_sales_hourly(
+                period[0], period[1] + timedelta(days=1), lazy_shop_numbers
+            )
+        else:
+            lazy_sales = load_sales_timed(
+                period[0], period[1] + timedelta(days=1), lazy_shop_numbers
+            )
+        lazy_detail = prepare_sales_detail_only(
+            lazy_sales, entities, st.session_state.get("point_mapping", {})
+        )
+        st.session_state["lazy_detail_frame_v751200"] = lazy_detail
+        st.session_state["lazy_detail_signature_v751200"] = lazy_signature
+        perf = dict(st.session_state.get("performance_diag_v751200", {}))
+        perf.update({
+            "Детализация": "по часам" if lazy_detail_mode == "hourly" else "точное время",
+            "Строк детального SQL": int(len(lazy_sales)),
+            "Память детального SQL, MB": round(_frame_memory_mb(lazy_sales), 2),
+            "Ленивая детализация, сек": round(time.perf_counter() - lazy_started, 3),
+        })
+        st.session_state["performance_diag_v751200"] = perf
+    daily_detail = st.session_state.get("lazy_detail_frame_v751200", daily_detail)
+
 # Не создаём вторую тяжёлую копию всей детализации с FIFO на каждом rerun.
 # Партии/даты загрузки рассчитываются ниже только для выбранного пользователем среза.
 daily_detail_with_loading = daily_detail
@@ -10918,7 +11033,7 @@ class _MainSection:
         return False
 
 
-tab_dashboard, tab_datalens, tab_report, tab_comparison, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_cycle_plan, tab_plan_check = [
+tab_dashboard, tab_report, tab_comparison, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_cycle_plan, tab_plan_check = [
     _MainSection(label) for label, _ in MENU_ITEMS
 ]
 
@@ -12275,38 +12390,20 @@ if tab_dashboard.open:
         point_sales["point_number"] = point_sales["point"].str[1:].astype(int)
         point_sales = point_sales.sort_values("point_number")
 
-        point_sales_chart = go.Figure()
-        point_sales_chart.add_trace(
-            go.Bar(
-                x=point_sales["point"],
-                y=point_sales["sales"],
-                name="Продано, шт.",
-                text=point_sales["sales"].map(lambda value: f"{value:,.0f}".replace(",", " ")),
-                textposition="outside",
-                hovertemplate="Точка %{x}<br>Продано: %{y:,.0f} шт.<extra></extra>",
-            )
+        point_revenue_table = point_sales[["point", "revenue"]].rename(
+            columns={"point": "Точка", "revenue": "Доход, ₽"}
         )
-        point_sales_chart.add_trace(
-            go.Scatter(
-                x=point_sales["point"],
-                y=point_sales["revenue"],
-                name="Выручка, ₽",
-                mode="lines+markers+text",
-                yaxis="y2",
-                text=point_sales["revenue"].map(lambda value: f"{value / 1000:,.0f} тыс. ₽".replace(",", " ")),
-                textposition="top center",
-                hovertemplate="Точка %{x}<br>Выручка: %{y:,.0f} ₽<extra></extra>",
-            )
+        col1.markdown("#### Доход по точкам")
+        col1.dataframe(
+            point_revenue_table,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Точка": st.column_config.TextColumn("Точка"),
+                "Доход, ₽": st.column_config.NumberColumn("Доход, ₽", format="%.0f"),
+            },
+            height=min(38 + 35 * max(len(point_revenue_table), 1), 720),
         )
-        point_sales_chart.update_layout(
-            title="Продажи и выручка по точкам",
-            xaxis_title="Точка",
-            yaxis=dict(title="Продано, шт."),
-            yaxis2=dict(title="Выручка, ₽", overlaying="y", side="right", showgrid=False),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            margin=dict(t=85, r=70, b=45, l=55),
-        )
-        col1.plotly_chart(point_sales_chart, use_container_width=True)
 
         category_sales = filtered_sku.groupby("category", as_index=False)["sales"].sum().sort_values("sales", ascending=False)
         col2.plotly_chart(px.bar(category_sales, x="category", y="sales", title="Продажи по категориям"), use_container_width=True)
@@ -16049,18 +16146,33 @@ if tab_sales_time.open:
                         selected_history_name = str(selected_menu_item.get("Название товара", "") or "")
 
                         history_start, history_end = period
-                        sku_history = daily_detail.copy()
-                        sku_history["sku"] = sku_history["sku"].map(normalize_sku)
-                        sku_history["business_date"] = pd.to_datetime(
-                            sku_history["business_date"], errors="coerce"
-                        ).dt.date
-                        sku_history = sku_history[
-                            sku_history["sku"].eq(selected_history_sku)
-                            & sku_history["point"].isin(selected_time_points)
-                            & sku_history["business_date"].between(
-                                history_start, history_end, inclusive="both"
+                        # Историю конкретного SKU загружаем с точным временем только после
+                        # фактического выбора строки пользователем. Это сохраняет детализацию,
+                        # но не заставляет весь раздел «Окно свежести» тянуть транзакции заранее.
+                        try:
+                            sku_history_raw = load_sales_timed(
+                                history_start,
+                                history_end + timedelta(days=1),
+                                selected_shop_numbers,
                             )
-                        ].copy()
+                            sku_history = prepare_sales_detail_only(
+                                sku_history_raw, entities, st.session_state.get("point_mapping", {})
+                            )
+                        except Exception as error:
+                            st.warning(f"Не удалось загрузить точную историю выбранного SKU: {error}")
+                            sku_history = pd.DataFrame()
+                        if not sku_history.empty:
+                            sku_history["sku"] = sku_history["sku"].map(normalize_sku)
+                            sku_history["business_date"] = pd.to_datetime(
+                                sku_history["business_date"], errors="coerce"
+                            ).dt.date
+                            sku_history = sku_history[
+                                sku_history["sku"].eq(selected_history_sku)
+                                & sku_history["point"].isin(selected_time_points)
+                                & sku_history["business_date"].between(
+                                    history_start, history_end, inclusive="both"
+                                )
+                            ].copy()
 
                         st.markdown(
                             f"#### История продаж SKU {selected_history_sku or '—'} · {selected_history_name}"
@@ -16270,7 +16382,7 @@ if tab_sales_time.open:
                             )
                         # История загружается сразу по всем доступным точкам: она нужна для общей
                         # таблицы категорий, даже если в фильтре для детализации выбрана одна точка.
-                        time_sales = load_forecast_history(
+                        time_sales = load_forecast_history_timed(
                             history_start_for_freshness,
                             history_end_for_freshness,
                             all_time_shop_numbers,
