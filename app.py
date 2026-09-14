@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.14-REPORT-APPS-SCRIPT-FALLBACK"
+BUILD_ID = "75.12.15-SITE-SURVIVES-APPS-SCRIPT"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -1315,7 +1315,21 @@ def get_current_entity_reference() -> tuple[pd.DataFrame, str, str, str, str]:
     )
 
 
-ENTITY_REFERENCE_SESSION_KEY = "entity_reference_snapshot_v751214"
+ENTITY_REFERENCE_SESSION_KEY = "entity_reference_snapshot_v751215"
+
+
+def _empty_entity_reference() -> pd.DataFrame:
+    """Schema-safe empty reference used only when the external reference is unavailable.
+
+    It lets the application and PostgreSQL reports start normally. Products are then
+    temporarily classified as «Не сопоставлено» until the live reference is reachable.
+    """
+    return pd.DataFrame(
+        columns=[
+            "sku", "entity_product_name", "category",
+            "attribute_1", "attribute_2", "attribute_3", "entity",
+        ]
+    )
 
 
 def _entity_reference_from_existing_analysis() -> pd.DataFrame:
@@ -1402,14 +1416,22 @@ def load_entity_reference_resilient() -> tuple[pd.DataFrame, str, str, str, str]
     saved = st.session_state.get(ENTITY_REFERENCE_SESSION_KEY)
     if isinstance(saved, dict):
         saved_frame = saved.get("frame")
-        if isinstance(saved_frame, pd.DataFrame) and not saved_frame.empty:
-            return (
-                saved_frame.copy(),
-                str(saved.get("source") or ""),
-                str(saved.get("checked_at") or ""),
-                str(saved.get("warning") or ""),
-                str(saved.get("signature") or _entity_reference_signature(saved_frame)),
-            )
+        # Empty is a valid emergency snapshot too. Reusing it prevents a broken
+        # Apps Script endpoint from being called again on every Streamlit rerun.
+        # The user can explicitly retry with «Обновить справочник сейчас».
+        if isinstance(saved_frame, pd.DataFrame):
+            required_columns = {
+                "sku", "entity_product_name", "category",
+                "attribute_1", "attribute_2", "attribute_3", "entity",
+            }
+            if required_columns.issubset(set(saved_frame.columns)):
+                return (
+                    saved_frame.copy(),
+                    str(saved.get("source") or ""),
+                    str(saved.get("checked_at") or ""),
+                    str(saved.get("warning") or ""),
+                    str(saved.get("signature") or _entity_reference_signature(saved_frame)),
+                )
 
     try:
         result = get_current_entity_reference()
@@ -1432,7 +1454,23 @@ def load_entity_reference_resilient() -> tuple[pd.DataFrame, str, str, str, str]
             )
             _store_entity_reference_in_session(*result)
             return result
-        raise
+        # Fresh Streamlit worker: there may be no successful reference snapshot yet.
+        # Do NOT stop the whole site.  Keep a schema-safe empty mapping so PostgreSQL
+        # sections, navigation, DataLens and raw reports stay available.  All unmatched
+        # SKU will be explicitly classified as «Не сопоставлено» until refresh succeeds.
+        empty = _empty_entity_reference()
+        checked_at = datetime.now().isoformat(timespec="seconds")
+        result = (
+            empty,
+            "Временно без справочника · PostgreSQL продолжает работать",
+            checked_at,
+            "Лист «Справочник» сейчас недоступен через Apps Script. "
+            "Сайт продолжает работу; SKU без справочника временно попадут в «Не сопоставлено». "
+            "Нажмите «Обновить справочник сейчас» после восстановления Apps Script.",
+            _entity_reference_signature(empty),
+        )
+        _store_entity_reference_in_session(*result)
+        return result
 
 
 def connection_settings() -> dict[str, object]:
@@ -9589,6 +9627,9 @@ def build_period_comparison_html(
 
 # Основной фирменный заголовок выводится вместе с внешним меню ниже.
 
+# Внешний Apps Script НЕ имеет права останавливать весь Streamlit.
+# Даже при 404 сайт стартует на PostgreSQL, а категории временно становятся
+# «Не сопоставлено» до успешного обновления справочника.
 try:
     (
         entities,
@@ -9597,13 +9638,15 @@ try:
         entity_reference_warning,
         entity_reference_signature,
     ) = load_entity_reference_resilient()
-except Exception as error:
-    st.error(f"Не удалось загрузить SKU/категории/сущности из матрицы 2.3: {error}")
-    st.caption(
-        "Это ошибка доступа к Apps Script, а не ошибка вкладки «Отчет». "
-        "Если справочник уже был загружен в текущей сессии, новая сборка использует его резервно."
+except Exception:
+    entities = _empty_entity_reference()
+    entity_reference_source = "Аварийный режим без справочника"
+    entity_reference_checked_at = datetime.now().isoformat(timespec="seconds")
+    entity_reference_warning = (
+        "Справочник временно недоступен. Сайт продолжает работу на PostgreSQL; "
+        "SKU без категории будут показаны как «Не сопоставлено»."
     )
-    st.stop()
+    entity_reference_signature = _entity_reference_signature(entities)
 
 today = date.today()
 month_start = today.replace(day=1)
@@ -9624,7 +9667,7 @@ with st.sidebar:
     if st.button(
         "Обновить справочник сейчас",
         use_container_width=True,
-        key="refresh_entity_reference_now_v751214",
+        key="refresh_entity_reference_now_v751215",
         help=(
             "Пробует заново прочитать лист «Справочник» через Apps Script. "
             "Если запрос не пройдет, уже загруженный справочник останется в работе."
@@ -9642,8 +9685,8 @@ with st.sidebar:
             if isinstance(previous_snapshot, dict):
                 st.session_state[ENTITY_REFERENCE_SESSION_KEY] = previous_snapshot
             st.warning(
-                "Apps Script пока недоступен. Продолжаю работать с уже загруженным "
-                f"справочником. Ошибка: {refresh_error}"
+                "Apps Script пока недоступен. Сайт не остановлен: продолжаю работать "
+                "с текущим резервом справочника / режимом «Не сопоставлено»."
             )
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
         pg_host = st.text_input(
