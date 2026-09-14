@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.09-SR-ZNACH-WEEKDAY-MIN-AVG-MAX"
+BUILD_ID = "75.12.10-SR-ZNACH-RAW-DRILLDOWN"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -10945,28 +10945,33 @@ if selected_main_section == "Аналитика DataLens":
     st.stop()
 
 # -----------------------------------------------------------------------------
-# Ср/знач — отдельный лёгкий отчёт. Он не наследует глобальные фильтры/метрики,
-# чтобы пользователь сначала выбрал именно период расчёта этого отчёта.
+# Ср/знач — проверяемый отчёт по точкам, дням недели и категориям.
+# Важно: расчёт ведётся по raw shop_number. Бизнес-метка ТN является только
+# отображаемым сопоставлением и НЕ используется как ключ агрегации, поэтому
+# разные raw-магазины никогда не склеиваются из-за одинакового названия точки.
 # -----------------------------------------------------------------------------
 if selected_main_section == "Ср/знач":
     st.subheader("Ср/знач")
     st.caption(
-        "Отчёт: точка → день недели → категория. Для каждого дня недели считаются "
-        "минимальные, средние и максимальные продажи категории по всем таким дням "
-        "в выбранном периоде. Среднее считается по фактическим наблюдениям одного "
-        "дня недели и не выводится из минимума и максимума."
+        "Отчёт: raw shop_number → точка → день недели → категория. Для каждой строки "
+        "показываются исходные даты, из которых получены минимум, среднее и максимум. "
+        "Ниже каждой точки можно провалиться до конкретной даты и увидеть SKU, которые "
+        "сформировали значение категории."
     )
 
-    with st.form("sr_mean_period_form_v751208", clear_on_submit=False):
+    with st.form("sr_mean_period_form_v751210", clear_on_submit=False):
         sr_period_input = st.date_input(
             "Период формирования отчёта",
             value=(period[0], period[1]),
             max_value=today,
             format="DD.MM.YYYY",
-            key="sr_mean_period_input_v751208",
-            help="Выберите начало и конец периода. Внутри периода показатели будут рассчитаны отдельно для Пн, Вт, Ср, Чт, Пт, Сб и Вс.",
+            key="sr_mean_period_input_v751210",
+            help=(
+                "Выберите начало и конец периода. Пн сравниваются только с Пн, Вт — только "
+                "с Вт и т.д."
+            ),
         )
-        sr_submit = st.form_submit_button(
+        st.form_submit_button(
             "Сформировать",
             type="primary",
             use_container_width=False,
@@ -10982,21 +10987,134 @@ if selected_main_section == "Ср/знач":
         st.stop()
 
     sr_day_count = (sr_end - sr_start).days + 1
-    sr_point_mapping = {
-        int(shop_number): str(point_label).strip()
-        for shop_number, point_label in st.session_state.get("point_mapping", {}).items()
-        if str(point_label).strip() and re.fullmatch(r"Т\d+", str(point_label).strip())
-    }
-    sr_shop_numbers = tuple(sorted(sr_point_mapping))
-    if not sr_shop_numbers:
-        st.warning("Не найдены точки для расчёта отчёта.")
+
+    # Берём raw shop_number напрямую из PostgreSQL за выбранный период. Это важно:
+    # локальный отчёт больше не зависит от предположения shop_number N == ТN.
+    try:
+        with st.spinner("Проверяю raw shop_number за выбранный период…"):
+            sr_available = load_available_shops(sr_start, sr_end + timedelta(days=1)).copy()
+    except Exception as error:
+        st.error(f"Не удалось получить raw shop_number: {error}")
         st.stop()
 
-    with st.spinner("Формирую Ср/знач по выбранному периоду…"):
+    if sr_available.empty:
+        st.info("За выбранный период точки в PostgreSQL не найдены.")
+        st.stop()
+
+    sr_available["shop_number"] = pd.to_numeric(sr_available["shop_number"], errors="coerce")
+    sr_available["sold_quantity"] = pd.to_numeric(
+        sr_available.get("sold_quantity", 0.0), errors="coerce"
+    ).fillna(0.0)
+    sr_available["receipts"] = pd.to_numeric(
+        sr_available.get("receipts", 0), errors="coerce"
+    ).fillna(0)
+    sr_available = sr_available[sr_available["shop_number"].notna()].copy()
+    sr_available["shop_number"] = sr_available["shop_number"].astype(int)
+
+    # В отчёт берём только магазины с фактической активностью в выбранном периоде.
+    sr_active_shop_frame = sr_available[
+        sr_available["sold_quantity"].ne(0) | sr_available["receipts"].gt(0)
+    ].copy()
+    if sr_active_shop_frame.empty:
+        st.info("За выбранный период фактических продаж не найдено.")
+        st.stop()
+
+    sr_raw_shop_numbers = tuple(sorted(sr_active_shop_frame["shop_number"].unique().tolist()))
+
+    # Текущее глобальное сопоставление используем только как подпись по умолчанию.
+    # Если его нет — НЕ придумываем ТN, а оставляем raw N.
+    sr_global_mapping = {
+        int(shop_number): str(point_label).strip()
+        for shop_number, point_label in st.session_state.get("point_mapping", {}).items()
+        if pd.notna(shop_number) and str(point_label).strip()
+    }
+    sr_manual_mapping_raw = st.session_state.get("sr_point_mapping_overrides_v751210", {})
+    sr_manual_mapping = {}
+    if isinstance(sr_manual_mapping_raw, dict):
+        for raw_shop, point_label in sr_manual_mapping_raw.items():
+            try:
+                raw_number = int(raw_shop)
+            except (TypeError, ValueError):
+                continue
+            point_text = str(point_label or "").strip()
+            if point_text:
+                sr_manual_mapping[raw_number] = point_text
+
+    sr_point_mapping = {
+        raw_shop: sr_manual_mapping.get(
+            raw_shop,
+            sr_global_mapping.get(raw_shop, f"raw {raw_shop}"),
+        )
+        for raw_shop in sr_raw_shop_numbers
+    }
+
+    with st.expander("Сопоставление raw shop_number → точка", expanded=False):
+        st.caption(
+            "Это контрольная карта только для отчёта «Ср/знач». Raw shop_number — фактический "
+            "номер из PostgreSQL. Если бизнес-точка подписана неверно, исправьте колонку «Точка» "
+            "и нажмите «Применить сопоставление». Расчёты при этом остаются разделены по raw номеру."
+        )
+        sr_mapping_editor = sr_active_shop_frame[
+            ["shop_number", "sold_quantity", "receipts"]
+        ].drop_duplicates("shop_number").sort_values("shop_number", kind="stable")
+        sr_mapping_editor["Точка"] = sr_mapping_editor["shop_number"].map(sr_point_mapping)
+        sr_mapping_editor = sr_mapping_editor.rename(
+            columns={
+                "shop_number": "raw shop_number",
+                "sold_quantity": "Продано за период, шт.",
+                "receipts": "Чеков",
+            }
+        )
+        sr_mapping_edited = st.data_editor(
+            sr_mapping_editor,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["raw shop_number", "Продано за период, шт.", "Чеков"],
+            column_config={
+                "raw shop_number": st.column_config.NumberColumn(format="%d"),
+                "Точка": st.column_config.TextColumn(
+                    "Точка",
+                    help="Например Т2. Если соответствие неизвестно, можно оставить raw N.",
+                ),
+                "Продано за период, шт.": st.column_config.NumberColumn(format="%.0f"),
+                "Чеков": st.column_config.NumberColumn(format="%d"),
+            },
+            key="sr_point_mapping_editor_v751210",
+        )
+        sr_mapping_cols = st.columns([1.2, 1.0, 3.0])
+        with sr_mapping_cols[0]:
+            if st.button(
+                "Применить сопоставление",
+                type="primary",
+                use_container_width=True,
+                key="sr_apply_point_mapping_v751210",
+            ):
+                updated_mapping = {}
+                for _, map_row in sr_mapping_edited.iterrows():
+                    try:
+                        raw_number = int(map_row.get("raw shop_number"))
+                    except (TypeError, ValueError):
+                        continue
+                    point_text = str(map_row.get("Точка", "") or "").strip()
+                    if point_text:
+                        updated_mapping[raw_number] = point_text
+                st.session_state["sr_point_mapping_overrides_v751210"] = updated_mapping
+                st.toast("Сопоставление точек применено", icon="✅")
+                st.rerun()
+        with sr_mapping_cols[1]:
+            if st.button(
+                "Сбросить ручное",
+                use_container_width=True,
+                key="sr_reset_point_mapping_v751210",
+            ):
+                st.session_state["sr_point_mapping_overrides_v751210"] = {}
+                st.rerun()
+
+    with st.spinner("Формирую Ср/знач по raw shop_number…"):
         sr_sales = load_sales(
             sr_start,
             sr_end + timedelta(days=1),
-            sr_shop_numbers,
+            sr_raw_shop_numbers,
         )
 
     if sr_sales.empty:
@@ -11007,11 +11125,15 @@ if selected_main_section == "Ср/знач":
     sr_work["shop_number"] = pd.to_numeric(sr_work["shop_number"], errors="coerce")
     sr_work = sr_work[sr_work["shop_number"].notna()].copy()
     sr_work["shop_number"] = sr_work["shop_number"].astype(int)
+    sr_work = sr_work[sr_work["shop_number"].isin(sr_raw_shop_numbers)].copy()
     sr_work["point"] = sr_work["shop_number"].map(sr_point_mapping)
-    sr_work = sr_work[sr_work["point"].notna()].copy()
+    sr_work["point"] = sr_work["point"].fillna(
+        sr_work["shop_number"].map(lambda value: f"raw {int(value)}")
+    )
     sr_work["business_date"] = pd.to_datetime(
         sr_work["business_date"], errors="coerce"
     ).dt.date
+    sr_work = sr_work[sr_work["business_date"].notna()].copy()
     sr_work["sold_quantity"] = pd.to_numeric(
         sr_work["sold_quantity"], errors="coerce"
     ).fillna(0.0)
@@ -11026,7 +11148,9 @@ if selected_main_section == "Ср/знач":
         sr_entities = sr_entities.drop_duplicates("sku", keep="last")
     sr_work = sr_work.merge(sr_entities, on="sku", how="left", validate="many_to_one")
 
-    sr_sql_names = sr_work.get("product_name", pd.Series("", index=sr_work.index)).fillna("").astype(str).str.strip()
+    sr_sql_names = sr_work.get(
+        "product_name", pd.Series("", index=sr_work.index)
+    ).fillna("").astype(str).str.strip()
     sr_reference_names = sr_work.get(
         "entity_product_name", pd.Series("", index=sr_work.index)
     ).fillna("").astype(str).str.strip()
@@ -11059,16 +11183,18 @@ if selected_main_section == "Ср/знач":
     sr_work["report_category"] = sr_work["report_category"].where(
         sr_work["report_category"].notna(), sr_base_category
     )
-    sr_work["report_category"] = sr_work["report_category"].fillna("Нераспознано").astype(str).str.strip()
+    sr_work["report_category"] = (
+        sr_work["report_category"].fillna("Нераспознано").astype(str).str.strip()
+    )
     sr_work.loc[
         sr_work["report_category"].str.casefold().isin(sr_unknown_values),
         "report_category",
     ] = "Нераспознано"
 
-    # Сначала считаем факт категории по каждому календарному дню точки.
+    # Дневной факт категории. Ключ всегда содержит raw shop_number.
     sr_daily = (
         sr_work.groupby(
-            ["point", "business_date", "report_category"],
+            ["shop_number", "point", "business_date", "report_category"],
             as_index=False,
             dropna=False,
         )["sold_quantity"]
@@ -11076,12 +11202,9 @@ if selected_main_section == "Ср/знач":
         .rename(columns={"sold_quantity": "daily_sales"})
     )
 
-    # Рабочий день точки = в этот день у точки есть хотя бы одна строка продаж.
-    # Если точка вообще не работала/не передала продажи, такой день НЕ занижает
-    # минимум и среднее. Но если точка работала, а конкретная категория не
-    # продавалась, для этой категории в этот день учитывается 0.
+    # Рабочий день raw-магазина = есть хотя бы одна строка продаж по любому SKU.
     sr_active_days = (
-        sr_work.groupby(["point", "business_date"], as_index=False)
+        sr_work.groupby(["shop_number", "point", "business_date"], as_index=False)
         .agg(activity_rows=("sold_quantity", "size"))
     )
     sr_active_days = sr_active_days[sr_active_days["activity_rows"].gt(0)].copy()
@@ -11100,32 +11223,33 @@ if selected_main_section == "Ср/знач":
     ).dt.weekday
     sr_active_days["weekday"] = sr_active_days["weekday_number"].map(sr_weekday_names)
 
-    # Для каждой точки берём все категории, встретившиеся в выбранном периоде,
-    # и накладываем их на каждый рабочий день этой точки. Так нулевые продажи
-    # категории в рабочий день остаются полноценным наблюдением.
-    sr_point_categories = sr_work[["point", "report_category"]].drop_duplicates()
+    # Нулевая продажа категории учитывается только если сам raw-магазин в этот день работал.
+    sr_point_categories = sr_work[
+        ["shop_number", "point", "report_category"]
+    ].drop_duplicates()
     if not sr_point_categories.empty and not sr_active_days.empty:
         sr_grid = sr_point_categories.merge(
-            sr_active_days[["point", "business_date", "weekday_number", "weekday"]],
-            on="point",
+            sr_active_days[
+                ["shop_number", "point", "business_date", "weekday_number", "weekday"]
+            ],
+            on=["shop_number", "point"],
             how="inner",
         )
         sr_grid = sr_grid.merge(
             sr_daily,
-            on=["point", "business_date", "report_category"],
+            on=["shop_number", "point", "business_date", "report_category"],
             how="left",
         )
         sr_grid["daily_sales"] = pd.to_numeric(
             sr_grid["daily_sales"], errors="coerce"
         ).fillna(0.0)
+        sr_grid = sr_grid.sort_values(
+            ["shop_number", "business_date", "report_category"], kind="stable"
+        )
 
-        # Главная логика отчёта:
-        # точка -> день недели -> категория -> min / mean / max
-        # Среднее = обычное среднее по всем рабочим таким дням недели в периоде,
-        # а НЕ среднее между min и max.
         sr_summary = (
             sr_grid.groupby(
-                ["point", "weekday_number", "weekday", "report_category"],
+                ["shop_number", "point", "weekday_number", "weekday", "report_category"],
                 as_index=False,
                 dropna=False,
             )
@@ -11136,25 +11260,55 @@ if selected_main_section == "Ср/знач":
                 max_sales=("daily_sales", "max"),
             )
         )
+
+        # Прозрачность расчёта: показываем все фактические даты и продажи,
+        # из которых получены min / avg / max.
+        sr_observations = sr_grid.copy()
+        sr_observations["_date_text"] = pd.to_datetime(
+            sr_observations["business_date"], errors="coerce"
+        ).dt.strftime("%d.%m")
+        sr_observations["_value_text"] = sr_observations["daily_sales"].map(
+            lambda value: f"{float(value):g}"
+        )
+        sr_observations["_observation"] = (
+            sr_observations["_date_text"] + " = " + sr_observations["_value_text"]
+        )
+        sr_dates = (
+            sr_observations.groupby(
+                ["shop_number", "point", "weekday_number", "weekday", "report_category"],
+                as_index=False,
+                dropna=False,
+            )["_observation"]
+            .agg("; ".join)
+            .rename(columns={"_observation": "dates_values"})
+        )
+        sr_summary = sr_summary.merge(
+            sr_dates,
+            on=["shop_number", "point", "weekday_number", "weekday", "report_category"],
+            how="left",
+            validate="one_to_one",
+        )
     else:
+        sr_grid = pd.DataFrame()
         sr_summary = pd.DataFrame(
             columns=[
-                "point", "weekday_number", "weekday", "report_category",
-                "days_count", "min_sales", "avg_sales", "max_sales",
+                "shop_number", "point", "weekday_number", "weekday", "report_category",
+                "days_count", "min_sales", "avg_sales", "max_sales", "dates_values",
             ]
         )
 
-    sr_points = sorted(
-        sr_summary["point"].dropna().astype(str).unique().tolist(),
-        key=lambda value: int(re.search(r"(\d+)", value).group(1))
-        if re.search(r"(\d+)", value)
-        else 999999,
+    sr_point_keys = (
+        sr_summary[["shop_number", "point"]]
+        .drop_duplicates()
+        .sort_values("shop_number", kind="stable")
+        .itertuples(index=False, name=None)
     )
+    sr_point_keys = list(sr_point_keys)
 
     report_meta_cols = st.columns(4)
     report_meta_cols[0].metric("Период", f"{sr_start:%d.%m.%Y}–{sr_end:%d.%m.%Y}")
     report_meta_cols[1].metric("Календарных дней", sr_day_count)
-    report_meta_cols[2].metric("Точек", len(sr_points))
+    report_meta_cols[2].metric("Raw-точек", len(sr_point_keys))
     report_meta_cols[3].metric(
         "Нераспознано, шт.",
         f"{sr_work.loc[sr_work['report_category'].eq('Нераспознано'), 'sold_quantity'].sum():,.0f}".replace(",", " "),
@@ -11162,18 +11316,22 @@ if selected_main_section == "Ср/знач":
 
     st.markdown("### Точки")
     st.caption(
-        "Раскройте точку. Для каждого дня недели и каждой категории показаны минимум, "
-        "среднее и максимум продаж за один такой день в выбранном периоде. "
-        "Например, строка Пн / Салаты сравнивает только понедельники. "
-        "День, когда точка работала, но категория не продавалась, учитывается как 0; "
-        "день, когда точка вообще не работала/не передала продажи, в расчёт не входит."
+        "В заголовке каждой точки обязательно показан raw shop_number. Колонка «Факт по датам» "
+        "показывает исходные значения. Если цифра кажется неверной, откройте «Проверка исходного "
+        "факта» и провалитесь до конкретных SKU."
     )
 
-    for sr_point in sr_points:
-        sr_point_table = sr_summary[sr_summary["point"].eq(sr_point)].copy()
+    for sr_raw_shop, sr_point in sr_point_keys:
+        sr_raw_shop = int(sr_raw_shop)
+        sr_point = str(sr_point)
+        sr_point_table = sr_summary[
+            sr_summary["shop_number"].eq(sr_raw_shop)
+        ].copy()
         sr_point_total = float(
             pd.to_numeric(
-                sr_work.loc[sr_work["point"].eq(sr_point), "sold_quantity"],
+                sr_work.loc[
+                    sr_work["shop_number"].eq(sr_raw_shop), "sold_quantity"
+                ],
                 errors="coerce",
             ).fillna(0.0).sum()
         )
@@ -11191,6 +11349,7 @@ if selected_main_section == "Ср/знач":
                 "avg_sales": "Средние продажи, шт.",
                 "max_sales": "Макс. продажи, шт.",
                 "days_count": "Дней в расчёте",
+                "dates_values": "Факт по датам",
             }
         )[
             [
@@ -11200,10 +11359,15 @@ if selected_main_section == "Ср/знач":
                 "Средние продажи, шт.",
                 "Макс. продажи, шт.",
                 "Дней в расчёте",
+                "Факт по датам",
             ]
         ]
+
         with st.expander(
-            f"{sr_point} · {sr_point_total:,.0f} шт. за период".replace(",", " "),
+            (
+                f"{sr_point} · raw shop_number={sr_raw_shop} · "
+                f"{sr_point_total:,.0f} шт. за период"
+            ).replace(",", " "),
             expanded=False,
         ):
             st.dataframe(
@@ -11211,21 +11375,141 @@ if selected_main_section == "Ср/знач":
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "День недели": st.column_config.TextColumn("День недели"),
-                    "Категория": st.column_config.TextColumn("Категория"),
+                    "День недели": st.column_config.TextColumn("День недели", width="small"),
+                    "Категория": st.column_config.TextColumn("Категория", width="medium"),
                     "Мин. продажи, шт.": st.column_config.NumberColumn(format="%.0f"),
                     "Средние продажи, шт.": st.column_config.NumberColumn(format="%.1f"),
                     "Макс. продажи, шт.": st.column_config.NumberColumn(format="%.0f"),
                     "Дней в расчёте": st.column_config.NumberColumn(format="%d"),
+                    "Факт по датам": st.column_config.TextColumn("Факт по датам", width="large"),
                 },
             )
+
+            with st.expander("Проверка исходного факта", expanded=False):
+                sr_point_grid = sr_grid[
+                    sr_grid["shop_number"].eq(sr_raw_shop)
+                ].copy() if not sr_grid.empty else pd.DataFrame()
+
+                if sr_point_grid.empty:
+                    st.info("Для этой raw-точки нет дневных наблюдений.")
+                else:
+                    sr_weekday_options = (
+                        sr_point_grid[["weekday_number", "weekday"]]
+                        .drop_duplicates()
+                        .sort_values("weekday_number", kind="stable")["weekday"]
+                        .astype(str)
+                        .tolist()
+                    )
+                    sr_drill_cols = st.columns(2)
+                    with sr_drill_cols[0]:
+                        sr_selected_weekday = st.selectbox(
+                            "День недели для проверки",
+                            sr_weekday_options,
+                            key=f"sr_drill_weekday_v751210_{sr_raw_shop}",
+                        )
+
+                    sr_category_options = sorted(
+                        sr_point_grid.loc[
+                            sr_point_grid["weekday"].eq(sr_selected_weekday),
+                            "report_category",
+                        ].dropna().astype(str).unique().tolist(),
+                        key=lambda value: (value == "Нераспознано", value.casefold()),
+                    )
+                    with sr_drill_cols[1]:
+                        sr_selected_category = st.selectbox(
+                            "Категория для проверки",
+                            sr_category_options,
+                            key=f"sr_drill_category_v751210_{sr_raw_shop}",
+                        )
+
+                    sr_daily_check = sr_point_grid[
+                        sr_point_grid["weekday"].eq(sr_selected_weekday)
+                        & sr_point_grid["report_category"].eq(sr_selected_category)
+                    ][["business_date", "weekday", "daily_sales"]].copy()
+                    sr_daily_check = sr_daily_check.sort_values("business_date", kind="stable")
+                    sr_daily_check = sr_daily_check.rename(
+                        columns={
+                            "business_date": "Дата",
+                            "weekday": "День недели",
+                            "daily_sales": "Продано категории, шт.",
+                        }
+                    )
+                    st.caption(
+                        f"{sr_point} / raw {sr_raw_shop} / {sr_selected_weekday} / "
+                        f"{sr_selected_category}: именно эти даты участвуют в min / avg / max."
+                    )
+                    st.dataframe(
+                        sr_daily_check,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Дата": st.column_config.DateColumn(format="DD.MM.YYYY"),
+                            "Продано категории, шт.": st.column_config.NumberColumn(format="%.0f"),
+                        },
+                    )
+
+                    sr_date_options = sr_daily_check["Дата"].tolist()
+                    if sr_date_options:
+                        sr_selected_date = st.selectbox(
+                            "Дата — показать SKU, из которых сложилась категория",
+                            sr_date_options,
+                            format_func=lambda value: value.strftime("%d.%m.%Y")
+                            if hasattr(value, "strftime") else str(value),
+                            key=f"sr_drill_date_v751210_{sr_raw_shop}",
+                        )
+                        sr_sku_breakdown = sr_work[
+                            sr_work["shop_number"].eq(sr_raw_shop)
+                            & sr_work["business_date"].eq(sr_selected_date)
+                            & sr_work["report_category"].eq(sr_selected_category)
+                        ].copy()
+                        if sr_sku_breakdown.empty:
+                            st.info(
+                                "В этот день точка работала, но в выбранной категории продаж не было — "
+                                "поэтому в расчёте стоит 0."
+                            )
+                        else:
+                            sr_sku_breakdown = (
+                                sr_sku_breakdown.groupby(
+                                    ["sku", "report_product_name"],
+                                    as_index=False,
+                                    dropna=False,
+                                )["sold_quantity"]
+                                .sum()
+                                .sort_values("sold_quantity", ascending=False, kind="stable")
+                                .rename(
+                                    columns={
+                                        "sku": "SKU",
+                                        "report_product_name": "Блюдо",
+                                        "sold_quantity": "Продано, шт.",
+                                    }
+                                )
+                            )
+                            sr_sku_total = float(
+                                pd.to_numeric(
+                                    sr_sku_breakdown["Продано, шт."], errors="coerce"
+                                ).fillna(0.0).sum()
+                            )
+                            st.markdown(
+                                f"**SKU за {sr_selected_date:%d.%m.%Y}: "
+                                f"итого {sr_sku_total:,.0f} шт.**".replace(",", " ")
+                            )
+                            st.dataframe(
+                                sr_sku_breakdown,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "SKU": st.column_config.TextColumn("SKU"),
+                                    "Блюдо": st.column_config.TextColumn("Блюдо"),
+                                    "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                },
+                            )
 
     st.markdown("---")
     st.markdown("### Редактор категории «Нераспознано»")
     st.caption(
-        "Здесь находятся SKU, для которых справочник не дал категорию. "
-        "Назначьте категорию и нажмите «Применить категории» — после обновления SKU "
-        "сразу уйдёт из «Нераспознано» и войдёт в выбранную категорию в отчёте."
+        "Здесь находятся SKU, для которых справочник не дал категорию. Назначьте категорию "
+        "и нажмите «Применить категории» — SKU сразу уйдёт из «Нераспознано» и все дневные "
+        "min / avg / max будут пересчитаны."
     )
 
     sr_unrecognized = sr_work[sr_work["report_category"].eq("Нераспознано")].copy()
@@ -11238,7 +11522,7 @@ if selected_main_section == "Ср/знач":
             .agg(
                 **{
                     "Продано за период, шт.": ("sold_quantity", "sum"),
-                    "Точек": ("point", "nunique"),
+                    "Raw-точек": ("shop_number", "nunique"),
                 }
             )
             .rename(columns={"sku": "SKU", "report_product_name": "Блюдо"})
@@ -11268,7 +11552,7 @@ if selected_main_section == "Ср/знач":
             sr_editor_source,
             use_container_width=True,
             hide_index=True,
-            disabled=["SKU", "Блюдо", "Продано за период, шт.", "Точек"],
+            disabled=["SKU", "Блюдо", "Продано за период, шт.", "Raw-точек"],
             column_config={
                 "SKU": st.column_config.TextColumn("SKU"),
                 "Блюдо": st.column_config.TextColumn("Блюдо"),
@@ -11278,9 +11562,9 @@ if selected_main_section == "Ср/знач":
                     required=True,
                 ),
                 "Продано за период, шт.": st.column_config.NumberColumn(format="%.0f"),
-                "Точек": st.column_config.NumberColumn(format="%d"),
+                "Raw-точек": st.column_config.NumberColumn(format="%d"),
             },
-            key=f"sr_category_editor_v751208_{sr_editor_signature}",
+            key=f"sr_category_editor_v751210_{sr_editor_signature}",
         )
 
         editor_actions = st.columns([1.0, 1.0, 3.2])
@@ -11289,7 +11573,7 @@ if selected_main_section == "Ср/знач":
                 "Применить категории",
                 type="primary",
                 use_container_width=True,
-                key="sr_apply_category_overrides_v751208",
+                key="sr_apply_category_overrides_v751210",
             ):
                 updated_overrides = dict(sr_overrides)
                 applied = 0
@@ -11310,14 +11594,14 @@ if selected_main_section == "Ср/знач":
             if st.button(
                 "Сбросить ручные",
                 use_container_width=True,
-                key="sr_reset_category_overrides_v751208",
+                key="sr_reset_category_overrides_v751210",
             ):
                 st.session_state["sr_category_overrides_v751208"] = {}
                 st.rerun()
 
         st.caption(
-            "Ручные назначения сейчас хранятся в сессии Streamlit и применяются к этому отчёту сразу. "
-            "Для постоянной записи в лист «Справочник» нужен отдельный write-метод Apps Script."
+            "Ручные назначения категорий пока хранятся в текущей сессии Streamlit. "
+            "Для постоянной записи в лист «Справочник» нужен write-метод Apps Script."
         )
 
     st.stop()
