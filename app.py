@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.10-SR-ZNACH-RAW-DRILLDOWN"
+BUILD_ID = "75.12.12-SR-REPORT-WEEKDAY-MATRIX"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -4922,6 +4922,221 @@ def build_freshness_point_menu_excel(
             width = 10 if column in FRESHNESS_POINT_DAY_COLUMNS else widths.get(column, 14)
             sheet.column_dimensions[get_column_letter(col_idx)].width = width
         sheet.row_dimensions[header_row].height = 32
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
+
+def _sr_report_month_label(period_start: date, period_end: date) -> str:
+    """Человекочитаемый месяц/диапазон месяцев для отчёта Ср/знач."""
+    month_names = {
+        1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+        5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+        9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
+    }
+    if period_start.year == period_end.year and period_start.month == period_end.month:
+        return f"{month_names[period_start.month]} {period_start.year}"
+    return (
+        f"{month_names[period_start.month]} {period_start.year} — "
+        f"{month_names[period_end.month]} {period_end.year}"
+    )
+
+
+def build_sr_weekday_category_excel(
+    summary: pd.DataFrame,
+    period_start: date,
+    period_end: date,
+) -> bytes:
+    """Excel-отчёт Ср/знач: отдельный лист на категорию, дни недели по колонкам.
+
+    На каждом листе:
+    - сверху месяц/период и категория;
+    - колонки Пн–Вс;
+    - каждая raw-точка занимает ровно 3 строки: Мин, Макс, Среднее.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Border, Side
+
+    if summary is None or summary.empty:
+        raise ValueError("Нет данных для формирования отчёта Ср/знач.")
+
+    required_columns = {
+        "shop_number", "point", "weekday_number", "weekday", "report_category",
+        "min_sales", "avg_sales", "max_sales",
+    }
+    missing = required_columns - set(summary.columns)
+    if missing:
+        raise ValueError(
+            "В расчёте Ср/знач не хватает колонок: " + ", ".join(sorted(missing))
+        )
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+
+    title_fill = PatternFill("solid", fgColor="1F4E78")
+    category_fill = PatternFill("solid", fgColor="D9EAF7")
+    header_fill = PatternFill("solid", fgColor="EAF2F8")
+    min_fill = PatternFill("solid", fgColor="F3F6FA")
+    max_fill = PatternFill("solid", fgColor="FCE4D6")
+    avg_fill = PatternFill("solid", fgColor="E2F0D9")
+    unknown_fill = PatternFill("solid", fgColor="FFF2CC")
+    border = Border(
+        left=Side(style="thin", color="D9D9D9"),
+        right=Side(style="thin", color="D9D9D9"),
+        top=Side(style="thin", color="D9D9D9"),
+        bottom=Side(style="thin", color="D9D9D9"),
+    )
+    white_bold = Font(color="FFFFFF", bold=True, size=15)
+    category_font = Font(bold=True, size=13, color="1F1F1F")
+    header_font = Font(bold=True, color="1F1F1F")
+    point_font = Font(bold=True, color="1F1F1F")
+
+    month_label = _sr_report_month_label(period_start, period_end)
+    weekdays = [(0, "Пн"), (1, "Вт"), (2, "Ср"), (3, "Чт"), (4, "Пт"), (5, "Сб"), (6, "Вс")]
+
+    categories = [
+        str(value or "Нераспознано").strip() or "Нераспознано"
+        for value in summary["report_category"].dropna().unique().tolist()
+    ]
+    categories = sorted(
+        set(categories),
+        key=lambda value: (str(value).casefold() == "нераспознано", str(value).casefold()),
+    )
+
+    point_rows = (
+        summary[["shop_number", "point"]]
+        .drop_duplicates()
+        .sort_values("shop_number", kind="stable")
+    )
+
+    used_sheet_names: set[str] = set()
+    for category in categories:
+        category_rows = summary[summary["report_category"].astype(str).eq(category)].copy()
+
+        safe_category = re.sub(r"[\\/*?:\[\]]", "_", category).strip() or "Категория"
+        sheet_name = safe_category[:31]
+        base_name = sheet_name
+        suffix = 2
+        while sheet_name in used_sheet_names:
+            tail = f"_{suffix}"
+            sheet_name = f"{base_name[:31-len(tail)]}{tail}"
+            suffix += 1
+        used_sheet_names.add(sheet_name)
+
+        sheet = workbook.create_sheet(sheet_name)
+        sheet.sheet_view.showGridLines = False
+        sheet.freeze_panes = "C5"
+
+        sheet.merge_cells("A1:I1")
+        sheet["A1"] = month_label
+        sheet["A1"].fill = title_fill
+        sheet["A1"].font = white_bold
+        sheet["A1"].alignment = Alignment(horizontal="center", vertical="center")
+        sheet.row_dimensions[1].height = 27
+
+        sheet.merge_cells("A2:I2")
+        sheet["A2"] = f"Категория: {category}"
+        sheet["A2"].fill = unknown_fill if category == "Нераспознано" else category_fill
+        sheet["A2"].font = category_font
+        sheet["A2"].alignment = Alignment(horizontal="center", vertical="center")
+        sheet.row_dimensions[2].height = 23
+
+        sheet.merge_cells("A3:I3")
+        sheet["A3"] = f"Период: {period_start:%d.%m.%Y}–{period_end:%d.%m.%Y}"
+        sheet["A3"].font = Font(color="666666", italic=True)
+        sheet["A3"].alignment = Alignment(horizontal="center", vertical="center")
+
+        headers = ["Точка", "Показатель"] + [name for _, name in weekdays]
+        header_row = 4
+        for column_index, header in enumerate(headers, start=1):
+            cell = sheet.cell(header_row, column_index, header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        sheet.row_dimensions[header_row].height = 28
+
+        output_row = 5
+        for point_item in point_rows.itertuples(index=False):
+            raw_shop = int(point_item.shop_number)
+            point_label = str(point_item.point or f"raw {raw_shop}").strip()
+            point_category = category_rows[category_rows["shop_number"].eq(raw_shop)].copy()
+
+            # Значения по дням недели. Если наблюдения для дня недели нет, оставляем пусто,
+            # чтобы не подменять отсутствие данных нулевой продажей.
+            lookup = {}
+            for _, row in point_category.iterrows():
+                weekday_number = pd.to_numeric(row.get("weekday_number"), errors="coerce")
+                if pd.isna(weekday_number):
+                    continue
+                lookup[int(weekday_number)] = {
+                    "Мин": pd.to_numeric(row.get("min_sales"), errors="coerce"),
+                    "Макс": pd.to_numeric(row.get("max_sales"), errors="coerce"),
+                    "Среднее": pd.to_numeric(row.get("avg_sales"), errors="coerce"),
+                }
+
+            start_row = output_row
+            end_row = output_row + 2
+            sheet.merge_cells(start_row=start_row, start_column=1, end_row=end_row, end_column=1)
+            point_cell = sheet.cell(start_row, 1, point_label)
+            point_cell.font = point_font
+            point_cell.alignment = Alignment(horizontal="center", vertical="center")
+            point_cell.border = border
+
+            # Порядок строк строго по запросу пользователя: 1) Мин, 2) Макс, 3) Среднее.
+            metrics = [
+                ("Мин", min_fill, "0"),
+                ("Макс", max_fill, "0"),
+                ("Среднее", avg_fill, "0.0"),
+            ]
+            for metric_offset, (metric_name, metric_fill, number_format) in enumerate(metrics):
+                row_number = output_row + metric_offset
+                metric_cell = sheet.cell(row_number, 2, metric_name)
+                metric_cell.font = header_font if metric_name == "Среднее" else Font(color="1F1F1F")
+                metric_cell.fill = metric_fill
+                metric_cell.border = border
+                metric_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                for weekday_index, (weekday_number, _) in enumerate(weekdays, start=3):
+                    raw_value = lookup.get(weekday_number, {}).get(metric_name, pd.NA)
+                    cell = sheet.cell(row_number, weekday_index)
+                    if pd.isna(raw_value):
+                        cell.value = None
+                    else:
+                        cell.value = float(raw_value)
+                        cell.number_format = number_format
+                    cell.fill = metric_fill
+                    cell.border = border
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            # OpenPyXL сохраняет границы merged-ячейки корректнее, если проставить их всем строкам блока.
+            for row_number in range(start_row, end_row + 1):
+                for column_index in range(1, 10):
+                    sheet.cell(row_number, column_index).border = border
+            output_row += 3
+
+        widths = {
+            "A": 15,
+            "B": 13,
+            "C": 12,
+            "D": 12,
+            "E": 12,
+            "F": 12,
+            "G": 12,
+            "H": 12,
+            "I": 12,
+        }
+        for column_letter, width in widths.items():
+            sheet.column_dimensions[column_letter].width = width
+
+        sheet.print_title_rows = "1:4"
+        sheet.page_setup.orientation = "landscape"
+        sheet.page_setup.fitToWidth = 1
+        sheet.sheet_properties.pageSetUpPr.fitToPage = True
+        sheet.oddFooter.center.text = "Стр. &P из &N"
 
     output = io.BytesIO()
     workbook.save(output)
@@ -11603,6 +11818,85 @@ if selected_main_section == "Ср/знач":
             "Ручные назначения категорий пока хранятся в текущей сессии Streamlit. "
             "Для постоянной записи в лист «Справочник» нужен write-метод Apps Script."
         )
+
+    st.markdown("---")
+    sr_report_tab = st.tabs(["Отчёт"])[0]
+    with sr_report_tab:
+        st.markdown("### Отчёт Мин / Макс / Среднее")
+        st.caption(
+            "Формирует Excel с отдельным листом для каждой категории. Сверху идут дни недели "
+            "Пн–Вс, ниже каждая точка занимает три строки: Мин, Макс и Среднее за выбранный "
+            "период. Месяц/диапазон месяцев указан вверху листа."
+        )
+
+        sr_report_hash_frame = sr_summary[
+            [
+                "shop_number", "point", "weekday_number", "weekday", "report_category",
+                "min_sales", "avg_sales", "max_sales",
+            ]
+        ].copy()
+        sr_report_hash_payload = pd.util.hash_pandas_object(
+            sr_report_hash_frame.astype(str), index=False
+        ).values.tobytes()
+        sr_report_signature = hashlib.md5(
+            sr_report_hash_payload
+            + f"{sr_start.isoformat()}|{sr_end.isoformat()}".encode("utf-8")
+        ).hexdigest()[:16]
+
+        report_state_key = "sr_excel_report_v751212"
+        report_sig_key = "sr_excel_report_signature_v751212"
+        report_error_key = "sr_excel_report_error_v751212"
+
+        report_cols = st.columns([1.2, 1.2, 3.2])
+        with report_cols[0]:
+            if st.button(
+                "Сформировать файл",
+                type="primary",
+                use_container_width=True,
+                key="sr_build_excel_report_v751212",
+            ):
+                try:
+                    st.session_state[report_state_key] = build_sr_weekday_category_excel(
+                        sr_summary,
+                        sr_start,
+                        sr_end,
+                    )
+                    st.session_state[report_sig_key] = sr_report_signature
+                    st.session_state.pop(report_error_key, None)
+                    st.toast("Excel-отчёт сформирован", icon="✅")
+                except Exception as error:
+                    st.session_state.pop(report_state_key, None)
+                    st.session_state[report_error_key] = str(error)
+
+        current_report_bytes = st.session_state.get(report_state_key)
+        current_report_signature = st.session_state.get(report_sig_key)
+        if current_report_signature != sr_report_signature:
+            current_report_bytes = None
+
+        report_error = st.session_state.get(report_error_key)
+        if report_error:
+            st.error(f"Не удалось сформировать Excel: {report_error}")
+
+        if isinstance(current_report_bytes, (bytes, bytearray)) and current_report_bytes:
+            with report_cols[1]:
+                file_period = (
+                    f"{sr_start:%Y-%m}"
+                    if sr_start.year == sr_end.year and sr_start.month == sr_end.month
+                    else f"{sr_start:%Y-%m}_{sr_end:%Y-%m}"
+                )
+                st.download_button(
+                    "Скачать Excel",
+                    data=current_report_bytes,
+                    file_name=f"Ср_знач_{file_period}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="sr_download_excel_report_v751212",
+                )
+            st.success(
+                f"Файл готов: {sr_summary['report_category'].nunique()} листов — по одному на каждую категорию."
+            )
+        else:
+            st.info("Нажмите «Сформировать файл», затем появится кнопка скачивания.")
 
     st.stop()
 
