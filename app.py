@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.18-REMOVE-CHECK-WRITEOFFS"
+BUILD_ID = "75.12.19-REMOVE-FORECAST"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -11544,7 +11544,6 @@ MENU_ITEMS = [
     ("Анализ категории", ":material/bar_chart:"),
     ("Окно свежести", ":material/calendar_month:"),
     ("Архив меню", ":material/history:"),
-    ("Прогноз плана", ":material/track_changes:"),
     ("Циклический план", ":material/repeat:"),
 ]
 SECTION_STATE_KEY = "main_section_v759"
@@ -12731,13 +12730,14 @@ class _MainSection:
         return False
 
 
-tab_mean, tab_datalens, tab_report, tab_comparison, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_menu_archive, tab_forecast, tab_cycle_plan = [
+tab_mean, tab_datalens, tab_report, tab_comparison, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_menu_archive, tab_cycle_plan = [
     _MainSection(label) for label, _ in MENU_ITEMS
 ]
 # Удалённые разделы оставлены как закрытые заглушки, чтобы старый код ниже
 # не исполнялся и не требовал массового удаления связанных функций.
 tab_category_writeoffs = _MainSection("__removed_category_writeoffs__")
 tab_plan_check = _MainSection("__removed_plan_check__")
+tab_forecast = _MainSection("__removed_forecast__")
 
 if tab_comparison.open:
     with tab_comparison:
