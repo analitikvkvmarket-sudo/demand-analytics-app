@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.19-REMOVE-FORECAST"
+BUILD_ID = "75.12.20-ENTITY-CONSUMPTION"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -14328,6 +14328,554 @@ if tab_entities.open:
                                 "Выручка, ₽": st.column_config.NumberColumn(format="%.0f"),
                                 "Точек с продажами": st.column_config.NumberColumn(format="%d"),
                             },
+                        )
+
+
+        st.divider()
+        st.subheader("Расчёт потребления сущности")
+        st.caption(
+            "Выберите период, категорию и сущность. Для каждой точки считаются среднее и максимальное "
+            "количество продаж по дням недели. Если точка в конкретную дату работала, но выбранная сущность "
+            "не продавалась, в среднем учитывается 0. Даты без факта работы точки в расчёт не входят."
+        )
+
+        entity_consumption_controls = st.columns([1.6, 1.15, 1.35])
+        with entity_consumption_controls[0]:
+            entity_consumption_range = st.date_input(
+                "Период расчёта",
+                value=(period[0], period[1]),
+                key="entity_consumption_period_v751220",
+            )
+
+        entity_reference_frames = []
+        if isinstance(entities, pd.DataFrame) and not entities.empty:
+            live_entity_reference = entities.copy()
+            for required_column in ["sku", "category", "entity"]:
+                if required_column not in live_entity_reference.columns:
+                    live_entity_reference[required_column] = pd.NA
+            live_entity_reference = live_entity_reference[["sku", "category", "entity"]].copy()
+            live_entity_reference["_source_priority"] = 0
+            entity_reference_frames.append(live_entity_reference)
+        if isinstance(sku_point, pd.DataFrame) and not sku_point.empty:
+            session_entity_reference = sku_point[["sku", "category", "entity"]].copy()
+            session_entity_reference["_source_priority"] = 1
+            entity_reference_frames.append(session_entity_reference)
+
+        entity_reference_for_consumption = (
+            pd.concat(entity_reference_frames, ignore_index=True)
+            if entity_reference_frames else pd.DataFrame(columns=["sku", "category", "entity"])
+        )
+        if not entity_reference_for_consumption.empty:
+            entity_reference_for_consumption["category"] = (
+                entity_reference_for_consumption["category"].fillna("Не сопоставлено").astype(str).str.strip()
+            )
+            entity_reference_for_consumption["entity"] = (
+                entity_reference_for_consumption["entity"].fillna("Не сопоставлено").astype(str).str.strip()
+            )
+            entity_reference_for_consumption["sku"] = entity_reference_for_consumption["sku"].map(normalize_sku)
+            entity_reference_for_consumption = (
+                entity_reference_for_consumption.sort_values("_source_priority", kind="stable")
+                .drop_duplicates("sku", keep="first")
+                .drop(columns=["_source_priority"], errors="ignore")
+                .reset_index(drop=True)
+            )
+
+        entity_consumption_categories = []
+        if not entity_reference_for_consumption.empty:
+            entity_consumption_categories = sorted(
+                value
+                for value in entity_reference_for_consumption["category"].dropna().astype(str).unique().tolist()
+                if value and value != "Не сопоставлено"
+            )
+
+        with entity_consumption_controls[1]:
+            if entity_consumption_categories:
+                entity_consumption_category = st.selectbox(
+                    "Категория",
+                    entity_consumption_categories,
+                    key="entity_consumption_category_v751220",
+                )
+            else:
+                entity_consumption_category = None
+                st.selectbox(
+                    "Категория",
+                    ["Справочник недоступен"],
+                    disabled=True,
+                    key="entity_consumption_category_empty_v751220",
+                )
+
+        entity_consumption_entities = []
+        if entity_consumption_category and not entity_reference_for_consumption.empty:
+            entity_consumption_entities = sorted(
+                value
+                for value in entity_reference_for_consumption.loc[
+                    entity_reference_for_consumption["category"].eq(entity_consumption_category), "entity"
+                ].dropna().astype(str).unique().tolist()
+                if value and value != "Не сопоставлено"
+            )
+
+        with entity_consumption_controls[2]:
+            if entity_consumption_entities:
+                entity_consumption_entity = st.selectbox(
+                    "Сущность",
+                    entity_consumption_entities,
+                    key="entity_consumption_entity_v751220",
+                )
+            else:
+                entity_consumption_entity = None
+                st.selectbox(
+                    "Сущность",
+                    ["Нет доступных сущностей"],
+                    disabled=True,
+                    key="entity_consumption_entity_empty_v751220",
+                )
+
+        entity_consumption_period_valid = (
+            isinstance(entity_consumption_range, (tuple, list))
+            and len(entity_consumption_range) == 2
+        )
+        if not entity_consumption_period_valid:
+            st.info("Укажите начальную и конечную дату периода расчёта.")
+        elif not entity_consumption_category or not entity_consumption_entity:
+            st.info("Для расчёта нужен доступный справочник категорий и сущностей.")
+        else:
+            entity_consumption_start, entity_consumption_end = entity_consumption_range
+            if entity_consumption_start > entity_consumption_end:
+                entity_consumption_start, entity_consumption_end = entity_consumption_end, entity_consumption_start
+
+            try:
+                entity_consumption_shops = load_available_shops(
+                    entity_consumption_start,
+                    entity_consumption_end + timedelta(days=1),
+                ).copy()
+            except Exception as error:
+                st.error(f"Не удалось получить список точек для расчёта сущности: {error}")
+                entity_consumption_shops = pd.DataFrame()
+
+            if entity_consumption_shops.empty:
+                st.info("За выбранный период точки продаж не найдены.")
+            else:
+                entity_consumption_shop_numbers = tuple(
+                    sorted(
+                        {
+                            int(value)
+                            for value in pd.to_numeric(
+                                entity_consumption_shops.get("shop_number", pd.Series(dtype=float)),
+                                errors="coerce",
+                            ).dropna().tolist()
+                            if int(value) > 0
+                        }
+                    )
+                )
+                current_entity_point_mapping = {
+                    int(raw): str(label).strip()
+                    for raw, label in st.session_state.get("point_mapping", {}).items()
+                    if str(raw).isdigit() and str(label).strip()
+                }
+                entity_consumption_point_mapping = {
+                    raw: current_entity_point_mapping.get(raw, f"Т{raw}")
+                    for raw in entity_consumption_shop_numbers
+                }
+
+                try:
+                    entity_consumption_history = load_forecast_history(
+                        entity_consumption_start,
+                        entity_consumption_end + timedelta(days=1),
+                        entity_consumption_shop_numbers,
+                    ).copy()
+                except Exception as error:
+                    st.error(f"Не удалось загрузить продажи для расчёта сущности: {error}")
+                    entity_consumption_history = pd.DataFrame()
+
+                if entity_consumption_history.empty:
+                    st.info("За выбранный период нет продаж для расчёта.")
+                else:
+                    entity_consumption_history["business_date"] = pd.to_datetime(
+                        entity_consumption_history["business_date"], errors="coerce"
+                    ).dt.date
+                    entity_consumption_history["shop_number"] = pd.to_numeric(
+                        entity_consumption_history["shop_number"], errors="coerce"
+                    ).astype("Int64")
+                    entity_consumption_history["sku"] = entity_consumption_history["sku"].map(normalize_sku)
+                    entity_consumption_history["sold_quantity"] = pd.to_numeric(
+                        entity_consumption_history["sold_quantity"], errors="coerce"
+                    ).fillna(0.0)
+                    entity_consumption_history = entity_consumption_history[
+                        entity_consumption_history["business_date"].notna()
+                        & entity_consumption_history["shop_number"].notna()
+                    ].copy()
+
+                    entity_consumption_reference = entity_reference_for_consumption[
+                        ["sku", "category", "entity"]
+                    ].drop_duplicates("sku", keep="last")
+                    entity_consumption_history = entity_consumption_history.merge(
+                        entity_consumption_reference,
+                        on="sku",
+                        how="left",
+                        validate="many_to_one",
+                    )
+                    entity_consumption_history["category"] = (
+                        entity_consumption_history["category"].fillna("Не сопоставлено").astype(str)
+                    )
+                    entity_consumption_history["entity"] = (
+                        entity_consumption_history["entity"].fillna("Не сопоставлено").astype(str)
+                    )
+
+                    # День считается рабочим, если по точке в этот день PostgreSQL вернул хотя бы один SKU.
+                    entity_active_days = entity_consumption_history[
+                        ["shop_number", "business_date"]
+                    ].drop_duplicates()
+
+                    selected_entity_history = entity_consumption_history[
+                        entity_consumption_history["category"].eq(entity_consumption_category)
+                        & entity_consumption_history["entity"].eq(entity_consumption_entity)
+                    ].copy()
+                    entity_daily_sales = (
+                        selected_entity_history.groupby(
+                            ["shop_number", "business_date"], as_index=False
+                        )["sold_quantity"].sum()
+                        .rename(columns={"sold_quantity": "entity_sales"})
+                    )
+                    entity_daily_grid = entity_active_days.merge(
+                        entity_daily_sales,
+                        on=["shop_number", "business_date"],
+                        how="left",
+                    )
+                    entity_daily_grid["entity_sales"] = pd.to_numeric(
+                        entity_daily_grid["entity_sales"], errors="coerce"
+                    ).fillna(0.0).clip(lower=0.0)
+                    entity_daily_grid["weekday_number"] = entity_daily_grid["business_date"].map(
+                        lambda value: int(value.weekday())
+                    )
+                    entity_weekday_short = {
+                        0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт",
+                        4: "Пт", 5: "Сб", 6: "Вс",
+                    }
+                    entity_daily_grid["День недели"] = entity_daily_grid["weekday_number"].map(
+                        entity_weekday_short
+                    )
+                    entity_daily_grid["Точка"] = entity_daily_grid["shop_number"].astype(int).map(
+                        entity_consumption_point_mapping
+                    )
+
+                    entity_point_summary = (
+                        entity_daily_grid.groupby(
+                            ["shop_number", "Точка", "weekday_number", "День недели"],
+                            as_index=False,
+                        )
+                        .agg(
+                            average_sales=("entity_sales", "mean"),
+                            max_sales=("entity_sales", "max"),
+                            active_days=("business_date", "nunique"),
+                        )
+                    )
+
+                    # Общий итог строим не как среднее средних, а сначала суммируем фактическое
+                    # потребление всех работающих точек по каждой дате, затем считаем среднее/максимум.
+                    entity_network_daily = (
+                        entity_daily_grid.groupby("business_date", as_index=False)["entity_sales"].sum()
+                    )
+                    entity_network_daily["weekday_number"] = entity_network_daily["business_date"].map(
+                        lambda value: int(value.weekday())
+                    )
+                    entity_network_daily["День недели"] = entity_network_daily["weekday_number"].map(
+                        entity_weekday_short
+                    )
+                    entity_network_summary = (
+                        entity_network_daily.groupby(
+                            ["weekday_number", "День недели"], as_index=False
+                        )
+                        .agg(
+                            average_sales=("entity_sales", "mean"),
+                            max_sales=("entity_sales", "max"),
+                            active_days=("business_date", "nunique"),
+                        )
+                    )
+
+                    entity_summary_lookup = {
+                        (int(row.shop_number), int(row.weekday_number)): row
+                        for row in entity_point_summary.itertuples(index=False)
+                    }
+                    entity_network_lookup = {
+                        int(row.weekday_number): row
+                        for row in entity_network_summary.itertuples(index=False)
+                    }
+                    entity_summary_rows = []
+                    active_raw_points = sorted(
+                        entity_daily_grid["shop_number"].dropna().astype(int).unique().tolist()
+                    )
+                    for raw_point in active_raw_points:
+                        point_label = entity_consumption_point_mapping.get(raw_point, f"Т{raw_point}")
+                        for metric_name, metric_column in [
+                            ("Среднее", "average_sales"),
+                            ("Максимум", "max_sales"),
+                        ]:
+                            summary_row = {
+                                "Точка": point_label,
+                                "raw shop_number": raw_point,
+                                "Показатель": metric_name,
+                            }
+                            for weekday_number, weekday_label in entity_weekday_short.items():
+                                source_row = entity_summary_lookup.get((raw_point, weekday_number))
+                                summary_row[weekday_label] = (
+                                    float(getattr(source_row, metric_column))
+                                    if source_row is not None
+                                    else pd.NA
+                                )
+                            entity_summary_rows.append(summary_row)
+
+                    for metric_name, metric_column in [
+                        ("Среднее", "average_sales"),
+                        ("Максимум", "max_sales"),
+                    ]:
+                        summary_row = {
+                            "Точка": "Все точки",
+                            "raw shop_number": pd.NA,
+                            "Показатель": metric_name,
+                        }
+                        for weekday_number, weekday_label in entity_weekday_short.items():
+                            source_row = entity_network_lookup.get(weekday_number)
+                            summary_row[weekday_label] = (
+                                float(getattr(source_row, metric_column))
+                                if source_row is not None
+                                else pd.NA
+                            )
+                        entity_summary_rows.append(summary_row)
+
+                    entity_consumption_table = pd.DataFrame(entity_summary_rows)
+                    entity_consumption_columns = [
+                        "Точка", "Показатель", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"
+                    ]
+                    entity_consumption_table = entity_consumption_table[
+                        ["Точка", "raw shop_number", "Показатель", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+                    ]
+
+                    st.markdown(
+                        f"#### {entity_consumption_category} → {entity_consumption_entity}"
+                    )
+                    st.caption(
+                        f"Период: {entity_consumption_start:%d.%m.%Y}–{entity_consumption_end:%d.%m.%Y}. "
+                        "В строках — точки и два показателя; по горизонтали — дни недели. "
+                        "Строки «Все точки» показывают суммарное потребление сети по каждой фактической дате."
+                    )
+
+                    entity_consumption_display = entity_consumption_table[entity_consumption_columns].copy()
+                    for weekday_label in entity_weekday_short.values():
+                        entity_consumption_display[weekday_label] = entity_consumption_display.apply(
+                            lambda row: (
+                                ""
+                                if pd.isna(row[weekday_label])
+                                else (
+                                    f"{float(row[weekday_label]):.1f}"
+                                    if row["Показатель"] == "Среднее"
+                                    else f"{float(row[weekday_label]):.0f}"
+                                )
+                            ),
+                            axis=1,
+                        )
+                    st.dataframe(
+                        entity_consumption_display,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    st.markdown("#### Чарт")
+                    entity_chart_point_options = ["Все точки"] + [
+                        entity_consumption_point_mapping.get(raw, f"Т{raw}")
+                        for raw in active_raw_points
+                    ]
+                    entity_chart_point = st.selectbox(
+                        "Точка для графика",
+                        entity_chart_point_options,
+                        key="entity_consumption_chart_point_v751220",
+                    )
+                    entity_chart_source = entity_consumption_table[
+                        entity_consumption_table["Точка"].eq(entity_chart_point)
+                    ].copy()
+                    entity_chart_rows = []
+                    for row in entity_chart_source.itertuples(index=False):
+                        for weekday_label in entity_weekday_short.values():
+                            value = getattr(row, weekday_label)
+                            if pd.notna(value):
+                                entity_chart_rows.append(
+                                    {
+                                        "День недели": weekday_label,
+                                        "Показатель": row.Показатель,
+                                        "Продано, шт.": float(value),
+                                    }
+                                )
+                    entity_chart_frame = pd.DataFrame(entity_chart_rows)
+                    if not entity_chart_frame.empty:
+                        entity_consumption_chart = px.bar(
+                            entity_chart_frame,
+                            x="День недели",
+                            y="Продано, шт.",
+                            color="Показатель",
+                            barmode="group",
+                            text_auto=".1f",
+                            category_orders={
+                                "День недели": list(entity_weekday_short.values()),
+                                "Показатель": ["Среднее", "Максимум"],
+                            },
+                            title=(
+                                f"{entity_consumption_entity} · {entity_chart_point} · "
+                                f"{entity_consumption_start:%d.%m.%Y}–{entity_consumption_end:%d.%m.%Y}"
+                            ),
+                        )
+                        entity_consumption_chart.update_layout(
+                            xaxis_title="День недели",
+                            yaxis_title="Продано, шт.",
+                            legend_title_text="",
+                            margin=dict(t=70, l=20, r=20, b=20),
+                        )
+                        st.plotly_chart(entity_consumption_chart, use_container_width=True)
+
+                    st.divider()
+                    st.markdown("### Отчёт")
+                    st.caption(
+                        "Excel повторяет текущий расчёт: выбранные категория, сущность, период, "
+                        "точки, средние и максимальные продажи по дням недели."
+                    )
+
+                    def _build_entity_consumption_excel() -> bytes:
+                        from openpyxl import Workbook
+                        from openpyxl.styles import Alignment, Font, PatternFill
+                        from openpyxl.utils import get_column_letter
+
+                        output = io.BytesIO()
+                        workbook = Workbook()
+                        sheet = workbook.active
+                        sheet.title = "Потребление сущности"
+                        sheet.sheet_view.showGridLines = False
+
+                        sheet.merge_cells("A1:I1")
+                        sheet["A1"] = (
+                            f"{entity_consumption_category} → {entity_consumption_entity}"
+                        )
+                        sheet["A1"].font = Font(bold=True, size=14)
+                        sheet["A1"].alignment = Alignment(horizontal="center")
+                        sheet["A1"].fill = PatternFill("solid", fgColor="D9EAF7")
+
+                        sheet.merge_cells("A2:I2")
+                        sheet["A2"] = (
+                            f"Период: {entity_consumption_start:%d.%m.%Y}–"
+                            f"{entity_consumption_end:%d.%m.%Y}"
+                        )
+                        sheet["A2"].alignment = Alignment(horizontal="center")
+                        sheet["A2"].font = Font(italic=True)
+
+                        headers = entity_consumption_columns
+                        for column_index, header in enumerate(headers, start=1):
+                            cell = sheet.cell(4, column_index, header)
+                            cell.font = Font(bold=True)
+                            cell.fill = PatternFill("solid", fgColor="E7E6E6")
+                            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+                        for row_index, record in enumerate(
+                            entity_consumption_table[entity_consumption_columns].itertuples(index=False),
+                            start=5,
+                        ):
+                            point_name = str(record[0])
+                            metric_name = str(record[1])
+                            sheet.cell(row_index, 1, point_name)
+                            sheet.cell(row_index, 2, metric_name)
+                            for offset, value in enumerate(record[2:], start=3):
+                                cell = sheet.cell(row_index, offset)
+                                if pd.notna(value):
+                                    cell.value = float(value)
+                                    cell.number_format = "0.0" if metric_name == "Среднее" else "0"
+                                cell.alignment = Alignment(horizontal="center")
+                            if point_name == "Все точки":
+                                for cell in sheet[row_index]:
+                                    cell.fill = PatternFill("solid", fgColor="DDEBF7")
+                                    cell.font = Font(bold=True)
+                            elif metric_name == "Среднее":
+                                for cell in sheet[row_index]:
+                                    cell.fill = PatternFill("solid", fgColor="F7F7F7")
+
+                        sheet.freeze_panes = "C5"
+                        sheet.auto_filter.ref = f"A4:I{sheet.max_row}"
+                        widths = {1: 16, 2: 14, 3: 11, 4: 11, 5: 11, 6: 11, 7: 11, 8: 11, 9: 11}
+                        for column_index, width in widths.items():
+                            sheet.column_dimensions[get_column_letter(column_index)].width = width
+                        sheet.page_setup.orientation = "landscape"
+                        sheet.page_setup.fitToWidth = 1
+                        sheet.sheet_properties.pageSetUpPr.fitToPage = True
+
+                        daily_sheet = workbook.create_sheet("Факт по дням")
+                        daily_sheet.sheet_view.showGridLines = False
+                        daily_headers = [
+                            "Дата", "День недели", "Точка", "raw shop_number",
+                            "Категория", "Сущность", "Продано, шт."
+                        ]
+                        for column_index, header in enumerate(daily_headers, start=1):
+                            cell = daily_sheet.cell(1, column_index, header)
+                            cell.font = Font(bold=True)
+                            cell.fill = PatternFill("solid", fgColor="E7E6E6")
+                            cell.alignment = Alignment(horizontal="center")
+
+                        daily_export = entity_daily_grid.sort_values(
+                            ["business_date", "shop_number"], kind="stable"
+                        )
+                        for row_index, (_, record) in enumerate(daily_export.iterrows(), start=2):
+                            daily_sheet.cell(row_index, 1, record["business_date"])
+                            daily_sheet.cell(row_index, 1).number_format = "DD.MM.YYYY"
+                            daily_sheet.cell(row_index, 2, record["День недели"])
+                            daily_sheet.cell(row_index, 3, record["Точка"])
+                            daily_sheet.cell(row_index, 4, int(record["shop_number"]))
+                            daily_sheet.cell(row_index, 5, entity_consumption_category)
+                            daily_sheet.cell(row_index, 6, entity_consumption_entity)
+                            daily_sheet.cell(row_index, 7, float(record["entity_sales"]))
+                            daily_sheet.cell(row_index, 7).number_format = "0"
+                        daily_sheet.freeze_panes = "A2"
+                        daily_sheet.auto_filter.ref = daily_sheet.dimensions
+                        daily_widths = [13, 14, 16, 18, 22, 28, 14]
+                        for column_index, width in enumerate(daily_widths, start=1):
+                            daily_sheet.column_dimensions[get_column_letter(column_index)].width = width
+
+                        workbook.save(output)
+                        output.seek(0)
+                        return output.getvalue()
+
+                    entity_report_signature = (
+                        str(entity_consumption_start),
+                        str(entity_consumption_end),
+                        str(entity_consumption_category),
+                        str(entity_consumption_entity),
+                        tuple(active_raw_points),
+                    )
+                    if st.button(
+                        "Сформировать Excel",
+                        type="primary",
+                        key="entity_consumption_build_excel_v751220",
+                    ):
+                        try:
+                            st.session_state["entity_consumption_excel_v751220"] = _build_entity_consumption_excel()
+                            st.session_state["entity_consumption_excel_signature_v751220"] = entity_report_signature
+                            st.session_state.pop("entity_consumption_excel_error_v751220", None)
+                        except Exception as error:
+                            st.session_state["entity_consumption_excel_error_v751220"] = str(error)
+
+                    entity_excel_error = st.session_state.get("entity_consumption_excel_error_v751220")
+                    if entity_excel_error:
+                        st.error(f"Не удалось сформировать Excel: {entity_excel_error}")
+                    entity_excel_bytes = st.session_state.get("entity_consumption_excel_v751220")
+                    entity_excel_signature = st.session_state.get("entity_consumption_excel_signature_v751220")
+                    if entity_excel_bytes and entity_excel_signature == entity_report_signature:
+                        safe_entity_name = re.sub(
+                            r"[^0-9A-Za-zА-Яа-яЁё_-]+", "_", str(entity_consumption_entity)
+                        ).strip("_") or "entity"
+                        st.download_button(
+                            "Скачать отчёт Excel",
+                            data=entity_excel_bytes,
+                            file_name=(
+                                f"Потребление_{safe_entity_name}_"
+                                f"{entity_consumption_start:%Y-%m-%d}_"
+                                f"{entity_consumption_end:%Y-%m-%d}.xlsx"
+                            ),
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            key="entity_consumption_download_excel_v751220",
+                            use_container_width=True,
                         )
 
 if tab_detail.open:
