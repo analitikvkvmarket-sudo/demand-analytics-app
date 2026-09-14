@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.08-SR-ZNACH-CATEGORY-EDITOR"
+BUILD_ID = "75.12.09-SR-ZNACH-WEEKDAY-MIN-AVG-MAX"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -10951,10 +10951,10 @@ if selected_main_section == "Аналитика DataLens":
 if selected_main_section == "Ср/знач":
     st.subheader("Ср/знач")
     st.caption(
-        "Отчёт по точкам и категориям. Мин/макс — дневное количество продаж категории "
-        "за выбранный период. Среднее считается по ВСЕМ календарным дням выбранного "
-        "периода: сумма категории за период / количество дней периода. "
-        "Среднее не рассчитывается из минимума и максимума."
+        "Отчёт: точка → день недели → категория. Для каждого дня недели считаются "
+        "минимальные, средние и максимальные продажи категории по всем таким дням "
+        "в выбранном периоде. Среднее считается по фактическим наблюдениям одного "
+        "дня недели и не выводится из минимума и максимума."
     )
 
     with st.form("sr_mean_period_form_v751208", clear_on_submit=False):
@@ -10964,7 +10964,7 @@ if selected_main_section == "Ср/знач":
             max_value=today,
             format="DD.MM.YYYY",
             key="sr_mean_period_input_v751208",
-            help="Выберите начало и конец периода, по которому будут рассчитаны минимум, максимум и среднее.",
+            help="Выберите начало и конец периода. Внутри периода показатели будут рассчитаны отдельно для Пн, Вт, Ср, Чт, Пт, Сб и Вс.",
         )
         sr_submit = st.form_submit_button(
             "Сформировать",
@@ -11065,6 +11065,7 @@ if selected_main_section == "Ср/знач":
         "report_category",
     ] = "Нераспознано"
 
+    # Сначала считаем факт категории по каждому календарному дню точки.
     sr_daily = (
         sr_work.groupby(
             ["point", "business_date", "report_category"],
@@ -11075,14 +11076,40 @@ if selected_main_section == "Ср/знач":
         .rename(columns={"sold_quantity": "daily_sales"})
     )
 
-    # Для среднего и минимума обязательно добавляем дни с нулевой продажей.
-    # Поэтому среднее действительно относится ко всему выбранному периоду.
-    sr_pairs = sr_daily[["point", "report_category"]].drop_duplicates()
-    sr_calendar = pd.DataFrame(
-        {"business_date": pd.date_range(sr_start, sr_end, freq="D").date}
+    # Рабочий день точки = в этот день у точки есть хотя бы одна строка продаж.
+    # Если точка вообще не работала/не передала продажи, такой день НЕ занижает
+    # минимум и среднее. Но если точка работала, а конкретная категория не
+    # продавалась, для этой категории в этот день учитывается 0.
+    sr_active_days = (
+        sr_work.groupby(["point", "business_date"], as_index=False)
+        .agg(activity_rows=("sold_quantity", "size"))
     )
-    if not sr_pairs.empty and not sr_calendar.empty:
-        sr_grid = sr_pairs.merge(sr_calendar, how="cross")
+    sr_active_days = sr_active_days[sr_active_days["activity_rows"].gt(0)].copy()
+
+    sr_weekday_names = {
+        0: "Пн",
+        1: "Вт",
+        2: "Ср",
+        3: "Чт",
+        4: "Пт",
+        5: "Сб",
+        6: "Вс",
+    }
+    sr_active_days["weekday_number"] = pd.to_datetime(
+        sr_active_days["business_date"], errors="coerce"
+    ).dt.weekday
+    sr_active_days["weekday"] = sr_active_days["weekday_number"].map(sr_weekday_names)
+
+    # Для каждой точки берём все категории, встретившиеся в выбранном периоде,
+    # и накладываем их на каждый рабочий день этой точки. Так нулевые продажи
+    # категории в рабочий день остаются полноценным наблюдением.
+    sr_point_categories = sr_work[["point", "report_category"]].drop_duplicates()
+    if not sr_point_categories.empty and not sr_active_days.empty:
+        sr_grid = sr_point_categories.merge(
+            sr_active_days[["point", "business_date", "weekday_number", "weekday"]],
+            on="point",
+            how="inner",
+        )
         sr_grid = sr_grid.merge(
             sr_daily,
             on=["point", "business_date", "report_category"],
@@ -11091,19 +11118,29 @@ if selected_main_section == "Ср/знач":
         sr_grid["daily_sales"] = pd.to_numeric(
             sr_grid["daily_sales"], errors="coerce"
         ).fillna(0.0)
+
+        # Главная логика отчёта:
+        # точка -> день недели -> категория -> min / mean / max
+        # Среднее = обычное среднее по всем рабочим таким дням недели в периоде,
+        # а НЕ среднее между min и max.
         sr_summary = (
-            sr_grid.groupby(["point", "report_category"], as_index=False)
+            sr_grid.groupby(
+                ["point", "weekday_number", "weekday", "report_category"],
+                as_index=False,
+                dropna=False,
+            )
             .agg(
-                period_sales=("daily_sales", "sum"),
+                days_count=("business_date", "nunique"),
                 min_sales=("daily_sales", "min"),
-                max_sales=("daily_sales", "max"),
                 avg_sales=("daily_sales", "mean"),
+                max_sales=("daily_sales", "max"),
             )
         )
     else:
         sr_summary = pd.DataFrame(
             columns=[
-                "point", "report_category", "period_sales", "min_sales", "max_sales", "avg_sales"
+                "point", "weekday_number", "weekday", "report_category",
+                "days_count", "min_sales", "avg_sales", "max_sales",
             ]
         )
 
@@ -11116,7 +11153,7 @@ if selected_main_section == "Ср/знач":
 
     report_meta_cols = st.columns(4)
     report_meta_cols[0].metric("Период", f"{sr_start:%d.%m.%Y}–{sr_end:%d.%m.%Y}")
-    report_meta_cols[1].metric("Дней в среднем", sr_day_count)
+    report_meta_cols[1].metric("Календарных дней", sr_day_count)
     report_meta_cols[2].metric("Точек", len(sr_points))
     report_meta_cols[3].metric(
         "Нераспознано, шт.",
@@ -11125,34 +11162,44 @@ if selected_main_section == "Ср/знач":
 
     st.markdown("### Точки")
     st.caption(
-        "Раскройте точку. Внутри — продажи по каждой категории: всего за период, "
-        "минимум за день, максимум за день и среднее за календарный день периода."
+        "Раскройте точку. Для каждого дня недели и каждой категории показаны минимум, "
+        "среднее и максимум продаж за один такой день в выбранном периоде. "
+        "Например, строка Пн / Салаты сравнивает только понедельники. "
+        "День, когда точка работала, но категория не продавалась, учитывается как 0; "
+        "день, когда точка вообще не работала/не передала продажи, в расчёт не входит."
     )
 
     for sr_point in sr_points:
         sr_point_table = sr_summary[sr_summary["point"].eq(sr_point)].copy()
-        sr_point_total = float(sr_point_table["period_sales"].sum())
+        sr_point_total = float(
+            pd.to_numeric(
+                sr_work.loc[sr_work["point"].eq(sr_point), "sold_quantity"],
+                errors="coerce",
+            ).fillna(0.0).sum()
+        )
         sr_point_table["_unknown_sort"] = sr_point_table["report_category"].eq("Нераспознано")
         sr_point_table = sr_point_table.sort_values(
-            ["_unknown_sort", "period_sales", "report_category"],
-            ascending=[True, False, True],
+            ["weekday_number", "_unknown_sort", "report_category"],
+            ascending=[True, True, True],
             kind="stable",
         )
         sr_point_display = sr_point_table.rename(
             columns={
+                "weekday": "День недели",
                 "report_category": "Категория",
-                "period_sales": "Продано за период, шт.",
-                "min_sales": "Мин. за день, шт.",
-                "max_sales": "Макс. за день, шт.",
-                "avg_sales": "Среднее за период, шт./день",
+                "min_sales": "Мин. продажи, шт.",
+                "avg_sales": "Средние продажи, шт.",
+                "max_sales": "Макс. продажи, шт.",
+                "days_count": "Дней в расчёте",
             }
         )[
             [
+                "День недели",
                 "Категория",
-                "Продано за период, шт.",
-                "Мин. за день, шт.",
-                "Макс. за день, шт.",
-                "Среднее за период, шт./день",
+                "Мин. продажи, шт.",
+                "Средние продажи, шт.",
+                "Макс. продажи, шт.",
+                "Дней в расчёте",
             ]
         ]
         with st.expander(
@@ -11164,11 +11211,12 @@ if selected_main_section == "Ср/знач":
                 use_container_width=True,
                 hide_index=True,
                 column_config={
+                    "День недели": st.column_config.TextColumn("День недели"),
                     "Категория": st.column_config.TextColumn("Категория"),
-                    "Продано за период, шт.": st.column_config.NumberColumn(format="%.0f"),
-                    "Мин. за день, шт.": st.column_config.NumberColumn(format="%.0f"),
-                    "Макс. за день, шт.": st.column_config.NumberColumn(format="%.0f"),
-                    "Среднее за период, шт./день": st.column_config.NumberColumn(format="%.1f"),
+                    "Мин. продажи, шт.": st.column_config.NumberColumn(format="%.0f"),
+                    "Средние продажи, шт.": st.column_config.NumberColumn(format="%.1f"),
+                    "Макс. продажи, шт.": st.column_config.NumberColumn(format="%.0f"),
+                    "Дней в расчёте": st.column_config.NumberColumn(format="%d"),
                 },
             )
 
