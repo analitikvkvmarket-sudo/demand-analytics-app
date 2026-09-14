@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.20-ENTITY-CONSUMPTION"
+BUILD_ID = "75.12.21-ENTITY-MULTI-TABLE"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -14332,19 +14332,20 @@ if tab_entities.open:
 
 
         st.divider()
-        st.subheader("Расчёт потребления сущности")
+        st.subheader("Расчёт потребления сущностей")
         st.caption(
-            "Выберите период, категорию и сущность. Для каждой точки считаются среднее и максимальное "
-            "количество продаж по дням недели. Если точка в конкретную дату работала, но выбранная сущность "
-            "не продавалась, в среднем учитывается 0. Даты без факта работы точки в расчёт не входят."
+            "Выберите период, категорию и одну или несколько сущностей. Таблица считает их совместное "
+            "потребление: сначала продажи выбранных сущностей суммируются внутри каждой точки и даты, "
+            "затем по каждому дню недели рассчитываются среднее и максимум. Если точка работала, но "
+            "ни одна из выбранных сущностей не продавалась, в среднем учитывается 0."
         )
 
-        entity_consumption_controls = st.columns([1.6, 1.15, 1.35])
+        entity_consumption_controls = st.columns([1.45, 1.15, 1.8])
         with entity_consumption_controls[0]:
             entity_consumption_range = st.date_input(
                 "Период расчёта",
                 value=(period[0], period[1]),
-                key="entity_consumption_period_v751220",
+                key="entity_consumption_period_v751221",
             )
 
         entity_reference_frames = []
@@ -14393,7 +14394,7 @@ if tab_entities.open:
                 entity_consumption_category = st.selectbox(
                     "Категория",
                     entity_consumption_categories,
-                    key="entity_consumption_category_v751220",
+                    key="entity_consumption_category_v751221",
                 )
             else:
                 entity_consumption_category = None
@@ -14401,12 +14402,12 @@ if tab_entities.open:
                     "Категория",
                     ["Справочник недоступен"],
                     disabled=True,
-                    key="entity_consumption_category_empty_v751220",
+                    key="entity_consumption_category_empty_v751221",
                 )
 
-        entity_consumption_entities = []
+        entity_consumption_entity_options = []
         if entity_consumption_category and not entity_reference_for_consumption.empty:
-            entity_consumption_entities = sorted(
+            entity_consumption_entity_options = sorted(
                 value
                 for value in entity_reference_for_consumption.loc[
                     entity_reference_for_consumption["category"].eq(entity_consumption_category), "entity"
@@ -14415,19 +14416,22 @@ if tab_entities.open:
             )
 
         with entity_consumption_controls[2]:
-            if entity_consumption_entities:
-                entity_consumption_entity = st.selectbox(
-                    "Сущность",
-                    entity_consumption_entities,
-                    key="entity_consumption_entity_v751220",
+            if entity_consumption_entity_options:
+                entity_consumption_entities_selected = st.multiselect(
+                    "Сущности",
+                    entity_consumption_entity_options,
+                    default=entity_consumption_entity_options[:1],
+                    key="entity_consumption_entities_v751221",
+                    help="Можно выбрать несколько сущностей. Их продажи суммируются на каждой точке и дате до расчёта среднего и максимума.",
                 )
             else:
-                entity_consumption_entity = None
-                st.selectbox(
-                    "Сущность",
+                entity_consumption_entities_selected = []
+                st.multiselect(
+                    "Сущности",
                     ["Нет доступных сущностей"],
+                    default=[],
                     disabled=True,
-                    key="entity_consumption_entity_empty_v751220",
+                    key="entity_consumption_entities_empty_v751221",
                 )
 
         entity_consumption_period_valid = (
@@ -14436,8 +14440,10 @@ if tab_entities.open:
         )
         if not entity_consumption_period_valid:
             st.info("Укажите начальную и конечную дату периода расчёта.")
-        elif not entity_consumption_category or not entity_consumption_entity:
+        elif not entity_consumption_category:
             st.info("Для расчёта нужен доступный справочник категорий и сущностей.")
+        elif not entity_consumption_entities_selected:
+            st.info("Выберите хотя бы одну сущность.")
         else:
             entity_consumption_start, entity_consumption_end = entity_consumption_range
             if entity_consumption_start > entity_consumption_end:
@@ -14449,7 +14455,7 @@ if tab_entities.open:
                     entity_consumption_end + timedelta(days=1),
                 ).copy()
             except Exception as error:
-                st.error(f"Не удалось получить список точек для расчёта сущности: {error}")
+                st.error(f"Не удалось получить список точек для расчёта сущностей: {error}")
                 entity_consumption_shops = pd.DataFrame()
 
             if entity_consumption_shops.empty:
@@ -14484,7 +14490,7 @@ if tab_entities.open:
                         entity_consumption_shop_numbers,
                     ).copy()
                 except Exception as error:
-                    st.error(f"Не удалось загрузить продажи для расчёта сущности: {error}")
+                    st.error(f"Не удалось загрузить продажи для расчёта сущностей: {error}")
                     entity_consumption_history = pd.DataFrame()
 
                 if entity_consumption_history.empty:
@@ -14521,14 +14527,15 @@ if tab_entities.open:
                         entity_consumption_history["entity"].fillna("Не сопоставлено").astype(str)
                     )
 
-                    # День считается рабочим, если по точке в этот день PostgreSQL вернул хотя бы один SKU.
+                    # Рабочий день точки = PostgreSQL вернул по ней хотя бы один SKU в эту дату.
+                    # Поэтому отсутствие выбранных сущностей в рабочий день превращается в 0 и влияет на среднее.
                     entity_active_days = entity_consumption_history[
                         ["shop_number", "business_date"]
                     ].drop_duplicates()
 
                     selected_entity_history = entity_consumption_history[
                         entity_consumption_history["category"].eq(entity_consumption_category)
-                        & entity_consumption_history["entity"].eq(entity_consumption_entity)
+                        & entity_consumption_history["entity"].isin(entity_consumption_entities_selected)
                     ].copy()
                     entity_daily_sales = (
                         selected_entity_history.groupby(
@@ -14570,8 +14577,8 @@ if tab_entities.open:
                         )
                     )
 
-                    # Общий итог строим не как среднее средних, а сначала суммируем фактическое
-                    # потребление всех работающих точек по каждой дате, затем считаем среднее/максимум.
+                    # Итог сети: сначала суммируем выбранные сущности всех точек на каждой дате,
+                    # потом считаем среднее/максимум по дням недели. Это не среднее от средних точек.
                     entity_network_daily = (
                         entity_daily_grid.groupby("business_date", as_index=False)["entity_sales"].sum()
                     )
@@ -14650,13 +14657,15 @@ if tab_entities.open:
                         ["Точка", "raw shop_number", "Показатель", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
                     ]
 
+                    selected_entities_title = " + ".join(entity_consumption_entities_selected)
                     st.markdown(
-                        f"#### {entity_consumption_category} → {entity_consumption_entity}"
+                        f"#### {entity_consumption_category} → {selected_entities_title}"
                     )
                     st.caption(
                         f"Период: {entity_consumption_start:%d.%m.%Y}–{entity_consumption_end:%d.%m.%Y}. "
-                        "В строках — точки и два показателя; по горизонтали — дни недели. "
-                        "Строки «Все точки» показывают суммарное потребление сети по каждой фактической дате."
+                        f"Выбрано сущностей: {len(entity_consumption_entities_selected)}. "
+                        "В строках — точки и показатели «Среднее»/«Максимум», по горизонтали — дни недели. "
+                        "Все выбранные сущности уже суммированы внутри каждой ячейки расчёта."
                     )
 
                     entity_consumption_display = entity_consumption_table[entity_consumption_columns].copy()
@@ -14679,61 +14688,10 @@ if tab_entities.open:
                         hide_index=True,
                     )
 
-                    st.markdown("#### Чарт")
-                    entity_chart_point_options = ["Все точки"] + [
-                        entity_consumption_point_mapping.get(raw, f"Т{raw}")
-                        for raw in active_raw_points
-                    ]
-                    entity_chart_point = st.selectbox(
-                        "Точка для графика",
-                        entity_chart_point_options,
-                        key="entity_consumption_chart_point_v751220",
-                    )
-                    entity_chart_source = entity_consumption_table[
-                        entity_consumption_table["Точка"].eq(entity_chart_point)
-                    ].copy()
-                    entity_chart_rows = []
-                    for row in entity_chart_source.itertuples(index=False):
-                        for weekday_label in entity_weekday_short.values():
-                            value = getattr(row, weekday_label)
-                            if pd.notna(value):
-                                entity_chart_rows.append(
-                                    {
-                                        "День недели": weekday_label,
-                                        "Показатель": row.Показатель,
-                                        "Продано, шт.": float(value),
-                                    }
-                                )
-                    entity_chart_frame = pd.DataFrame(entity_chart_rows)
-                    if not entity_chart_frame.empty:
-                        entity_consumption_chart = px.bar(
-                            entity_chart_frame,
-                            x="День недели",
-                            y="Продано, шт.",
-                            color="Показатель",
-                            barmode="group",
-                            text_auto=".1f",
-                            category_orders={
-                                "День недели": list(entity_weekday_short.values()),
-                                "Показатель": ["Среднее", "Максимум"],
-                            },
-                            title=(
-                                f"{entity_consumption_entity} · {entity_chart_point} · "
-                                f"{entity_consumption_start:%d.%m.%Y}–{entity_consumption_end:%d.%m.%Y}"
-                            ),
-                        )
-                        entity_consumption_chart.update_layout(
-                            xaxis_title="День недели",
-                            yaxis_title="Продано, шт.",
-                            legend_title_text="",
-                            margin=dict(t=70, l=20, r=20, b=20),
-                        )
-                        st.plotly_chart(entity_consumption_chart, use_container_width=True)
-
                     st.divider()
                     st.markdown("### Отчёт")
                     st.caption(
-                        "Excel повторяет текущий расчёт: выбранные категория, сущность, период, "
+                        "Excel повторяет текущую таблицу: выбранные категория, несколько сущностей, период, "
                         "точки, средние и максимальные продажи по дням недели."
                     )
 
@@ -14745,12 +14703,12 @@ if tab_entities.open:
                         output = io.BytesIO()
                         workbook = Workbook()
                         sheet = workbook.active
-                        sheet.title = "Потребление сущности"
+                        sheet.title = "Потребление сущностей"
                         sheet.sheet_view.showGridLines = False
 
                         sheet.merge_cells("A1:I1")
                         sheet["A1"] = (
-                            f"{entity_consumption_category} → {entity_consumption_entity}"
+                            f"{entity_consumption_category} → {selected_entities_title}"
                         )
                         sheet["A1"].font = Font(bold=True, size=14)
                         sheet["A1"].alignment = Alignment(horizontal="center")
@@ -14806,7 +14764,7 @@ if tab_entities.open:
                         daily_sheet.sheet_view.showGridLines = False
                         daily_headers = [
                             "Дата", "День недели", "Точка", "raw shop_number",
-                            "Категория", "Сущность", "Продано, шт."
+                            "Категория", "Выбранные сущности", "Продано суммарно, шт."
                         ]
                         for column_index, header in enumerate(daily_headers, start=1):
                             cell = daily_sheet.cell(1, column_index, header)
@@ -14817,6 +14775,7 @@ if tab_entities.open:
                         daily_export = entity_daily_grid.sort_values(
                             ["business_date", "shop_number"], kind="stable"
                         )
+                        selected_entities_text = ", ".join(entity_consumption_entities_selected)
                         for row_index, (_, record) in enumerate(daily_export.iterrows(), start=2):
                             daily_sheet.cell(row_index, 1, record["business_date"])
                             daily_sheet.cell(row_index, 1).number_format = "DD.MM.YYYY"
@@ -14824,12 +14783,12 @@ if tab_entities.open:
                             daily_sheet.cell(row_index, 3, record["Точка"])
                             daily_sheet.cell(row_index, 4, int(record["shop_number"]))
                             daily_sheet.cell(row_index, 5, entity_consumption_category)
-                            daily_sheet.cell(row_index, 6, entity_consumption_entity)
+                            daily_sheet.cell(row_index, 6, selected_entities_text)
                             daily_sheet.cell(row_index, 7, float(record["entity_sales"]))
                             daily_sheet.cell(row_index, 7).number_format = "0"
                         daily_sheet.freeze_panes = "A2"
                         daily_sheet.auto_filter.ref = daily_sheet.dimensions
-                        daily_widths = [13, 14, 16, 18, 22, 28, 14]
+                        daily_widths = [13, 14, 16, 18, 22, 48, 20]
                         for column_index, width in enumerate(daily_widths, start=1):
                             daily_sheet.column_dimensions[get_column_letter(column_index)].width = width
 
@@ -14841,30 +14800,32 @@ if tab_entities.open:
                         str(entity_consumption_start),
                         str(entity_consumption_end),
                         str(entity_consumption_category),
-                        str(entity_consumption_entity),
+                        tuple(sorted(entity_consumption_entities_selected)),
                         tuple(active_raw_points),
                     )
                     if st.button(
                         "Сформировать Excel",
                         type="primary",
-                        key="entity_consumption_build_excel_v751220",
+                        key="entity_consumption_build_excel_v751221",
                     ):
                         try:
-                            st.session_state["entity_consumption_excel_v751220"] = _build_entity_consumption_excel()
-                            st.session_state["entity_consumption_excel_signature_v751220"] = entity_report_signature
-                            st.session_state.pop("entity_consumption_excel_error_v751220", None)
+                            st.session_state["entity_consumption_excel_v751221"] = _build_entity_consumption_excel()
+                            st.session_state["entity_consumption_excel_signature_v751221"] = entity_report_signature
+                            st.session_state.pop("entity_consumption_excel_error_v751221", None)
                         except Exception as error:
-                            st.session_state["entity_consumption_excel_error_v751220"] = str(error)
+                            st.session_state["entity_consumption_excel_error_v751221"] = str(error)
 
-                    entity_excel_error = st.session_state.get("entity_consumption_excel_error_v751220")
+                    entity_excel_error = st.session_state.get("entity_consumption_excel_error_v751221")
                     if entity_excel_error:
                         st.error(f"Не удалось сформировать Excel: {entity_excel_error}")
-                    entity_excel_bytes = st.session_state.get("entity_consumption_excel_v751220")
-                    entity_excel_signature = st.session_state.get("entity_consumption_excel_signature_v751220")
+                    entity_excel_bytes = st.session_state.get("entity_consumption_excel_v751221")
+                    entity_excel_signature = st.session_state.get("entity_consumption_excel_signature_v751221")
                     if entity_excel_bytes and entity_excel_signature == entity_report_signature:
                         safe_entity_name = re.sub(
-                            r"[^0-9A-Za-zА-Яа-яЁё_-]+", "_", str(entity_consumption_entity)
-                        ).strip("_") or "entity"
+                            r"[^0-9A-Za-zА-Яа-яЁё_-]+", "_",
+                            "_".join(entity_consumption_entities_selected),
+                        ).strip("_") or "entities"
+                        safe_entity_name = safe_entity_name[:80]
                         st.download_button(
                             "Скачать отчёт Excel",
                             data=entity_excel_bytes,
@@ -14874,7 +14835,7 @@ if tab_entities.open:
                                 f"{entity_consumption_end:%Y-%m-%d}.xlsx"
                             ),
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key="entity_consumption_download_excel_v751220",
+                            key="entity_consumption_download_excel_v751221",
                             use_container_width=True,
                         )
 
