@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.15-SITE-SURVIVES-APPS-SCRIPT"
+BUILD_ID = "75.12.17-CATEGORY-SKU-WEEKDAY-SYNC"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -14239,6 +14239,95 @@ if tab_entities.open:
             hide_index=True,
         )
 
+        # Раскрытие сущности до конкретных SKU. Используем тот же filtered_sku,
+        # поэтому список и количества полностью соответствуют выбранным точкам и категориям.
+        st.markdown("### Состав сущностей по SKU")
+        st.caption(
+            "Раскройте сущность — внутри показаны все SKU, которые к ней относятся, "
+            "их названия и количество проданного за выбранный период."
+        )
+
+        entity_sku_detail = (
+            filtered_sku.groupby(
+                ["category", "entity", "sku", "product_name"],
+                as_index=False,
+                dropna=False,
+            )
+            .agg(
+                sold_quantity=("sales", "sum"),
+                revenue=("revenue", "sum"),
+                points_count=("point", "nunique"),
+            )
+        )
+
+        if entity_sku_detail.empty:
+            st.info("Для выбранных фильтров нет продаж по сущностям.")
+        else:
+            entity_sku_detail["category"] = entity_sku_detail["category"].fillna("Не сопоставлено").astype(str)
+            entity_sku_detail["entity"] = entity_sku_detail["entity"].fillna("Не сопоставлено").astype(str)
+            entity_sku_detail["product_name"] = entity_sku_detail["product_name"].fillna("").astype(str)
+
+            entity_order = entity_overall.copy()
+            entity_order["category"] = entity_order["category"].fillna("Не сопоставлено").astype(str)
+            entity_order["entity"] = entity_order["entity"].fillna("Не сопоставлено").astype(str)
+            entity_order = entity_order.sort_values(
+                ["category", "entity_sales"],
+                ascending=[True, False],
+                kind="stable",
+            )
+
+            for entity_category in entity_order["category"].drop_duplicates().tolist():
+                st.markdown(f"#### {entity_category}")
+                category_entities = entity_order[entity_order["category"].eq(entity_category)]
+
+                for entity_row in category_entities.itertuples(index=False):
+                    entity_name = str(entity_row.entity)
+                    entity_sales_total = float(entity_row.entity_sales)
+                    entity_sku_count = int(entity_row.active_sku)
+                    expander_title = (
+                        f"{entity_name} · {entity_sales_total:,.0f} шт. · {entity_sku_count} SKU"
+                    ).replace(",", " ")
+
+                    with st.expander(expander_title, expanded=False):
+                        current_entity_skus = entity_sku_detail[
+                            entity_sku_detail["category"].eq(entity_category)
+                            & entity_sku_detail["entity"].eq(entity_name)
+                        ].copy()
+                        current_entity_skus = current_entity_skus.sort_values(
+                            ["sold_quantity", "product_name", "sku"],
+                            ascending=[False, True, True],
+                            kind="stable",
+                        )
+                        sku_display = current_entity_skus.rename(
+                            columns={
+                                "sku": "SKU",
+                                "product_name": "Название товара",
+                                "sold_quantity": "Продано, шт.",
+                                "revenue": "Выручка, ₽",
+                                "points_count": "Точек с продажами",
+                            }
+                        )
+                        st.dataframe(
+                            sku_display[
+                                [
+                                    "SKU",
+                                    "Название товара",
+                                    "Продано, шт.",
+                                    "Выручка, ₽",
+                                    "Точек с продажами",
+                                ]
+                            ],
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "SKU": st.column_config.TextColumn("SKU"),
+                                "Название товара": st.column_config.TextColumn("Название товара"),
+                                "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                "Выручка, ₽": st.column_config.NumberColumn(format="%.0f"),
+                                "Точек с продажами": st.column_config.NumberColumn(format="%d"),
+                            },
+                        )
+
 if tab_detail.open:
     with tab_detail:
         detail_loading_plan = _load_detail_plan_for_active_tab()
@@ -16149,20 +16238,48 @@ if tab_category_analysis.open:
         st.subheader("Анализ категории по дням недели")
         st.caption(
             "Выберите категорию, один или несколько дней недели и до четырёх периодов для сравнения. "
-            "Среднее рассчитывается по всем подходящим календарным датам; дни без продаж входят в "
-            "расчёт как нулевые. При выборе нескольких точек показываются отдельные значения и общий итог."
+            "Категория и дни недели работают как единый взаимосвязанный фильтр для всех блоков, "
+            "включая средние продажи SKU. Среднее рассчитывается по всем подходящим календарным датам; "
+            "дни без продаж входят в расчёт как нулевые. При выборе нескольких точек показываются "
+            "отдельные значения и общий итог."
         )
         weekday_names = {
             0: "Понедельник", 1: "Вторник", 2: "Среда", 3: "Четверг",
             4: "Пятница", 5: "Суббота", 6: "Воскресенье",
         }
         category_analysis_controls = st.columns([1.2, 1.8, 1.0])
+        category_analysis_values = sorted(
+            {
+                str(value).strip()
+                for value in filtered_sku.get("category", pd.Series(dtype=str)).dropna().tolist()
+                if str(value).strip()
+            }
+        )
+        if not category_analysis_values and "category" in entities.columns:
+            category_analysis_values = sorted(
+                {
+                    str(value).strip()
+                    for value in entities["category"].dropna().tolist()
+                    if str(value).strip()
+                }
+            )
+        category_analysis_options = ["Все категории"] + category_analysis_values
         with category_analysis_controls[0]:
             selected_analysis_category = st.selectbox(
                 "Категория",
-                sorted(entities["category"].dropna().astype(str).unique()),
-                key="category_analysis_category_v37",
+                category_analysis_options,
+                key="category_analysis_category_v75",
+                help=(
+                    "Категория влияет на все показатели раздела, включая средние продажи SKU. "
+                    "Выберите «Все категории», чтобы сравнивать позиции без ограничения по категории."
+                ),
             )
+        category_analysis_all_categories = selected_analysis_category == "Все категории"
+        category_scope_text = (
+            "всех категорий"
+            if category_analysis_all_categories
+            else f"категории «{selected_analysis_category}»"
+        )
         with category_analysis_controls[1]:
             selected_weekday_names = st.multiselect(
                 "Дни недели",
@@ -16221,7 +16338,7 @@ if tab_category_analysis.open:
             help="Поиск фильтрует показатели, графики и таблицу SKU внутри выбранной категории.",
         ).strip()
 
-        if not selected_weekday_names and not category_sku_search:
+        if not selected_weekday_names:
             st.info("Выберите хотя бы один день недели.")
         elif len(category_periods) != category_period_count:
             st.info("Для каждого периода укажите начальную и конечную дату.")
@@ -16231,14 +16348,14 @@ if tab_category_analysis.open:
             selected_weekdays = {
                 number for number, name in weekday_names.items() if name in selected_weekday_names
             }
+            # Категория, дни недели, периоды и точки — единый набор фильтров.
+            # Поиск SKU больше не отключает фильтр дня недели: все блоки ниже используют
+            # один и тот же набор целевых календарных дат.
             target_rows = []
             for period_name, range_start, range_end in category_periods:
-                if category_sku_search:
-                    target_rows.append({"Период": period_name, "business_date": range_start})
-                else:
-                    for target_date in pd.date_range(range_start, range_end, freq="D").date:
-                        if target_date.weekday() in selected_weekdays:
-                            target_rows.append({"Период": period_name, "business_date": target_date})
+                for target_date in pd.date_range(range_start, range_end, freq="D").date:
+                    if target_date.weekday() in selected_weekdays:
+                        target_rows.append({"Период": period_name, "business_date": target_date})
             category_target_frame = pd.DataFrame(
                 target_rows, columns=["Период", "business_date"]
             )
@@ -16277,9 +16394,12 @@ if tab_category_analysis.open:
                 category_sales_history["category"] = category_sales_history["category"].fillna(
                     "Не сопоставлено"
                 )
-                category_lifecycle_history = category_sales_history[
-                    category_sales_history["category"] == selected_analysis_category
-                ].copy()
+                if category_analysis_all_categories:
+                    category_lifecycle_history = category_sales_history.copy()
+                else:
+                    category_lifecycle_history = category_sales_history[
+                        category_sales_history["category"] == selected_analysis_category
+                    ].copy()
                 category_full_period_frames = []
                 for period_name, range_start, range_end in category_periods:
                     period_frame = category_lifecycle_history[
@@ -16355,10 +16475,15 @@ if tab_category_analysis.open:
                             category_full_period_history["sku"] == selected_lifecycle_sku
                         ].copy()
 
-                category_table_history = category_full_period_history
+                # Таблица средних SKU использует тот же срез дней недели, что и вся вкладка.
+                # Полный период остаётся только как вселенная SKU, чтобы позиции без продаж
+                # в выбранный день недели могли получить честное среднее 0.
+                category_table_history = category_sales_history.copy()
 
                 if False and category_sku_search and not category_lifecycle_history.empty:
-                    lifecycle_days = product_lifecycle_days(selected_analysis_category)
+                    lifecycle_days = product_lifecycle_days(
+                        selected_analysis_category if not category_analysis_all_categories else ""
+                    )
                     lifecycle_products = category_lifecycle_history[
                         ["sku", "product_name"]
                     ].drop_duplicates()
@@ -16650,19 +16775,19 @@ if tab_category_analysis.open:
                         f"Для запроса «{category_sku_search}» продажи в жизненном цикле не найдены."
                     )
 
-                if category_table_history.empty:
+                if category_full_period_history.empty:
                     if category_sku_search:
                         st.warning(
-                            f"В категории «{selected_analysis_category}» по запросу "
+                            f"В срезе {category_scope_text} по запросу "
                             f"«{category_sku_search}» продажи не найдены."
                         )
                     else:
-                        st.info("В выбранной категории за эти дни продаж не найдено.")
+                        st.info(f"В срезе {category_scope_text} за выбранные дни продаж не найдено.")
                 else:
                     if category_sku_search:
                         st.caption(
-                            f"Показаны результаты поиска «{category_sku_search}» внутри категории "
-                            f"«{selected_analysis_category}»."
+                            f"Показаны результаты поиска «{category_sku_search}» в срезе "
+                            f"{category_scope_text}; фильтр дней недели применяется ко всем расчётам."
                         )
                     period_day_counts = (
                         category_target_frame.groupby("Период")["business_date"].nunique().to_dict()
@@ -16725,7 +16850,7 @@ if tab_category_analysis.open:
                             combined_daily,
                             x="Дата",
                             y="Продано, шт.",
-                            title=f"Продажи категории «{selected_analysis_category}» по выбранным датам",
+                            title=f"Продажи {category_scope_text} по выбранным датам",
                             text_auto=".0f",
                             color="Период",
                             barmode="group",
@@ -16761,7 +16886,7 @@ if tab_category_analysis.open:
                         )
                         category_point_weekday_title = ", ".join(selected_weekday_names)
                         category_point_chart_title = (
-                            f"Средние продажи категории по точкам · {category_point_weekday_title}"
+                            f"Средние продажи {category_scope_text} по точкам · {category_point_weekday_title}"
                             f"<br><sup>{category_point_period_title}</sup>"
                         )
                         point_average_chart = px.bar(
@@ -16777,83 +16902,157 @@ if tab_category_analysis.open:
                             point_average_chart, use_container_width=True
                         )
 
+                    # ---------------------------------------------------------
+                    # Средние продажи SKU: тот же срез, что выбран сверху.
+                    # Категория + дни недели + период + точки взаимно влияют
+                    # на итог. Среднее считается по ВСЕМ выбранным таким дням,
+                    # включая даты с нулевой продажей SKU.
+                    # ---------------------------------------------------------
+                    sku_group_cols = [
+                        "Период", "point", "category", "sku", "product_name"
+                    ]
                     sku_daily_by_point = (
                         category_table_history.groupby(
-                            ["Период", "point", "sku", "product_name", "business_date"],
+                            sku_group_cols + ["business_date"],
                             as_index=False,
                             dropna=False,
                         )["sold_quantity"].sum()
                     )
                     sku_daily_by_point = sku_daily_by_point[
                         sku_daily_by_point["sold_quantity"] > 0
-                    ]
-                    sku_by_point = (
+                    ].copy()
+
+                    # Вселенная SKU берётся из полного выбранного периода, но среднее
+                    # строится только по выбранным дням недели. Поэтому SKU, который
+                    # продавался в периоде, но ни разу не продался, например, в Пн,
+                    # остаётся в таблице со средним 0 вместо полного исчезновения.
+                    sku_universe_by_point = (
+                        category_full_period_history[
+                            ["Период", "point", "category", "sku", "product_name"]
+                        ]
+                        .drop_duplicates()
+                    )
+                    sku_totals_by_point = (
                         sku_daily_by_point.groupby(
-                            ["Период", "point", "sku", "product_name"],
-                            as_index=False,
-                            dropna=False,
+                            sku_group_cols, as_index=False, dropna=False
                         )
                         .agg(
                             total_sales=("sold_quantity", "sum"),
                             active_days=("business_date", "nunique"),
                         )
                     )
-                    sku_by_point["average_sales"] = (
-                        sku_by_point["total_sales"] / sku_by_point["active_days"]
+                    sku_by_point = sku_universe_by_point.merge(
+                        sku_totals_by_point,
+                        on=sku_group_cols,
+                        how="left",
                     )
+                    sku_by_point[["total_sales", "active_days"]] = sku_by_point[
+                        ["total_sales", "active_days"]
+                    ].fillna(0.0)
+                    sku_by_point["days_in_calc"] = (
+                        sku_by_point["Период"].map(period_day_counts).fillna(0).astype(int)
+                    )
+                    sku_by_point["average_sales"] = (
+                        sku_by_point["total_sales"]
+                        / sku_by_point["days_in_calc"].replace(0, pd.NA)
+                    ).fillna(0.0)
                     sku_by_point = sku_by_point.rename(
                         columns={
-                            "point": "Точка", "sku": "SKU", "product_name": "Название товара",
-                            "total_sales": "Продано всего, шт.", "active_days": "Дней с продажами",
-                            "average_sales": "Среднее за день продажи, шт.",
+                            "point": "Точка",
+                            "category": "Категория",
+                            "sku": "SKU",
+                            "product_name": "Название товара",
+                            "total_sales": "Продано всего, шт.",
+                            "active_days": "Дней с продажами",
+                            "days_in_calc": "Дней в расчёте",
+                            "average_sales": "Среднее за выбранный день, шт.",
                         }
                     )
+
                     sku_tables = [sku_by_point]
                     if len(selected_category_points) > 1:
+                        combined_group_cols = [
+                            "Период", "category", "sku", "product_name"
+                        ]
                         sku_daily_combined = (
                             category_table_history.groupby(
-                                ["Период", "sku", "product_name", "business_date"],
+                                combined_group_cols + ["business_date"],
                                 as_index=False,
                                 dropna=False,
                             )["sold_quantity"].sum()
                         )
                         sku_daily_combined = sku_daily_combined[
                             sku_daily_combined["sold_quantity"] > 0
-                        ]
-                        sku_combined = (
+                        ].copy()
+                        sku_universe_combined = (
+                            category_full_period_history[
+                                ["Период", "category", "sku", "product_name"]
+                            ]
+                            .drop_duplicates()
+                        )
+                        sku_totals_combined = (
                             sku_daily_combined.groupby(
-                                ["Период", "sku", "product_name"],
-                                as_index=False,
-                                dropna=False,
+                                combined_group_cols, as_index=False, dropna=False
                             )
                             .agg(
                                 total_sales=("sold_quantity", "sum"),
                                 active_days=("business_date", "nunique"),
                             )
                         )
-                        sku_combined["average_sales"] = (
-                            sku_combined["total_sales"] / sku_combined["active_days"]
+                        sku_combined = sku_universe_combined.merge(
+                            sku_totals_combined,
+                            on=combined_group_cols,
+                            how="left",
                         )
+                        sku_combined[["total_sales", "active_days"]] = sku_combined[
+                            ["total_sales", "active_days"]
+                        ].fillna(0.0)
+                        sku_combined["days_in_calc"] = (
+                            sku_combined["Период"].map(period_day_counts).fillna(0).astype(int)
+                        )
+                        sku_combined["average_sales"] = (
+                            sku_combined["total_sales"]
+                            / sku_combined["days_in_calc"].replace(0, pd.NA)
+                        ).fillna(0.0)
                         sku_combined.insert(0, "Точка", "Все выбранные")
                         sku_combined = sku_combined.rename(
                             columns={
-                                "sku": "SKU", "product_name": "Название товара",
-                                "total_sales": "Продано всего, шт.", "active_days": "Дней с продажами",
-                                "average_sales": "Среднее за день продажи, шт.",
+                                "category": "Категория",
+                                "sku": "SKU",
+                                "product_name": "Название товара",
+                                "total_sales": "Продано всего, шт.",
+                                "active_days": "Дней с продажами",
+                                "days_in_calc": "Дней в расчёте",
+                                "average_sales": "Среднее за выбранный день, шт.",
                             }
                         )
                         sku_tables.insert(0, sku_combined)
-                    category_sku_table = pd.concat(sku_tables, ignore_index=True).sort_values(
-                        ["Период", "Точка", "Среднее за день продажи, шт."],
-                        ascending=[True, True, False]
-                    ).reset_index(drop=True)
+                    else:
+                        # Переменная используется ниже только для общего итога нескольких точек.
+                        sku_daily_combined = pd.DataFrame(
+                            columns=[
+                                "Период", "category", "sku", "product_name",
+                                "business_date", "sold_quantity"
+                            ]
+                        )
+
+                    category_sku_table = (
+                        pd.concat(sku_tables, ignore_index=True)
+                        .sort_values(
+                            ["Период", "Точка", "Категория", "Среднее за выбранный день, шт."],
+                            ascending=[True, True, True, False],
+                            kind="stable",
+                        )
+                        .reset_index(drop=True)
+                    )
                     selected_category_table_sku = None
                     if not category_sku_search:
-                        st.markdown("#### Средние продажи позиций SKU внутри категории")
+                        st.markdown("#### Средние продажи позиций SKU внутри выбранного среза")
                         st.caption(
-                            "Таблица SKU всегда рассчитывается по всем календарным датам выбранного "
-                            "периода. Выберите строку по SKU или названию, чтобы сразу открыть факт "
-                            "продаж этого SKU по дням."
+                            "Таблица полностью подчиняется селекторам сверху: категория, дни недели, "
+                            "период и точки. Среднее SKU = продажи на выбранных днях / количество всех "
+                            "таких календарных дней; день без продаж SKU учитывается как 0. Выберите строку, "
+                            "чтобы открыть фактические продажи этого SKU по выбранным дням."
                         )
                         category_sku_selection = st.dataframe(
                             category_sku_table,
@@ -16861,11 +17060,12 @@ if tab_category_analysis.open:
                             hide_index=True,
                             on_select="rerun",
                             selection_mode="single-row",
-                            key="category_analysis_sku_table_v74",
+                            key="category_analysis_sku_table_v75",
                             column_config={
                                 "Продано всего, шт.": st.column_config.NumberColumn(format="%.0f"),
-                                "Среднее за день продажи, шт.": st.column_config.NumberColumn(format="%.2f"),
+                                "Среднее за выбранный день, шт.": st.column_config.NumberColumn(format="%.2f"),
                                 "Дней с продажами": st.column_config.NumberColumn(format="%d"),
+                                "Дней в расчёте": st.column_config.NumberColumn(format="%d"),
                             },
                         )
                         category_selected_rows = list(category_sku_selection.selection.rows)
@@ -16940,6 +17140,15 @@ if tab_category_analysis.open:
                         )
                         calendar_rows = []
                         for period_name, range_start, range_end in category_periods:
+                            period_target_dates = (
+                                category_target_frame.loc[
+                                    category_target_frame["Период"].eq(period_name),
+                                    "business_date",
+                                ]
+                                .drop_duplicates()
+                                .sort_values()
+                                .tolist()
+                            )
                             for point_name in selected_category_points:
                                 point_sales_lookup = (
                                     sku_daily_by_point[
@@ -16949,9 +17158,7 @@ if tab_category_analysis.open:
                                     .set_index("business_date")["sold_quantity"]
                                     .to_dict()
                                 )
-                                for calendar_date in pd.date_range(
-                                    range_start, range_end, freq="D"
-                                ).date:
+                                for calendar_date in period_target_dates:
                                     calendar_rows.append(
                                         {
                                             "Период": period_name,
@@ -16970,9 +17177,7 @@ if tab_category_analysis.open:
                                     .set_index("business_date")["sold_quantity"]
                                     .to_dict()
                                 )
-                                for calendar_date in pd.date_range(
-                                    range_start, range_end, freq="D"
-                                ).date:
+                                for calendar_date in period_target_dates:
                                     calendar_rows.append(
                                         {
                                             "Период": period_name,
@@ -16995,14 +17200,16 @@ if tab_category_analysis.open:
                             aggfunc="sum",
                         ).sort_index(axis=1)
 
-                        # Среднее за выбранный период показываем отдельным узким блоком
-                        # справа от последней календарной даты — визуально отдельно от дат.
-                        # Бизнес-логика: СР = всё проданное количество / число ФАКТИЧЕСКИХ
-                        # дней продаж SKU. Календарные дни с нулём в знаменатель не входят.
+                        # Среднее справа использует тот же фильтр дней недели, что и таблица SKU.
+                        # Нулевые продажи остаются полноценным наблюдением.
                         calendar_sales_sum = calendar_heat.fillna(0.0).sum(axis=1)
-                        calendar_active_sale_days = calendar_heat.fillna(0.0).gt(0).sum(axis=1)
+                        calendar_days_in_calc = (
+                            sku_calendar.groupby("Строка")["Дата"].nunique()
+                            .reindex(calendar_heat.index)
+                            .astype(float)
+                        )
                         calendar_average = calendar_sales_sum.div(
-                            calendar_active_sale_days.where(calendar_active_sale_days > 0)
+                            calendar_days_in_calc.where(calendar_days_in_calc > 0)
                         ).fillna(0.0)
                         calendar_dates = list(calendar_heat.columns)
                         calendar_x_values = [
@@ -17077,7 +17284,7 @@ if tab_category_analysis.open:
                                 text=average_text.to_numpy().reshape(-1, 1),
                                 texttemplate="%{text}",
                                 hovertemplate=(
-                                    "%{y}<br>СР за фактический день продаж: %{z:.2f} шт."
+                                    "%{y}<br>СР за выбранный день недели: %{z:.2f} шт."
                                     "<extra></extra>"
                                 ),
                                 colorscale=[
@@ -17132,11 +17339,10 @@ if tab_category_analysis.open:
                         )
                         st.plotly_chart(sku_calendar_chart, use_container_width=True)
                         st.caption(
-                            "Зелёный — SKU продавался, число внутри — продано за день. "
-                            "Серый — в эту дату продаж SKU не было. Справа от последней даты "
-                            "отдельным блоком показано «СР за период» по каждой точке. Расчёт: "
-                            "всё проданное количество SKU / количество фактических дней продаж; "
-                            "дни с нулевыми продажами в знаменатель не входят."
+                            "Зелёный — SKU продавался, число внутри — продано за выбранный день. "
+                            "Серый — в эту выбранную дату продаж SKU не было. Справа показано среднее "
+                            "по тем же дням недели, что выбраны в селекторе. Расчёт: всё проданное SKU "
+                            "/ количество всех выбранных таких календарных дней; нулевые дни входят в среднее."
                         )
 
 
