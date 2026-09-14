@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.07-DATALENS-RESTORED"
+BUILD_ID = "75.12.08-SR-ZNACH-CATEGORY-EDITOR"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -6086,7 +6086,7 @@ def prepare_sales_detail_only(
 ) -> pd.DataFrame:
     """Build only detailed rows; skip the three extra profile groupbys.
 
-    Used by lazy Dashboard/Detail loads so opening a time-sensitive section does not
+    Used by lazy Detail loads so opening a time-sensitive section does not
     rebuild the complete application analysis a second time.
     """
     if sales is None or sales.empty:
@@ -9273,7 +9273,7 @@ previous_month_start = previous_month_end.replace(day=1)
 
 with st.sidebar:
     st.header("Параметры")
-    st.caption("Аналитика спроса · версия 75.12.06 · LAZY LOAD")
+    st.caption(f"Аналитика спроса · {BUILD_ID} · LAZY LOAD")
     st.caption("Автозагрузка · дневной срез + ленивая детализация")
     st.caption("Источники: PostgreSQL + Apps Script · без обязательных локальных XLSX")
     st.caption(f"SKU / категории / сущности · {entity_reference_source}")
@@ -10715,7 +10715,7 @@ sku_point, category_profile, entity_profile, daily_detail = st.session_state["an
 period = st.session_state["period"]
 
 MENU_ITEMS = [
-    ("Дашборд", ":material/dashboard:"),
+    ("Ср/знач", ":material/calculate:"),
     ("Аналитика DataLens", ":material/analytics:"),
     ("Отчет", ":material/description:"),
     ("Сравнение", ":material/compare_arrows:"),
@@ -10944,6 +10944,336 @@ if selected_main_section == "Аналитика DataLens":
         st.caption(f"Техническая ошибка: {error}")
     st.stop()
 
+# -----------------------------------------------------------------------------
+# Ср/знач — отдельный лёгкий отчёт. Он не наследует глобальные фильтры/метрики,
+# чтобы пользователь сначала выбрал именно период расчёта этого отчёта.
+# -----------------------------------------------------------------------------
+if selected_main_section == "Ср/знач":
+    st.subheader("Ср/знач")
+    st.caption(
+        "Отчёт по точкам и категориям. Мин/макс — дневное количество продаж категории "
+        "за выбранный период. Среднее считается по ВСЕМ календарным дням выбранного "
+        "периода: сумма категории за период / количество дней периода. "
+        "Среднее не рассчитывается из минимума и максимума."
+    )
+
+    with st.form("sr_mean_period_form_v751208", clear_on_submit=False):
+        sr_period_input = st.date_input(
+            "Период формирования отчёта",
+            value=(period[0], period[1]),
+            max_value=today,
+            format="DD.MM.YYYY",
+            key="sr_mean_period_input_v751208",
+            help="Выберите начало и конец периода, по которому будут рассчитаны минимум, максимум и среднее.",
+        )
+        sr_submit = st.form_submit_button(
+            "Сформировать",
+            type="primary",
+            use_container_width=False,
+        )
+
+    if not (isinstance(sr_period_input, tuple) and len(sr_period_input) == 2):
+        st.info("Выберите дату начала и дату окончания периода.")
+        st.stop()
+
+    sr_start, sr_end = sr_period_input
+    if sr_start > sr_end:
+        st.error("Дата начала периода не может быть позже даты окончания.")
+        st.stop()
+
+    sr_day_count = (sr_end - sr_start).days + 1
+    sr_point_mapping = {
+        int(shop_number): str(point_label).strip()
+        for shop_number, point_label in st.session_state.get("point_mapping", {}).items()
+        if str(point_label).strip() and re.fullmatch(r"Т\d+", str(point_label).strip())
+    }
+    sr_shop_numbers = tuple(sorted(sr_point_mapping))
+    if not sr_shop_numbers:
+        st.warning("Не найдены точки для расчёта отчёта.")
+        st.stop()
+
+    with st.spinner("Формирую Ср/знач по выбранному периоду…"):
+        sr_sales = load_sales(
+            sr_start,
+            sr_end + timedelta(days=1),
+            sr_shop_numbers,
+        )
+
+    if sr_sales.empty:
+        st.info("За выбранный период продажи не найдены.")
+        st.stop()
+
+    sr_work = sr_sales.copy()
+    sr_work["shop_number"] = pd.to_numeric(sr_work["shop_number"], errors="coerce")
+    sr_work = sr_work[sr_work["shop_number"].notna()].copy()
+    sr_work["shop_number"] = sr_work["shop_number"].astype(int)
+    sr_work["point"] = sr_work["shop_number"].map(sr_point_mapping)
+    sr_work = sr_work[sr_work["point"].notna()].copy()
+    sr_work["business_date"] = pd.to_datetime(
+        sr_work["business_date"], errors="coerce"
+    ).dt.date
+    sr_work["sold_quantity"] = pd.to_numeric(
+        sr_work["sold_quantity"], errors="coerce"
+    ).fillna(0.0)
+
+    sr_entity_columns = [
+        column
+        for column in ["sku", "entity_product_name", "category"]
+        if column in entities.columns
+    ]
+    sr_entities = entities[sr_entity_columns].copy()
+    if "sku" in sr_entities.columns:
+        sr_entities = sr_entities.drop_duplicates("sku", keep="last")
+    sr_work = sr_work.merge(sr_entities, on="sku", how="left", validate="many_to_one")
+
+    sr_sql_names = sr_work.get("product_name", pd.Series("", index=sr_work.index)).fillna("").astype(str).str.strip()
+    sr_reference_names = sr_work.get(
+        "entity_product_name", pd.Series("", index=sr_work.index)
+    ).fillna("").astype(str).str.strip()
+    sr_work["report_product_name"] = sr_reference_names.where(
+        sr_reference_names.ne(""), sr_sql_names
+    )
+
+    sr_unknown_values = {
+        "", "nan", "none", "не сопоставлено", "не задана", "нераспознано", "нераспознанно"
+    }
+    sr_base_category = sr_work.get(
+        "category", pd.Series("", index=sr_work.index)
+    ).fillna("").astype(str).str.strip()
+    sr_base_category = sr_base_category.map(
+        lambda value: "Нераспознано"
+        if str(value).strip().casefold() in sr_unknown_values
+        else str(value).strip()
+    )
+
+    sr_overrides_raw = st.session_state.get("sr_category_overrides_v751208", {})
+    sr_overrides: dict[str, str] = {}
+    if isinstance(sr_overrides_raw, dict):
+        for sku_value, category_value in sr_overrides_raw.items():
+            sku_key = normalize_sku(sku_value)
+            category_text = str(category_value or "").strip()
+            if sku_key and category_text:
+                sr_overrides[sku_key] = category_text
+
+    sr_work["report_category"] = sr_work["sku"].map(sr_overrides)
+    sr_work["report_category"] = sr_work["report_category"].where(
+        sr_work["report_category"].notna(), sr_base_category
+    )
+    sr_work["report_category"] = sr_work["report_category"].fillna("Нераспознано").astype(str).str.strip()
+    sr_work.loc[
+        sr_work["report_category"].str.casefold().isin(sr_unknown_values),
+        "report_category",
+    ] = "Нераспознано"
+
+    sr_daily = (
+        sr_work.groupby(
+            ["point", "business_date", "report_category"],
+            as_index=False,
+            dropna=False,
+        )["sold_quantity"]
+        .sum()
+        .rename(columns={"sold_quantity": "daily_sales"})
+    )
+
+    # Для среднего и минимума обязательно добавляем дни с нулевой продажей.
+    # Поэтому среднее действительно относится ко всему выбранному периоду.
+    sr_pairs = sr_daily[["point", "report_category"]].drop_duplicates()
+    sr_calendar = pd.DataFrame(
+        {"business_date": pd.date_range(sr_start, sr_end, freq="D").date}
+    )
+    if not sr_pairs.empty and not sr_calendar.empty:
+        sr_grid = sr_pairs.merge(sr_calendar, how="cross")
+        sr_grid = sr_grid.merge(
+            sr_daily,
+            on=["point", "business_date", "report_category"],
+            how="left",
+        )
+        sr_grid["daily_sales"] = pd.to_numeric(
+            sr_grid["daily_sales"], errors="coerce"
+        ).fillna(0.0)
+        sr_summary = (
+            sr_grid.groupby(["point", "report_category"], as_index=False)
+            .agg(
+                period_sales=("daily_sales", "sum"),
+                min_sales=("daily_sales", "min"),
+                max_sales=("daily_sales", "max"),
+                avg_sales=("daily_sales", "mean"),
+            )
+        )
+    else:
+        sr_summary = pd.DataFrame(
+            columns=[
+                "point", "report_category", "period_sales", "min_sales", "max_sales", "avg_sales"
+            ]
+        )
+
+    sr_points = sorted(
+        sr_summary["point"].dropna().astype(str).unique().tolist(),
+        key=lambda value: int(re.search(r"(\d+)", value).group(1))
+        if re.search(r"(\d+)", value)
+        else 999999,
+    )
+
+    report_meta_cols = st.columns(4)
+    report_meta_cols[0].metric("Период", f"{sr_start:%d.%m.%Y}–{sr_end:%d.%m.%Y}")
+    report_meta_cols[1].metric("Дней в среднем", sr_day_count)
+    report_meta_cols[2].metric("Точек", len(sr_points))
+    report_meta_cols[3].metric(
+        "Нераспознано, шт.",
+        f"{sr_work.loc[sr_work['report_category'].eq('Нераспознано'), 'sold_quantity'].sum():,.0f}".replace(",", " "),
+    )
+
+    st.markdown("### Точки")
+    st.caption(
+        "Раскройте точку. Внутри — продажи по каждой категории: всего за период, "
+        "минимум за день, максимум за день и среднее за календарный день периода."
+    )
+
+    for sr_point in sr_points:
+        sr_point_table = sr_summary[sr_summary["point"].eq(sr_point)].copy()
+        sr_point_total = float(sr_point_table["period_sales"].sum())
+        sr_point_table["_unknown_sort"] = sr_point_table["report_category"].eq("Нераспознано")
+        sr_point_table = sr_point_table.sort_values(
+            ["_unknown_sort", "period_sales", "report_category"],
+            ascending=[True, False, True],
+            kind="stable",
+        )
+        sr_point_display = sr_point_table.rename(
+            columns={
+                "report_category": "Категория",
+                "period_sales": "Продано за период, шт.",
+                "min_sales": "Мин. за день, шт.",
+                "max_sales": "Макс. за день, шт.",
+                "avg_sales": "Среднее за период, шт./день",
+            }
+        )[
+            [
+                "Категория",
+                "Продано за период, шт.",
+                "Мин. за день, шт.",
+                "Макс. за день, шт.",
+                "Среднее за период, шт./день",
+            ]
+        ]
+        with st.expander(
+            f"{sr_point} · {sr_point_total:,.0f} шт. за период".replace(",", " "),
+            expanded=False,
+        ):
+            st.dataframe(
+                sr_point_display,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Категория": st.column_config.TextColumn("Категория"),
+                    "Продано за период, шт.": st.column_config.NumberColumn(format="%.0f"),
+                    "Мин. за день, шт.": st.column_config.NumberColumn(format="%.0f"),
+                    "Макс. за день, шт.": st.column_config.NumberColumn(format="%.0f"),
+                    "Среднее за период, шт./день": st.column_config.NumberColumn(format="%.1f"),
+                },
+            )
+
+    st.markdown("---")
+    st.markdown("### Редактор категории «Нераспознано»")
+    st.caption(
+        "Здесь находятся SKU, для которых справочник не дал категорию. "
+        "Назначьте категорию и нажмите «Применить категории» — после обновления SKU "
+        "сразу уйдёт из «Нераспознано» и войдёт в выбранную категорию в отчёте."
+    )
+
+    sr_unrecognized = sr_work[sr_work["report_category"].eq("Нераспознано")].copy()
+    sr_unrecognized = sr_unrecognized[sr_unrecognized["sku"].notna()].copy()
+    if sr_unrecognized.empty:
+        st.success("Все SKU выбранного периода распределены по категориям.")
+    else:
+        sr_editor_source = (
+            sr_unrecognized.groupby(["sku", "report_product_name"], as_index=False, dropna=False)
+            .agg(
+                **{
+                    "Продано за период, шт.": ("sold_quantity", "sum"),
+                    "Точек": ("point", "nunique"),
+                }
+            )
+            .rename(columns={"sku": "SKU", "report_product_name": "Блюдо"})
+            .sort_values("Продано за период, шт.", ascending=False, kind="stable")
+        )
+        sr_editor_source.insert(2, "Категория", "Нераспознано")
+
+        sr_known_categories = sorted(
+            {
+                str(value).strip()
+                for value in entities.get("category", pd.Series(dtype=str)).dropna().tolist()
+                if str(value).strip()
+                and str(value).strip().casefold() not in sr_unknown_values
+            },
+            key=lambda value: value.casefold(),
+        )
+        sr_category_options = ["Нераспознано"] + sr_known_categories
+        sr_editor_signature = hashlib.md5(
+            (
+                "|".join(sr_editor_source["SKU"].astype(str).tolist())
+                + "||"
+                + "|".join(f"{key}:{value}" for key, value in sorted(sr_overrides.items()))
+            ).encode("utf-8")
+        ).hexdigest()[:10]
+
+        sr_edited = st.data_editor(
+            sr_editor_source,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["SKU", "Блюдо", "Продано за период, шт.", "Точек"],
+            column_config={
+                "SKU": st.column_config.TextColumn("SKU"),
+                "Блюдо": st.column_config.TextColumn("Блюдо"),
+                "Категория": st.column_config.SelectboxColumn(
+                    "Категория",
+                    options=sr_category_options,
+                    required=True,
+                ),
+                "Продано за период, шт.": st.column_config.NumberColumn(format="%.0f"),
+                "Точек": st.column_config.NumberColumn(format="%d"),
+            },
+            key=f"sr_category_editor_v751208_{sr_editor_signature}",
+        )
+
+        editor_actions = st.columns([1.0, 1.0, 3.2])
+        with editor_actions[0]:
+            if st.button(
+                "Применить категории",
+                type="primary",
+                use_container_width=True,
+                key="sr_apply_category_overrides_v751208",
+            ):
+                updated_overrides = dict(sr_overrides)
+                applied = 0
+                for _, editor_row in sr_edited.iterrows():
+                    sku_key = normalize_sku(editor_row.get("SKU"))
+                    chosen_category = str(editor_row.get("Категория", "") or "").strip()
+                    if not sku_key:
+                        continue
+                    if chosen_category and chosen_category != "Нераспознано":
+                        updated_overrides[sku_key] = chosen_category
+                        applied += 1
+                    elif sku_key in updated_overrides:
+                        updated_overrides.pop(sku_key, None)
+                st.session_state["sr_category_overrides_v751208"] = updated_overrides
+                st.toast(f"Категории применены: {applied}", icon="✅")
+                st.rerun()
+        with editor_actions[1]:
+            if st.button(
+                "Сбросить ручные",
+                use_container_width=True,
+                key="sr_reset_category_overrides_v751208",
+            ):
+                st.session_state["sr_category_overrides_v751208"] = {}
+                st.rerun()
+
+        st.caption(
+            "Ручные назначения сейчас хранятся в сессии Streamlit и применяются к этому отчёту сразу. "
+            "Для постоянной записи в лист «Справочник» нужен отдельный write-метод Apps Script."
+        )
+
+    st.stop()
+
 categories = sorted(category_profile["category"].unique())
 filter_columns = st.columns(2)
 with filter_columns[0]:
@@ -10979,9 +11309,7 @@ filtered_sku = sku_point[sku_point["category"].isin(category_filter) & sku_point
 # лишь в разделах, где оно реально используется. Дашборду достаточно часовой агрегации;
 # Детализации и Детализации категории нужны точные timestamps.
 lazy_detail_mode = None
-if selected_main_section == "Дашборд":
-    lazy_detail_mode = "hourly"
-elif selected_main_section in {"Детализация", "Детализация категории"}:
+if selected_main_section in {"Детализация", "Детализация категории"}:
     lazy_detail_mode = "timed"
 
 if lazy_detail_mode:
@@ -11177,7 +11505,7 @@ class _MainSection:
         return False
 
 
-tab_dashboard, tab_datalens, tab_report, tab_comparison, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_cycle_plan, tab_plan_check = [
+tab_mean, tab_datalens, tab_report, tab_comparison, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_category_writeoffs, tab_menu_archive, tab_forecast, tab_cycle_plan, tab_plan_check = [
     _MainSection(label) for label, _ in MENU_ITEMS
 ]
 
@@ -12524,560 +12852,7 @@ if tab_report.open:
                 )
 
 
-if tab_dashboard.open:
-    with tab_dashboard:
-        col1, col2 = st.columns(2)
-
-        # Доход по точкам считаем по НЕФИЛЬТРОВАННОМУ сырому факту PostgreSQL.
-        # В SQL здесь нет point_mapping и нет списка разрешённых точек. Это важно:
-        # новая/неверно сопоставленная точка (включая Т30) сначала обязана появиться
-        # как реальный shop_number, и только потом мы пытаемся дать ей метку Т.
-        dashboard_raw_sales = st.session_state.get("raw_all_shops_daily_v751205")
-        raw_signature_expected = (
-            period[0].isoformat(),
-            period[1].isoformat(),
-            "all_shops_unfiltered",
-        )
-        raw_signature_saved = st.session_state.get("raw_all_shops_signature_v751205")
-        raw_signature_matches = raw_signature_saved == raw_signature_expected
-        if (
-            not isinstance(dashboard_raw_sales, pd.DataFrame)
-            or dashboard_raw_sales.empty
-            or not raw_signature_matches
-        ):
-            dashboard_raw_sales = load_all_shop_daily_totals(
-                period[0], period[1] + timedelta(days=1)
-            )
-            st.session_state["raw_all_shops_daily_v751205"] = dashboard_raw_sales.copy()
-            st.session_state["raw_all_shops_signature_v751205"] = raw_signature_expected
-
-        raw_point_revenue = pd.DataFrame(columns=["shop_number", "point", "revenue"])
-        if isinstance(dashboard_raw_sales, pd.DataFrame) and not dashboard_raw_sales.empty:
-            raw_point_revenue = dashboard_raw_sales.copy()
-            raw_point_revenue["shop_number"] = pd.to_numeric(
-                raw_point_revenue["shop_number"], errors="coerce"
-            )
-            raw_point_revenue["revenue"] = pd.to_numeric(
-                raw_point_revenue["revenue"], errors="coerce"
-            ).fillna(0.0)
-            raw_point_revenue = (
-                raw_point_revenue.dropna(subset=["shop_number"])
-                .assign(shop_number=lambda frame: frame["shop_number"].astype(int))
-                .groupby("shop_number", as_index=False)
-                .agg(revenue=("revenue", "sum"))
-            )
-            dashboard_mapping = {
-                int(shop): str(label).strip()
-                for shop, label in st.session_state.get("point_mapping", {}).items()
-            }
-            raw_point_revenue["mapped_point"] = raw_point_revenue["shop_number"].map(dashboard_mapping)
-            # Если текущая карта ещё не знает точку, НЕ теряем её: показываем
-            # техническую метку Т<shop_number>. Так shop_number=30 сразу виден как Т30.
-            raw_point_revenue["point"] = raw_point_revenue["mapped_point"].fillna(
-                raw_point_revenue["shop_number"].map(lambda value: f"Т{int(value)}")
-            )
-
-            # Уважаем пользовательский фильтр для уже известных точек, но новые/
-            # отсутствующие в старой карте точки оставляем видимыми для диагностики.
-            selected_dashboard_points = set(point_filter)
-            known_point_options = set(point_options)
-            raw_point_revenue = raw_point_revenue[
-                raw_point_revenue["point"].isin(selected_dashboard_points)
-                | ~raw_point_revenue["point"].isin(known_point_options)
-            ].copy()
-            raw_point_revenue["point_number"] = pd.to_numeric(
-                raw_point_revenue["point"].astype(str).str.extract(r"(\d+)", expand=False),
-                errors="coerce",
-            )
-            raw_point_revenue = raw_point_revenue.sort_values(
-                ["point_number", "shop_number"], kind="stable"
-            )
-
-        point_revenue_table = raw_point_revenue[["point", "revenue"]].rename(
-            columns={"point": "Точка", "revenue": "Доход, ₽"}
-        )
-        col1.markdown("#### Доход по точкам")
-        col1.dataframe(
-            point_revenue_table,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Точка": st.column_config.TextColumn("Точка"),
-                "Доход, ₽": st.column_config.NumberColumn("Доход, ₽", format="%.0f"),
-            },
-            height=min(38 + 35 * max(len(point_revenue_table), 1), 720),
-        )
-
-        category_sales = filtered_sku.groupby("category", as_index=False)["sales"].sum().sort_values("sales", ascending=False)
-        col2.plotly_chart(px.bar(category_sales, x="category", y="sales", title="Продажи по категориям"), use_container_width=True)
-
-        # Временная диагностика соответствия shop_number -> Точка.
-        # Нужна, чтобы точно понять, под каким номером PostgreSQL отдаёт Т30.
-        with st.expander("Диагностика точек · сырой факт PostgreSQL", expanded=False):
-            st.caption(
-                "Таблица строится до сущностей, категорий и других преобразований. "
-                "Если деньги есть здесь, но их нет дальше — потеря происходит внутри приложения. "
-                "Если здесь нет Т30/дохода, проверяем реальный shop_number или поле дохода источника."
-            )
-            if not isinstance(dashboard_raw_sales, pd.DataFrame) or dashboard_raw_sales.empty:
-                st.info("Сырой дневной факт за выбранный период пуст.")
-            else:
-                diag_source = dashboard_raw_sales.copy()
-                diag_source["business_date"] = pd.to_datetime(
-                    diag_source["business_date"], errors="coerce"
-                ).dt.date
-                diag_source["shop_number"] = pd.to_numeric(
-                    diag_source["shop_number"], errors="coerce"
-                )
-                diag_source["revenue"] = pd.to_numeric(
-                    diag_source["revenue"], errors="coerce"
-                ).fillna(0.0)
-                diag_source["sold_quantity"] = pd.to_numeric(
-                    diag_source["sold_quantity"], errors="coerce"
-                ).fillna(0.0)
-                diag_dates = sorted(
-                    value for value in diag_source["business_date"].dropna().unique().tolist()
-                    if isinstance(value, date)
-                )
-                if not diag_dates:
-                    st.info("В сыром факте нет корректных дат.")
-                else:
-                    default_diag_date = period[1] if period[1] in diag_dates else diag_dates[-1]
-                    diag_date = st.selectbox(
-                        "Дата проверки точки",
-                        diag_dates,
-                        index=diag_dates.index(default_diag_date),
-                        format_func=lambda value: value.strftime("%d.%m.%Y"),
-                        key="dashboard_raw_shop_diag_date_v751204",
-                    )
-                    diag_day = diag_source[diag_source["business_date"].eq(diag_date)].copy()
-                    diag_table = (
-                        diag_day.dropna(subset=["shop_number"])
-                        .assign(shop_number=lambda frame: frame["shop_number"].astype(int))
-                        .groupby("shop_number", as_index=False)
-                        .agg(
-                            raw_revenue=("revenue", "sum"),
-                            sold_quantity=("sold_quantity", "sum"),
-                            receipts=("receipts", "sum"),
-                            sku_count=("sku_count", "sum"),
-                        )
-                        .sort_values("shop_number", kind="stable")
-                    )
-                    dashboard_mapping = {
-                        int(shop): str(label).strip()
-                        for shop, label in st.session_state.get("point_mapping", {}).items()
-                    }
-                    diag_table["app_point"] = diag_table["shop_number"].map(dashboard_mapping).fillna("Не сопоставлена")
-                    diag_table["technical_point"] = diag_table["shop_number"].map(
-                        lambda value: f"Т{int(value)}"
-                    )
-
-                    # Сравниваем тот же день с результатом после prepare_analysis.
-                    analysis_day = daily_detail.copy()
-                    analysis_day["business_date"] = pd.to_datetime(
-                        analysis_day["business_date"], errors="coerce"
-                    ).dt.date
-                    analysis_day = analysis_day[analysis_day["business_date"].eq(diag_date)]
-                    if analysis_day.empty:
-                        analysed_revenue = pd.DataFrame(columns=["app_point", "analysis_revenue"])
-                    else:
-                        analysed_revenue = (
-                            analysis_day.groupby("point", as_index=False)
-                            .agg(analysis_revenue=("revenue", "sum"))
-                            .rename(columns={"point": "app_point"})
-                        )
-                    diag_table = diag_table.merge(analysed_revenue, on="app_point", how="left")
-                    diag_table["analysis_revenue"] = pd.to_numeric(
-                        diag_table["analysis_revenue"], errors="coerce"
-                    ).fillna(0.0)
-                    diag_table["delta"] = diag_table["raw_revenue"] - diag_table["analysis_revenue"]
-                    diag_display = diag_table.rename(
-                        columns={
-                            "shop_number": "shop_number",
-                            "technical_point": "Техническая метка",
-                            "app_point": "Точка в приложении",
-                            "raw_revenue": "Доход сырой, ₽",
-                            "analysis_revenue": "После анализа, ₽",
-                            "delta": "Разница, ₽",
-                            "sold_quantity": "Продано, шт.",
-                            "receipts": "Чеков",
-                            "sku_count": "SKU",
-                        }
-                    )
-                    st.dataframe(
-                        diag_display[
-                            [
-                                "shop_number", "Техническая метка", "Точка в приложении",
-                                "Доход сырой, ₽", "После анализа, ₽", "Разница, ₽",
-                                "Продано, шт.", "Чеков", "SKU",
-                            ]
-                        ],
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "shop_number": st.column_config.NumberColumn("shop_number", format="%d"),
-                            "Доход сырой, ₽": st.column_config.NumberColumn(format="%.0f"),
-                            "После анализа, ₽": st.column_config.NumberColumn(format="%.0f"),
-                            "Разница, ₽": st.column_config.NumberColumn(format="%.0f"),
-                            "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
-                            "Чеков": st.column_config.NumberColumn(format="%d"),
-                            "SKU": st.column_config.NumberColumn(format="%d"),
-                        },
-                    )
-
-                    t30_diag = diag_table[diag_table["shop_number"].eq(30)]
-                    if t30_diag.empty:
-                        st.warning(
-                            f"{diag_date:%d.%m.%Y}: в НЕФИЛЬТРОВАННОМ PostgreSQL нет shop_number=30. "
-                            "По скриншоту это уже подтверждено: бизнес-точка Т30 в SET должна быть "
-                            "привязана к другому raw shop_number."
-                        )
-
-                        # Сначала отдельно показываем номера, выходящие за обычную сетку Т1-Т30.
-                        # Именно там чаще всего оказываются новые/перенумерованные магазины.
-                        outside_candidates = diag_table[
-                            (diag_table["shop_number"] > 30)
-                            | (diag_table["shop_number"] < 1)
-                        ].copy()
-                        if not outside_candidates.empty:
-                            st.markdown("**Кандидаты вне диапазона 1–30**")
-                            candidate_display = outside_candidates[
-                                ["shop_number", "raw_revenue", "sold_quantity", "receipts"]
-                            ].rename(
-                                columns={
-                                    "raw_revenue": "Доход, ₽",
-                                    "sold_quantity": "Продано, шт.",
-                                    "receipts": "Чеков",
-                                }
-                            )
-                            st.dataframe(
-                                candidate_display,
-                                use_container_width=True,
-                                hide_index=True,
-                                column_config={
-                                    "shop_number": st.column_config.NumberColumn(format="%d"),
-                                    "Доход, ₽": st.column_config.NumberColumn(format="%.0f"),
-                                    "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
-                                    "Чеков": st.column_config.NumberColumn(format="%d"),
-                                },
-                            )
-
-                        st.markdown("**Найти Т30 по доходу из SET**")
-                        expected_t30_revenue = st.number_input(
-                            f"Доход Т30 в SET за {diag_date:%d.%m.%Y}, ₽",
-                            min_value=0.0,
-                            value=0.0,
-                            step=1.0,
-                            key="t30_expected_set_revenue_v751206",
-                            help="Введите сумму Т30 из DataLens SET за эту же дату. Приложение покажет ближайшие raw shop_number.",
-                        )
-                        candidate_source = diag_table.copy()
-                        if expected_t30_revenue > 0 and not candidate_source.empty:
-                            candidate_source["difference"] = (
-                                pd.to_numeric(candidate_source["raw_revenue"], errors="coerce").fillna(0.0)
-                                - float(expected_t30_revenue)
-                            ).abs()
-                            nearest = candidate_source.sort_values(
-                                ["difference", "shop_number"], kind="stable"
-                            ).head(7)
-                            nearest_display = nearest[
-                                ["shop_number", "raw_revenue", "difference", "sold_quantity", "receipts"]
-                            ].rename(
-                                columns={
-                                    "raw_revenue": "Доход PostgreSQL, ₽",
-                                    "difference": "Разница с SET, ₽",
-                                    "sold_quantity": "Продано, шт.",
-                                    "receipts": "Чеков",
-                                }
-                            )
-                            st.dataframe(
-                                nearest_display,
-                                use_container_width=True,
-                                hide_index=True,
-                                column_config={
-                                    "shop_number": st.column_config.NumberColumn(format="%d"),
-                                    "Доход PostgreSQL, ₽": st.column_config.NumberColumn(format="%.0f"),
-                                    "Разница с SET, ₽": st.column_config.NumberColumn(format="%.0f"),
-                                    "Продано, шт.": st.column_config.NumberColumn(format="%.0f"),
-                                    "Чеков": st.column_config.NumberColumn(format="%d"),
-                                },
-                            )
-                            best = nearest.iloc[0]
-                            if float(best["difference"]) <= 1.0:
-                                st.success(
-                                    f"Практически точное совпадение: shop_number={int(best['shop_number'])}, "
-                                    f"доход {float(best['raw_revenue']):,.0f} ₽.".replace(",", " ")
-                                )
-
-                        # Позволяем сразу проверить найденное соответствие без очередной правки кода.
-                        raw_shop_options = [
-                            int(value)
-                            for value in diag_table["shop_number"].dropna().astype(int).tolist()
-                        ]
-                        if raw_shop_options:
-                            suggested_shop = raw_shop_options[0]
-                            if expected_t30_revenue > 0 and not candidate_source.empty:
-                                ranked = candidate_source.assign(
-                                    _diff=(
-                                        pd.to_numeric(candidate_source["raw_revenue"], errors="coerce").fillna(0.0)
-                                        - float(expected_t30_revenue)
-                                    ).abs()
-                                ).sort_values(["_diff", "shop_number"], kind="stable")
-                                if not ranked.empty:
-                                    suggested_shop = int(ranked.iloc[0]["shop_number"])
-                            elif not outside_candidates.empty:
-                                suggested_shop = int(outside_candidates.iloc[0]["shop_number"])
-
-                            selected_t30_raw_shop = st.selectbox(
-                                "Какой raw shop_number считать точкой Т30?",
-                                raw_shop_options,
-                                index=raw_shop_options.index(suggested_shop),
-                                key="t30_raw_shop_candidate_v751206",
-                                format_func=lambda value: (
-                                    f"shop_number {value} · доход "
-                                    f"{float(diag_table.loc[diag_table['shop_number'].eq(value), 'raw_revenue'].sum()):,.0f} ₽"
-                                ).replace(",", " "),
-                            )
-                            action_cols = st.columns(2)
-                            with action_cols[0]:
-                                if st.button(
-                                    "Применить как Т30",
-                                    type="primary",
-                                    use_container_width=True,
-                                    key="apply_t30_raw_mapping_v751206",
-                                ):
-                                    overrides = dict(
-                                        st.session_state.get("point_mapping_overrides_v751206", {})
-                                    )
-                                    # Т30 должна иметь только один raw shop_number.
-                                    overrides = {
-                                        int(shop): str(label)
-                                        for shop, label in overrides.items()
-                                        if str(label).strip() != "Т30"
-                                    }
-                                    overrides[int(selected_t30_raw_shop)] = "Т30"
-                                    st.session_state["point_mapping_overrides_v751206"] = overrides
-                                    for state_key in (
-                                        "analysis",
-                                        "analysis_auto_signature_v751200",
-                                        "lazy_detail_frame_v751200",
-                                        "lazy_detail_signature_v751200",
-                                    ):
-                                        st.session_state.pop(state_key, None)
-                                    st.rerun()
-                            with action_cols[1]:
-                                if st.button(
-                                    "Сбросить привязку Т30",
-                                    use_container_width=True,
-                                    key="reset_t30_raw_mapping_v751206",
-                                ):
-                                    overrides = dict(
-                                        st.session_state.get("point_mapping_overrides_v751206", {})
-                                    )
-                                    overrides = {
-                                        int(shop): str(label)
-                                        for shop, label in overrides.items()
-                                        if str(label).strip() != "Т30"
-                                    }
-                                    st.session_state["point_mapping_overrides_v751206"] = overrides
-                                    for state_key in (
-                                        "analysis",
-                                        "analysis_auto_signature_v751200",
-                                        "lazy_detail_frame_v751200",
-                                        "lazy_detail_signature_v751200",
-                                    ):
-                                        st.session_state.pop(state_key, None)
-                                    st.rerun()
-
-                        active_t30_override = [
-                            int(shop)
-                            for shop, label in st.session_state.get(
-                                "point_mapping_overrides_v751206", {}
-                            ).items()
-                            if str(label).strip() == "Т30"
-                        ]
-                        if active_t30_override:
-                            st.info(
-                                f"Текущая тестовая привязка: raw shop_number={active_t30_override[0]} → Т30. "
-                                "Она уже применяется ко всему анализу в этой сессии."
-                            )
-                    else:
-                        t30_raw = float(t30_diag["raw_revenue"].sum())
-                        t30_after = float(t30_diag["analysis_revenue"].sum())
-                        mapped_value = str(t30_diag["app_point"].iloc[0])
-                        st.info(
-                            f"{diag_date:%d.%m.%Y}: сырой shop_number=30 найден. "
-                            f"Доход {t30_raw:,.0f} ₽; текущая карта приложения: {mapped_value}.".replace(",", " ")
-                        )
-                        if abs(t30_raw) > 0.005:
-                            st.success(
-                                f"{diag_date:%d.%m.%Y}: сырой доход Т30 = {t30_raw:,.0f} ₽; "
-                                f"после анализа = {t30_after:,.0f} ₽.".replace(",", " ")
-                            )
-                        else:
-                            st.warning(
-                                f"{diag_date:%d.%m.%Y}: строка Т30 есть, но SUM(net_line_amount) = 0 ₽. "
-                                "Если SET показывает деньги, значит нужно сверить поле дохода в его датасете."
-                            )
-
-        if not filtered_detail.empty:
-            dashboard_time_sales = filtered_detail.copy()
-            dashboard_time_sales["hour"] = pd.to_datetime(
-                dashboard_time_sales["sale_datetime"]
-            ).dt.hour
-            dashboard_time_sales["Время суток"] = dashboard_time_sales["hour"].map(
-                lambda hour: "День · 06:00–21:59" if 6 <= hour < 22 else "Ночь · 22:00–05:59"
-            )
-            dashboard_time_by_point = (
-                dashboard_time_sales.groupby(["point", "Время суток"], as_index=False)
-                .agg(**{"Продано, шт.": ("sales", "sum"), "Выручка, ₽": ("revenue", "sum")})
-                .rename(columns={"point": "Точка"})
-            )
-            dashboard_time_totals = (
-                dashboard_time_by_point.groupby("Точка", as_index=False)
-                .agg(
-                    **{
-                        "Всего по точке, шт.": ("Продано, шт.", "sum"),
-                        "Выручка точки, ₽": ("Выручка, ₽", "sum"),
-                    }
-                )
-            )
-            dashboard_time_by_point = dashboard_time_by_point.merge(
-                dashboard_time_totals, on="Точка", how="left"
-            )
-            dashboard_time_by_point["Доля времени суток"] = (
-                dashboard_time_by_point["Продано, шт."]
-                / dashboard_time_by_point["Всего по точке, шт."].replace(0, pd.NA)
-            )
-            dashboard_point_order = sorted(
-                dashboard_time_by_point["Точка"].unique(),
-                key=lambda value: int(str(value)[1:]),
-            )
-            day_total = float(
-                dashboard_time_by_point.loc[
-                    dashboard_time_by_point["Время суток"].str.startswith("День"),
-                    "Продано, шт.",
-                ].sum()
-            )
-            night_total = float(
-                dashboard_time_by_point.loc[
-                    dashboard_time_by_point["Время суток"].str.startswith("Ночь"),
-                    "Продано, шт.",
-                ].sum()
-            )
-            day_revenue = float(
-                dashboard_time_by_point.loc[
-                    dashboard_time_by_point["Время суток"].str.startswith("День"),
-                    "Выручка, ₽",
-                ].sum()
-            )
-            night_revenue = float(
-                dashboard_time_by_point.loc[
-                    dashboard_time_by_point["Время суток"].str.startswith("Ночь"),
-                    "Выручка, ₽",
-                ].sum()
-            )
-            time_total = day_total + night_total
-            dashboard_time_metrics = st.columns(3)
-            dashboard_time_metrics[0].metric(
-                "Дневные продажи, шт.",
-                f"{day_total:,.0f}".replace(",", " "),
-                delta=f"Выручка: {day_revenue:,.0f} ₽".replace(",", " "),
-                delta_color="off",
-            )
-            dashboard_time_metrics[1].metric(
-                "Ночные продажи, шт.",
-                f"{night_total:,.0f}".replace(",", " "),
-                delta=f"Выручка: {night_revenue:,.0f} ₽".replace(",", " "),
-                delta_color="off",
-            )
-            dashboard_time_metrics[2].metric(
-                "Доля ночных продаж",
-                f"{night_total / time_total:.1%}" if time_total else "0,0%",
-            )
-            dashboard_time_chart = px.bar(
-                dashboard_time_by_point,
-                x="Точка",
-                y="Продано, шт.",
-                color="Время суток",
-                barmode="stack",
-                text_auto=".0f",
-                title="Дневные и ночные продажи по точкам",
-                color_discrete_map={
-                    "День · 06:00–21:59": "#F4B183",
-                    "Ночь · 22:00–05:59": "#4472C4",
-                },
-                category_orders={
-                    "Точка": dashboard_point_order,
-                    "Время суток": ["День · 06:00–21:59", "Ночь · 22:00–05:59"],
-                },
-                custom_data=[
-                    "Доля времени суток", "Всего по точке, шт.",
-                    "Выручка, ₽", "Выручка точки, ₽",
-                ],
-            )
-            dashboard_time_chart.update_traces(
-                hovertemplate=(
-                    "Точка: %{x}<br>%{fullData.name}<br>Продано: %{y:.0f} шт."
-                    "<br>Доля в точке: %{customdata[0]:.1%}"
-                    "<br>Всего по точке: %{customdata[1]:.0f} шт."
-                    "<br>Выручка периода: %{customdata[2]:,.0f} ₽"
-                    "<br>Выручка точки: %{customdata[3]:,.0f} ₽<extra></extra>"
-                )
-            )
-            dashboard_time_chart.update_layout(
-                xaxis_title="Точка",
-                yaxis_title="Продано, шт.",
-                legend_title="Время суток",
-                height=520,
-            )
-            st.plotly_chart(dashboard_time_chart, use_container_width=True)
-
-        heat = filtered_category.pivot(index="point", columns="category", values="category_share_point")
-        heat_quantity = filtered_category.pivot(index="point", columns="category", values="category_sales")
-        point_order = sorted(heat.index, key=lambda value: int(value[1:]))
-        heat = heat.reindex(point_order)
-        heat_quantity = heat_quantity.reindex(index=point_order, columns=heat.columns)
-        heat_labels = heat.copy().astype(object)
-        for point in heat.index:
-            for category in heat.columns:
-                share = heat.loc[point, category]
-                quantity = heat_quantity.loc[point, category]
-                if pd.isna(share):
-                    heat_labels.loc[point, category] = "—"
-                else:
-                    heat_labels.loc[point, category] = f"{share:.0%}<br>{quantity:,.0f} шт.".replace(",", " ")
-        heat_values = heat.stack()
-        heat_scale_max = max(float(heat_values.max()), 0.10) if not heat_values.empty else 0.10
-        red_limit = 0.05 / heat_scale_max
-        green_limit = 0.10 / heat_scale_max
-        category_share_colors = [
-            [0.0, "#F8696B"],
-            [max(0.0, red_limit - 0.000001), "#F8696B"],
-            [red_limit, "#FFEB84"],
-            [max(red_limit, green_limit - 0.000001), "#FFEB84"],
-            [green_limit, "#63BE7B"],
-            [1.0, "#008A3B"],
-        ]
-        heat_figure = px.imshow(
-            heat,
-            aspect="auto",
-            color_continuous_scale=category_share_colors,
-            zmin=0,
-            zmax=heat_scale_max,
-            title="Доля категории и количество продаж по точкам",
-            labels={"x": "Категория", "y": "Точка", "color": "Доля категории"},
-        )
-        heat_figure.update_traces(
-            text=heat_labels.to_numpy(),
-            texttemplate="%{text}",
-            hovertemplate="Точка: %{y}<br>Категория: %{x}<br>%{text}<extra></extra>",
-        )
-        heat_figure.update_layout(
-            height=max(500, 34 * len(heat.index) + 180),
-            coloraxis_colorbar=dict(tickformat=".0%", title="Доля<br>10% = зелёная зона"),
-        )
-        st.plotly_chart(heat_figure, use_container_width=True)
+# Старый «Дашборд» удалён. Его место в меню занимает отчёт «Ср/знач».
 
 if tab_points.open:
     with tab_points:
