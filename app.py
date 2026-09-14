@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.12-SR-REPORT-WEEKDAY-MATRIX"
+BUILD_ID = "75.12.13-CYCLE-CATEGORY-LIMITS"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -9759,6 +9759,341 @@ def _cycle_plan_normalize_name(value: object) -> str:
     return re.sub(r"\\s+", " ", str(value or "").strip().casefold().replace("ё", "е"))
 
 
+_CYCLE_LIMIT_WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+_CYCLE_LIMIT_UNKNOWN_CATEGORIES = {
+    "", "nan", "none", "нераспознано", "нераспознанно", "не сопоставлено", "не задана"
+}
+
+
+def _cycle_limit_normalize_point(value: object) -> str:
+    text = str(value or "").strip().upper().replace("T", "Т").replace(" ", "")
+    match = re.fullmatch(r"Т0*(\d+)", text)
+    return f"Т{int(match.group(1))}" if match else ""
+
+
+def _cycle_limit_normalize_weekday(value: object) -> str:
+    text = str(value or "").strip().casefold().replace("ё", "е")
+    mapping = {
+        "пн": "Пн", "понедельник": "Пн",
+        "вт": "Вт", "вторник": "Вт",
+        "ср": "Ср", "среда": "Ср",
+        "чт": "Чт", "четверг": "Чт",
+        "пт": "Пт", "пятница": "Пт",
+        "сб": "Сб", "суббота": "Сб",
+        "вс": "Вс", "воскресенье": "Вс",
+    }
+    return mapping.get(text, "")
+
+
+def _cycle_limit_normalize_indicator(value: object) -> str:
+    text = str(value or "").strip().casefold().replace("ё", "е")
+    if text.startswith("мин"):
+        return "min_sales"
+    if text.startswith("макс"):
+        return "max_sales"
+    if text.startswith("сред") or text in {"ср", "ср."}:
+        return "avg_sales"
+    return ""
+
+
+@st.cache_data(show_spinner=False)
+def parse_cycle_category_limits_report(file_bytes: bytes) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Read the uploaded Ср/знач workbook into point/category/weekday limits.
+
+    Expected layout per category sheet:
+      row with Точка | Показатель | Пн ... Вс
+      each point occupies three rows: Мин / Макс / Среднее.
+
+    «Нераспознано» / «Не сопоставлено» is deliberately excluded from control.
+    """
+    columns = [
+        "point", "category", "weekday", "min_sales", "avg_sales", "max_sales", "month_key"
+    ]
+    if not file_bytes or file_bytes[:2] != b"PK":
+        raise ValueError("Файл ограничений должен быть Excel .xlsx.")
+
+    workbook = load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=False)
+    buckets: dict[tuple[str, str, str], dict[str, object]] = {}
+    period_start: date | None = None
+    period_end: date | None = None
+    month_label = ""
+
+    for sheet in workbook.worksheets:
+        # Prefer the explicit category caption, otherwise the sheet name.
+        raw_category = sheet.title
+        for row_number in range(1, min(sheet.max_row, 8) + 1):
+            for column in range(1, min(sheet.max_column, 4) + 1):
+                cell_text = str(sheet.cell(row_number, column).value or "").strip()
+                if cell_text.casefold().startswith("категория:"):
+                    raw_category = cell_text.split(":", 1)[1].strip()
+                if not month_label and row_number == 1 and cell_text:
+                    month_label = cell_text
+                period_match = re.search(
+                    r"(\d{2}\.\d{2}\.\d{4}).*?(\d{2}\.\d{2}\.\d{4})",
+                    cell_text,
+                )
+                if period_match and period_start is None:
+                    try:
+                        period_start = datetime.strptime(period_match.group(1), "%d.%m.%Y").date()
+                        period_end = datetime.strptime(period_match.group(2), "%d.%m.%Y").date()
+                    except ValueError:
+                        pass
+
+        category = normalize_matrix_category(raw_category)
+        if str(category or "").strip().casefold() in _CYCLE_LIMIT_UNKNOWN_CATEGORIES:
+            continue
+
+        header_row = None
+        weekday_columns: dict[int, str] = {}
+        point_column = None
+        indicator_column = None
+        for row_number in range(1, min(sheet.max_row, 20) + 1):
+            row_values = [str(sheet.cell(row_number, c).value or "").strip() for c in range(1, sheet.max_column + 1)]
+            normalized = [value.casefold().replace("ё", "е") for value in row_values]
+            if "точка" not in normalized or "показатель" not in normalized:
+                continue
+            for column, value in enumerate(row_values, start=1):
+                low = value.casefold().replace("ё", "е")
+                if low == "точка":
+                    point_column = column
+                elif low == "показатель":
+                    indicator_column = column
+                else:
+                    weekday = _cycle_limit_normalize_weekday(value)
+                    if weekday:
+                        weekday_columns[column] = weekday
+            if point_column and indicator_column and weekday_columns:
+                header_row = row_number
+                break
+
+        if header_row is None or point_column is None or indicator_column is None:
+            continue
+
+        current_point = ""
+        for row_number in range(header_row + 1, sheet.max_row + 1):
+            point_value = _cycle_limit_normalize_point(sheet.cell(row_number, point_column).value)
+            if point_value:
+                current_point = point_value
+            if not current_point:
+                continue
+            indicator = _cycle_limit_normalize_indicator(sheet.cell(row_number, indicator_column).value)
+            if not indicator:
+                continue
+            for column, weekday in weekday_columns.items():
+                raw_value = sheet.cell(row_number, column).value
+                numeric_value = pd.to_numeric(pd.Series([raw_value]), errors="coerce").iloc[0]
+                if pd.isna(numeric_value):
+                    continue
+                key = (current_point, category, weekday)
+                record = buckets.setdefault(
+                    key,
+                    {
+                        "point": current_point,
+                        "category": category,
+                        "weekday": weekday,
+                        "min_sales": pd.NA,
+                        "avg_sales": pd.NA,
+                        "max_sales": pd.NA,
+                    },
+                )
+                record[indicator] = float(numeric_value)
+
+    if not buckets:
+        raise ValueError(
+            "В файле не найден формат: Точка / Показатель / Пн…Вс с тремя строками Мин / Макс / Среднее."
+        )
+
+    frame = pd.DataFrame(list(buckets.values()))
+    month_key = ""
+    if period_start is not None and period_end is not None:
+        if (period_start.year, period_start.month) == (period_end.year, period_end.month):
+            month_key = period_start.strftime("%Y-%m")
+    frame["month_key"] = month_key
+    frame = frame[columns].sort_values(
+        ["point", "category", "weekday"],
+        key=lambda series: series.map(_archive_point_sort_key) if series.name == "point" else series,
+        kind="stable",
+    ).reset_index(drop=True)
+
+    metadata: dict[str, object] = {
+        "month_label": month_label,
+        "period_start": period_start,
+        "period_end": period_end,
+        "month_key": month_key,
+        "categories": int(frame["category"].nunique()),
+        "points": int(frame["point"].nunique()),
+        "rows": int(len(frame)),
+    }
+    return frame, metadata
+
+
+def apply_cycle_category_limits(
+    frame: pd.DataFrame,
+    limits: pd.DataFrame | None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Attach category min/average/max control to cyclic-plan SKU rows.
+
+    The cyclic SKU logic is left unchanged. After all SKU plans are calculated,
+    their sum is checked at Date -> Point -> Category level against the uploaded
+    report for the corresponding weekday. Yellow = below minimum, red = above maximum.
+    """
+    result = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame()
+    added_columns = [
+        "План категории, шт.",
+        "Мин категории, шт.",
+        "Среднее категории, шт.",
+        "Макс категории, шт.",
+        "Недобор до минимума, шт.",
+        "Превышение максимума, шт.",
+        "Статус ограничения категории",
+    ]
+    for column in added_columns:
+        if column not in result.columns:
+            result[column] = pd.NA if column != "Статус ограничения категории" else ""
+
+    summary_columns = [
+        "Дата плана", "День недели", "Точка", "Категория",
+        "План категории, шт.", "Мин категории, шт.", "Среднее категории, шт.",
+        "Макс категории, шт.", "Недобор до минимума, шт.",
+        "Превышение максимума, шт.", "Статус ограничения категории",
+    ]
+    if result.empty or limits is None or limits.empty:
+        return result, pd.DataFrame(columns=summary_columns)
+
+    work = result.copy()
+    work["_row_id"] = range(len(work))
+    work["_plan_date"] = pd.to_datetime(work["Дата плана"], errors="coerce").dt.date
+    work["_point"] = work["Точка"].map(_cycle_limit_normalize_point)
+    work["_category"] = work["Категория"].map(normalize_matrix_category)
+    work["_weekday"] = work["_plan_date"].map(
+        lambda value: WEEKDAY_RU.get(value.weekday(), "") if isinstance(value, date) else ""
+    )
+    work["_month_key"] = work["_plan_date"].map(
+        lambda value: value.strftime("%Y-%m") if isinstance(value, date) else ""
+    )
+    work["_new_plan_numeric"] = pd.to_numeric(work["Новый план"], errors="coerce")
+
+    valid = work[
+        work["_plan_date"].notna()
+        & work["_point"].ne("")
+        & work["_weekday"].ne("")
+        & ~work["_category"].fillna("").astype(str).str.casefold().isin(_CYCLE_LIMIT_UNKNOWN_CATEGORIES)
+    ].copy()
+    if valid.empty:
+        return result, pd.DataFrame(columns=summary_columns)
+
+    summary = (
+        valid.groupby(
+            ["_plan_date", "_month_key", "_point", "_category", "_weekday"],
+            as_index=False,
+            dropna=False,
+        )
+        .agg(
+            **{
+                "План категории, шт.": (
+                    "_new_plan_numeric",
+                    lambda values: pd.to_numeric(values, errors="coerce").sum(min_count=1),
+                ),
+                "SKU в категории": ("SKU", "size"),
+                "SKU с планом": (
+                    "_new_plan_numeric",
+                    lambda values: int(pd.to_numeric(values, errors="coerce").notna().sum()),
+                ),
+            }
+        )
+    )
+
+    limit_frame = limits.copy()
+    limit_frame["_point"] = limit_frame["point"].map(_cycle_limit_normalize_point)
+    limit_frame["_category"] = limit_frame["category"].map(normalize_matrix_category)
+    limit_frame["_weekday"] = limit_frame["weekday"].map(_cycle_limit_normalize_weekday)
+    for column in ["min_sales", "avg_sales", "max_sales"]:
+        limit_frame[column] = pd.to_numeric(limit_frame.get(column), errors="coerce")
+    if "month_key" not in limit_frame.columns:
+        limit_frame["month_key"] = ""
+    limit_frame["month_key"] = limit_frame["month_key"].fillna("").astype(str)
+
+    # A month-specific uploaded report only controls plans inside that same month.
+    month_specific = bool(limit_frame["month_key"].ne("").any())
+    merge_left = ["_point", "_category", "_weekday"]
+    merge_right = ["_point", "_category", "_weekday"]
+    if month_specific:
+        merge_left = ["_month_key"] + merge_left
+        merge_right = ["month_key"] + merge_right
+
+    limit_unique = limit_frame[
+        merge_right + ["min_sales", "avg_sales", "max_sales"]
+    ].drop_duplicates(merge_right, keep="last")
+    summary = summary.merge(
+        limit_unique,
+        left_on=merge_left,
+        right_on=merge_right,
+        how="left",
+    )
+
+    summary["Мин категории, шт."] = summary["min_sales"]
+    summary["Среднее категории, шт."] = summary["avg_sales"]
+    summary["Макс категории, шт."] = summary["max_sales"]
+    plan_values = pd.to_numeric(summary["План категории, шт."], errors="coerce")
+    min_values = pd.to_numeric(summary["Мин категории, шт."], errors="coerce")
+    max_values = pd.to_numeric(summary["Макс категории, шт."], errors="coerce")
+
+    summary["Недобор до минимума, шт."] = (min_values - plan_values).clip(lower=0)
+    summary["Превышение максимума, шт."] = (plan_values - max_values).clip(lower=0)
+
+    def _limit_status(row: pd.Series) -> str:
+        plan_value = pd.to_numeric(pd.Series([row.get("План категории, шт.")]), errors="coerce").iloc[0]
+        min_value = pd.to_numeric(pd.Series([row.get("Мин категории, шт.")]), errors="coerce").iloc[0]
+        max_value = pd.to_numeric(pd.Series([row.get("Макс категории, шт.")]), errors="coerce").iloc[0]
+        if pd.isna(min_value) and pd.isna(max_value):
+            return "Нет ограничения"
+        if pd.isna(plan_value):
+            return "Нет рассчитанного плана"
+        if pd.notna(min_value) and float(plan_value) < float(min_value):
+            return "Ниже минимума"
+        if pd.notna(max_value) and float(plan_value) > float(max_value):
+            return "Выше максимума"
+        return "В диапазоне"
+
+    summary["Статус ограничения категории"] = summary.apply(_limit_status, axis=1)
+
+    # Human-readable summary used both on screen and in the Excel control sheet.
+    summary_display = summary.rename(
+        columns={
+            "_plan_date": "Дата плана",
+            "_weekday": "День недели",
+            "_point": "Точка",
+            "_category": "Категория",
+        }
+    )
+    summary_display = summary_display[summary_columns].sort_values(
+        ["Дата плана", "Точка", "Категория"],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    map_columns = [
+        "_plan_date", "_point", "_category",
+        "План категории, шт.", "Мин категории, шт.", "Среднее категории, шт.",
+        "Макс категории, шт.", "Недобор до минимума, шт.",
+        "Превышение максимума, шт.", "Статус ограничения категории",
+    ]
+    mapped = summary[map_columns].copy()
+    work = work.merge(mapped, on=["_plan_date", "_point", "_category"], how="left", suffixes=("", "_limit"))
+    for column in added_columns:
+        limit_column = f"{column}_limit"
+        if limit_column in work.columns:
+            work[column] = work[limit_column]
+            work.drop(columns=[limit_column], inplace=True)
+
+    work = work.sort_values("_row_id", kind="stable").reset_index(drop=True)
+    drop_columns = [
+        column for column in ["_row_id", "_plan_date", "_point", "_category", "_weekday", "_month_key", "_new_plan_numeric"]
+        if column in work.columns
+    ]
+    result = work.drop(columns=drop_columns)
+    return result, summary_display
+
+
 def build_cycle_plan_v1(
     target_plans: pd.DataFrame,
     reference_plans: pd.DataFrame,
@@ -10614,6 +10949,41 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                         target_cell.fill = PatternFill("solid", fgColor="FCE4D6")
                         target_cell.font = Font(color="9C5700", bold=True)
 
+                    limit_status = str(record.get("Статус ограничения категории", "") or "")
+                    category_plan_total = pd.to_numeric(
+                        pd.Series([record.get("План категории, шт.")]), errors="coerce"
+                    ).iloc[0]
+                    category_min = pd.to_numeric(
+                        pd.Series([record.get("Мин категории, шт.")]), errors="coerce"
+                    ).iloc[0]
+                    category_avg = pd.to_numeric(
+                        pd.Series([record.get("Среднее категории, шт.")]), errors="coerce"
+                    ).iloc[0]
+                    category_max = pd.to_numeric(
+                        pd.Series([record.get("Макс категории, шт.")]), errors="coerce"
+                    ).iloc[0]
+                    # Category-limit color has priority on the main plan cell. Match quality
+                    # remains visible in the blue diagnostic row/comment below the SKU.
+                    if limit_status == "Выше максимума":
+                        target_cell.fill = PatternFill("solid", fgColor="F4CCCC")
+                        target_cell.font = Font(color="9C0006", bold=True)
+                    elif limit_status == "Ниже минимума":
+                        target_cell.fill = PatternFill("solid", fgColor="FFF2CC")
+                        target_cell.font = Font(color="7F6000", bold=True)
+
+                    limit_comment = ""
+                    if limit_status and limit_status not in {"Нет ограничения", "Нет рассчитанного плана"}:
+                        def _fmt_limit(value):
+                            return "-" if pd.isna(value) else f"{float(value):g}"
+                        limit_comment = (
+                            "Контроль категории по отчёту Ср/знач:\n"
+                            f"План категории: {_fmt_limit(category_plan_total)}\n"
+                            f"Мин: {_fmt_limit(category_min)}\n"
+                            f"Среднее: {_fmt_limit(category_avg)}\n"
+                            f"Макс: {_fmt_limit(category_max)}\n"
+                            f"Статус ограничения: {limit_status}\n"
+                        )
+
                     previous_plan = pd.to_numeric(pd.Series([record.get("Прошлый план SKU")]), errors="coerce").iloc[0]
                     consumed = pd.to_numeric(pd.Series([record.get("Факт SKU за срок")]), errors="coerce").iloc[0]
                     coefficient = pd.to_numeric(pd.Series([record.get("K SKU")]), errors="coerce").iloc[0]
@@ -10639,6 +11009,7 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
                             f"Сущность: {record.get('Сущность текущего SKU', '')}\n"
                             f"SKU-основание: {record.get('SKU-основание', '')}\n"
                             f"{entity_compare_line}"
+                            f"{limit_comment}"
                             f"Статус: {status}"
                         ),
                         "Циклический план",
@@ -10894,6 +11265,52 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
     for cells in calculation_sheet.columns:
         width = min(max(len(str(cell.value or "")) for cell in cells) + 2, 34)
         calculation_sheet.column_dimensions[cells[0].column_letter].width = width
+
+    # Category min/avg/max control from the uploaded Ср/знач report.
+    control_required = [
+        "Дата плана", "День недели", "Точка", "Категория",
+        "План категории, шт.", "Мин категории, шт.", "Среднее категории, шт.",
+        "Макс категории, шт.", "Недобор до минимума, шт.",
+        "Превышение максимума, шт.", "Статус ограничения категории",
+    ]
+    if all(column in work.columns for column in control_required):
+        control_frame = work[control_required].copy()
+        control_frame = control_frame[
+            control_frame[["Мин категории, шт.", "Макс категории, шт."]].notna().any(axis=1)
+        ].drop_duplicates(["Дата плана", "Точка", "Категория"], keep="last")
+        if not control_frame.empty:
+            control_name = "Контроль категорий"
+            if control_name in workbook.sheetnames:
+                del workbook[control_name]
+            control_sheet = workbook.create_sheet(control_name)
+            control_sheet.append(control_frame.columns.tolist())
+            for values in control_frame.itertuples(index=False, name=None):
+                control_sheet.append([
+                    None if value is pd.NA or (not isinstance(value, str) and pd.isna(value)) else value
+                    for value in values
+                ])
+            control_sheet.freeze_panes = "A2"
+            control_sheet.auto_filter.ref = control_sheet.dimensions
+            control_sheet.sheet_properties.tabColor = "FFC000"
+            status_column = control_frame.columns.get_loc("Статус ограничения категории") + 1
+            for row_number in range(2, control_sheet.max_row + 1):
+                status_value = str(control_sheet.cell(row_number, status_column).value or "")
+                if status_value == "Выше максимума":
+                    fill = PatternFill("solid", fgColor="F4CCCC")
+                    font = Font(color="9C0006", bold=True)
+                elif status_value == "Ниже минимума":
+                    fill = PatternFill("solid", fgColor="FFF2CC")
+                    font = Font(color="7F6000", bold=True)
+                else:
+                    fill = None
+                    font = None
+                if fill is not None:
+                    for column in range(1, control_sheet.max_column + 1):
+                        control_sheet.cell(row_number, column).fill = fill
+                        control_sheet.cell(row_number, column).font = font
+            for cells in control_sheet.columns:
+                width = min(max(len(str(cell.value or "")) for cell in cells[:500]) + 2, 34)
+                control_sheet.column_dimensions[cells[0].column_letter].width = width
 
     # Detailed long-form justification sheet.
     detail_name = "Обоснование циклического плана"
@@ -19747,6 +20164,104 @@ if tab_cycle_plan.open:
             "При сущности синяя строка показывает только план основания и название блюда сравнения."
         )
 
+        cycle_limits_upload_tab, cycle_limits_preview_tab = st.tabs(
+            ["Ограничения категорий", "Проверка ограничений"]
+        )
+        with cycle_limits_upload_tab:
+            st.markdown("#### Отчёт Ср/знач для контроля плана")
+            st.caption(
+                "Загрузите Excel из вкладки «Ср/знач». Для каждой точки, категории и дня недели "
+                "берутся Мин / Среднее / Макс. «Нераспознано» и «Не сопоставлено» в контроль не входят. "
+                "После расчёта сумма нового плана категории ниже минимума будет жёлтой, выше максимума — красной."
+            )
+            cycle_limits_upload = st.file_uploader(
+                "Загрузить отчёт Ср/знач (.xlsx)",
+                type=["xlsx"],
+                key="cycle_category_limits_upload_v751213",
+            )
+            if cycle_limits_upload is not None:
+                try:
+                    upload_bytes = cycle_limits_upload.getvalue()
+                    upload_digest = hashlib.sha256(upload_bytes).hexdigest()
+                    if st.session_state.get("cycle_category_limits_digest_v751213") != upload_digest:
+                        parsed_limits, limits_meta = parse_cycle_category_limits_report(upload_bytes)
+                        st.session_state["cycle_category_limits_frame_v751213"] = parsed_limits
+                        st.session_state["cycle_category_limits_meta_v751213"] = limits_meta
+                        st.session_state["cycle_category_limits_name_v751213"] = cycle_limits_upload.name
+                        st.session_state["cycle_category_limits_digest_v751213"] = upload_digest
+                        # Старый расчёт мог быть сделан без нового файла ограничений.
+                        st.session_state.pop("cycle_plan_result_v1", None)
+                        st.session_state.pop("cycle_plan_limit_summary_v751213", None)
+                    st.success(f"Ограничения загружены: {cycle_limits_upload.name}")
+                except Exception as error:
+                    st.error(f"Не удалось прочитать отчёт Ср/знач: {error}")
+
+            loaded_limits = st.session_state.get("cycle_category_limits_frame_v751213", pd.DataFrame())
+            loaded_limits_meta = st.session_state.get("cycle_category_limits_meta_v751213", {})
+            if isinstance(loaded_limits, pd.DataFrame) and not loaded_limits.empty:
+                limit_metrics = st.columns(4)
+                limit_metrics[0].metric("Точек", int(loaded_limits["point"].nunique()))
+                limit_metrics[1].metric("Категорий", int(loaded_limits["category"].nunique()))
+                limit_metrics[2].metric("Связок", int(len(loaded_limits)))
+                limit_metrics[3].metric(
+                    "Месяц",
+                    str(loaded_limits_meta.get("month_label") or loaded_limits_meta.get("month_key") or "—"),
+                )
+                period_from = loaded_limits_meta.get("period_start")
+                period_to = loaded_limits_meta.get("period_end")
+                if isinstance(period_from, date) and isinstance(period_to, date):
+                    st.caption(
+                        f"Источник ограничений: {period_from:%d.%m.%Y}–{period_to:%d.%m.%Y}. "
+                        "Ограничения применяются к соответствующему дню недели и, если в отчёте определён один месяц, только к этому месяцу."
+                    )
+                if st.button(
+                    "Очистить ограничения",
+                    key="cycle_category_limits_clear_v751213",
+                    use_container_width=False,
+                ):
+                    for state_key in (
+                        "cycle_category_limits_frame_v751213",
+                        "cycle_category_limits_meta_v751213",
+                        "cycle_category_limits_name_v751213",
+                        "cycle_category_limits_digest_v751213",
+                        "cycle_plan_result_v1",
+                        "cycle_plan_limit_summary_v751213",
+                    ):
+                        st.session_state.pop(state_key, None)
+                    st.rerun()
+            else:
+                st.info("Ограничения пока не загружены. Циклический план будет рассчитан по прежней логике без контроля Мин/Макс категории.")
+
+        with cycle_limits_preview_tab:
+            loaded_limits = st.session_state.get("cycle_category_limits_frame_v751213", pd.DataFrame())
+            if isinstance(loaded_limits, pd.DataFrame) and not loaded_limits.empty:
+                preview_limits = loaded_limits.rename(
+                    columns={
+                        "point": "Точка",
+                        "category": "Категория",
+                        "weekday": "День недели",
+                        "min_sales": "Мин, шт.",
+                        "avg_sales": "Среднее, шт.",
+                        "max_sales": "Макс, шт.",
+                    }
+                )
+                st.dataframe(
+                    preview_limits[["Точка", "Категория", "День недели", "Мин, шт.", "Среднее, шт.", "Макс, шт."]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.info("Загрузите отчёт во вкладке «Ограничения категорий».")
+
+        active_limits = st.session_state.get("cycle_category_limits_frame_v751213", pd.DataFrame())
+        if isinstance(active_limits, pd.DataFrame) and not active_limits.empty:
+            st.success(
+                "Контроль Мин/Макс категории активен. Новый план SKU сначала считается по циклической логике, "
+                "после чего сумма категории на точке сверяется с загруженным отчётом."
+            )
+        else:
+            st.warning("Контроль категорий не загружен — цветовые ограничения Мин/Макс применяться не будут.")
+
         matrix_bytes, matrix_source, matrix_checked_at, matrix_error = _load_matrix_context_for_active_tab()
         if not matrix_bytes:
             st.error("Текущая Матрица КОМБО недоступна.")
@@ -19906,6 +20421,14 @@ if tab_cycle_plan.open:
                                     cycle_sales,
                                     entities=cycle_entities,
                                 )
+                                active_limits = st.session_state.get(
+                                    "cycle_category_limits_frame_v751213", pd.DataFrame()
+                                )
+                                result, limit_summary = apply_cycle_category_limits(
+                                    result,
+                                    active_limits if isinstance(active_limits, pd.DataFrame) else pd.DataFrame(),
+                                )
+                                st.session_state["cycle_plan_limit_summary_v751213"] = limit_summary
                                 st.session_state["cycle_plan_result_v1"] = result
                                 st.session_state["cycle_plan_period_saved_v1"] = (cycle_start, cycle_end)
                                 st.session_state["cycle_plan_archive_error_v1"] = archive_error
@@ -19947,9 +20470,43 @@ if tab_cycle_plan.open:
                         )
                         metrics[4].metric("Проверить SKU", int(result["Статус"].eq("Проверить SKU").sum()))
 
+                        limit_summary = st.session_state.get(
+                            "cycle_plan_limit_summary_v751213", pd.DataFrame()
+                        )
+                        if isinstance(limit_summary, pd.DataFrame) and not limit_summary.empty:
+                            st.markdown("#### Контроль плана по Мин / Среднему / Макс категории")
+                            limit_status = limit_summary["Статус ограничения категории"].fillna("").astype(str)
+                            limit_metrics = st.columns(3)
+                            limit_metrics[0].metric("Ниже минимума", int(limit_status.eq("Ниже минимума").sum()))
+                            limit_metrics[1].metric("Выше максимума", int(limit_status.eq("Выше максимума").sum()))
+                            limit_metrics[2].metric("В диапазоне", int(limit_status.eq("В диапазоне").sum()))
+
+                            def _cycle_limit_summary_style(row):
+                                status_value = str(row.get("Статус ограничения категории", "") or "")
+                                if status_value == "Выше максимума":
+                                    return ["background-color: #f4cccc; color: #9c0006;"] * len(row)
+                                if status_value == "Ниже минимума":
+                                    return ["background-color: #fff2cc; color: #7f6000;"] * len(row)
+                                return [""] * len(row)
+
+                            st.dataframe(
+                                limit_summary.style.apply(_cycle_limit_summary_style, axis=1),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.caption(
+                                "Жёлтый: сумма плана категории на точке ниже исторического минимума этого дня недели. "
+                                "Красный: выше исторического максимума. Среднее используется как ориентир и само по себе цвет не меняет."
+                            )
+
                         def _cycle_style(row):
                             if str(row.get("Статус", "")) == "Проверить SKU":
                                 return ["background-color: #f4cccc; color: #9c0006;"] * len(row)
+                            limit_status_value = str(row.get("Статус ограничения категории", "") or "")
+                            if limit_status_value == "Выше максимума":
+                                return ["background-color: #f4cccc; color: #9c0006;"] * len(row)
+                            if limit_status_value == "Ниже минимума":
+                                return ["background-color: #fff2cc; color: #7f6000;"] * len(row)
                             if bool(row.get("Сопоставление неуверенное", False)):
                                 return ["background-color: #fce4d6; color: #9c5700;"] * len(row)
                             return [""] * len(row)
@@ -19960,7 +20517,8 @@ if tab_cycle_plan.open:
                             hide_index=True,
                         )
                         st.caption(
-                            "Красные строки не получают автоматический новый план. Excel выгружается в формате Матрицы КОМБО, как обычный «Прогноз плана»: основной лист меню + служебные листы расчёта."
+                            "В контроле категории: жёлтый = итог категории ниже Мин, красный = выше Макс. "
+                            "Красный статус сопоставления SKU по прежней логике также сохраняется. Excel выгружается в формате Матрицы КОМБО с листом контроля категорий."
                         )
 
                         st.download_button(
