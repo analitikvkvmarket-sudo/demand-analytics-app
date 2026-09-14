@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.13-CYCLE-CATEGORY-LIMITS"
+BUILD_ID = "75.12.14-REPORT-APPS-SCRIPT-FALLBACK"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -1313,6 +1313,126 @@ def get_current_entity_reference() -> tuple[pd.DataFrame, str, str, str, str]:
     raise RuntimeError(
         live_error or "Лист «Справочник» недоступен через Apps Script."
     )
+
+
+ENTITY_REFERENCE_SESSION_KEY = "entity_reference_snapshot_v751214"
+
+
+def _entity_reference_from_existing_analysis() -> pd.DataFrame:
+    """Emergency in-session fallback when Apps Script is temporarily unavailable.
+
+    The normal source remains the live «Справочник». This fallback only rebuilds the
+    minimal SKU/category/entity map from data that was already prepared successfully
+    earlier in the same Streamlit session. It prevents a tab switch from killing the
+    whole app because Apps Script returned a transient 404.
+    """
+    candidates: list[pd.DataFrame] = []
+
+    analysis_state = st.session_state.get("analysis")
+    if isinstance(analysis_state, (tuple, list)) and analysis_state:
+        first = analysis_state[0]
+        if isinstance(first, pd.DataFrame) and not first.empty:
+            candidates.append(first)
+
+    report_state = st.session_state.get("period_comparison_report_v770")
+    if isinstance(report_state, dict):
+        for key in ("frame_1", "frame_2"):
+            frame = report_state.get(key)
+            if isinstance(frame, pd.DataFrame) and not frame.empty:
+                candidates.append(frame)
+
+    rebuilt_parts: list[pd.DataFrame] = []
+    for frame in candidates:
+        if "sku" not in frame.columns:
+            continue
+        part = pd.DataFrame(index=frame.index)
+        part["sku"] = frame["sku"].map(normalize_sku)
+        if "product_name" in frame.columns:
+            part["entity_product_name"] = frame["product_name"].fillna("").astype(str).str.strip()
+        elif "entity_product_name" in frame.columns:
+            part["entity_product_name"] = frame["entity_product_name"].fillna("").astype(str).str.strip()
+        else:
+            part["entity_product_name"] = ""
+        part["category"] = (
+            frame["category"].fillna("Не сопоставлено").astype(str).str.strip()
+            if "category" in frame.columns
+            else "Не сопоставлено"
+        )
+        part["entity"] = (
+            frame["entity"].fillna("Не сопоставлено").astype(str).str.strip()
+            if "entity" in frame.columns
+            else "Не сопоставлено"
+        )
+        part["attribute_1"] = ""
+        part["attribute_2"] = ""
+        part["attribute_3"] = ""
+        part = part[part["sku"].notna()].copy()
+        if not part.empty:
+            rebuilt_parts.append(part)
+
+    if not rebuilt_parts:
+        return pd.DataFrame()
+
+    rebuilt = pd.concat(rebuilt_parts, ignore_index=True)
+    rebuilt = rebuilt.drop_duplicates("sku", keep="last").reset_index(drop=True)
+    return rebuilt[[
+        "sku", "entity_product_name", "category",
+        "attribute_1", "attribute_2", "attribute_3", "entity",
+    ]]
+
+
+def _store_entity_reference_in_session(
+    frame: pd.DataFrame,
+    source: str,
+    checked_at: str,
+    warning: str,
+    signature: str,
+) -> None:
+    st.session_state[ENTITY_REFERENCE_SESSION_KEY] = {
+        "frame": frame.copy(),
+        "source": str(source or ""),
+        "checked_at": str(checked_at or ""),
+        "warning": str(warning or ""),
+        "signature": str(signature or ""),
+    }
+
+
+def load_entity_reference_resilient() -> tuple[pd.DataFrame, str, str, str, str]:
+    """Load «Справочник» once per Streamlit session and survive transient API 404s."""
+    saved = st.session_state.get(ENTITY_REFERENCE_SESSION_KEY)
+    if isinstance(saved, dict):
+        saved_frame = saved.get("frame")
+        if isinstance(saved_frame, pd.DataFrame) and not saved_frame.empty:
+            return (
+                saved_frame.copy(),
+                str(saved.get("source") or ""),
+                str(saved.get("checked_at") or ""),
+                str(saved.get("warning") or ""),
+                str(saved.get("signature") or _entity_reference_signature(saved_frame)),
+            )
+
+    try:
+        result = get_current_entity_reference()
+        _store_entity_reference_in_session(*result)
+        return result
+    except Exception as error:
+        rebuilt = _entity_reference_from_existing_analysis()
+        if not rebuilt.empty:
+            checked_at = datetime.now().isoformat(timespec="seconds")
+            warning = (
+                "Apps Script сейчас недоступен, поэтому используется справочник из уже "
+                f"загруженного анализа этой сессии. Ошибка: {error}"
+            )
+            result = (
+                rebuilt,
+                "Резерв текущей сессии · ранее подготовленный анализ",
+                checked_at,
+                warning,
+                _entity_reference_signature(rebuilt),
+            )
+            _store_entity_reference_in_session(*result)
+            return result
+        raise
 
 
 def connection_settings() -> dict[str, object]:
@@ -9476,9 +9596,13 @@ try:
         entity_reference_checked_at,
         entity_reference_warning,
         entity_reference_signature,
-    ) = get_current_entity_reference()
+    ) = load_entity_reference_resilient()
 except Exception as error:
     st.error(f"Не удалось загрузить SKU/категории/сущности из матрицы 2.3: {error}")
+    st.caption(
+        "Это ошибка доступа к Apps Script, а не ошибка вкладки «Отчет». "
+        "Если справочник уже был загружен в текущей сессии, новая сборка использует его резервно."
+    )
     st.stop()
 
 today = date.today()
@@ -9495,14 +9619,32 @@ with st.sidebar:
     if entity_reference_checked_at:
         checked_label = str(entity_reference_checked_at).replace("T", " ")
         st.caption(f"Справочник проверен: {checked_label}")
+    if entity_reference_warning:
+        st.warning(entity_reference_warning)
     if st.button(
         "Обновить справочник сейчас",
         use_container_width=True,
-        key="refresh_entity_reference_now_v751133",
-        help="Сбрасывает только кэш SKU/категорий/сущностей и заново читает лист «Справочник» через Apps Script.",
+        key="refresh_entity_reference_now_v751214",
+        help=(
+            "Пробует заново прочитать лист «Справочник» через Apps Script. "
+            "Если запрос не пройдет, уже загруженный справочник останется в работе."
+        ),
     ):
+        previous_snapshot = st.session_state.get(ENTITY_REFERENCE_SESSION_KEY)
         _fetch_apps_script_entity_reference.clear()
-        st.rerun()
+        st.session_state.pop(ENTITY_REFERENCE_SESSION_KEY, None)
+        try:
+            refreshed_reference = get_current_entity_reference()
+            _store_entity_reference_in_session(*refreshed_reference)
+            st.toast("Справочник обновлен через Apps Script", icon="✅")
+            st.rerun()
+        except Exception as refresh_error:
+            if isinstance(previous_snapshot, dict):
+                st.session_state[ENTITY_REFERENCE_SESSION_KEY] = previous_snapshot
+            st.warning(
+                "Apps Script пока недоступен. Продолжаю работать с уже загруженным "
+                f"справочником. Ошибка: {refresh_error}"
+            )
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
         pg_host = st.text_input(
             "Сервер",
@@ -20412,7 +20554,7 @@ if tab_cycle_plan.open:
                                 )
 
                                 cycle_entities, cycle_entity_source, cycle_entity_checked_at, cycle_entity_error, _ = (
-                                    get_current_entity_reference()
+                                    load_entity_reference_resilient()
                                 )
 
                                 result = build_cycle_plan_v1(
