@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.23-ENTITY-REFERENCE-SKU"
+BUILD_ID = "75.12.24-ENTITY-STANDARD-SOURCE"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -14437,7 +14437,8 @@ if tab_entities.open:
         st.subheader("Расчёт потребления сущностей")
         st.caption(
             "Выберите период, категорию и одну или несколько сущностей. Состав каждой сущности берётся напрямую "
-            "из полного справочника SKU. Затем продажи всех этих SKU суммируются внутри точки и даты, а по дням недели "
+            "из полного справочника SKU. Факт берётся из того же дневного источника PostgreSQL, что и основной анализ приложения, "
+            "после чего SKU связывается со справочником. Затем продажи суммируются внутри точки и даты, а по дням недели "
             "считаются среднее и максимум. Рабочий день точки без продаж выбранной группы учитывается как 0."
         )
 
@@ -14446,7 +14447,7 @@ if tab_entities.open:
             entity_consumption_range = st.date_input(
                 "Период расчёта",
                 value=(period[0], period[1]),
-                key="entity_consumption_period_v751223",
+                key="entity_consumption_period_v751224",
             )
 
         entity_reference_for_consumption = entity_reference_tab.copy()
@@ -14459,13 +14460,13 @@ if tab_entities.open:
         with entity_consumption_controls[1]:
             if entity_consumption_categories:
                 entity_consumption_category = st.selectbox(
-                    "Категория", entity_consumption_categories, key="entity_consumption_category_v751223"
+                    "Категория", entity_consumption_categories, key="entity_consumption_category_v751224"
                 )
             else:
                 entity_consumption_category = None
                 st.selectbox(
                     "Категория", ["Справочник недоступен"], disabled=True,
-                    key="entity_consumption_category_empty_v751223",
+                    key="entity_consumption_category_empty_v751224",
                 )
 
         entity_consumption_entity_options = []
@@ -14484,14 +14485,14 @@ if tab_entities.open:
                     "Сущности",
                     entity_consumption_entity_options,
                     default=entity_consumption_entity_options[:1],
-                    key="entity_consumption_entities_v751223",
+                    key="entity_consumption_entities_v751224",
                     help="Можно выбрать несколько сущностей. В расчёт попадут ВСЕ SKU, закреплённые за ними в справочнике.",
                 )
             else:
                 entity_consumption_entities_selected = []
                 st.multiselect(
                     "Сущности", ["Нет доступных сущностей"], default=[], disabled=True,
-                    key="entity_consumption_entities_empty_v751223",
+                    key="entity_consumption_entities_empty_v751224",
                 )
 
         entity_consumption_period_valid = (
@@ -14550,24 +14551,17 @@ if tab_entities.open:
                     }
 
                     try:
-                        # Общая история нужна только для определения фактических рабочих дат точки.
+                        # Берём ТОТ ЖЕ дневной источник факта, на котором работает остальное приложение.
+                        # Сущность здесь не ищется повторным SQL по сырым кодам: сначала SKU нормализуется
+                        # общим загрузчиком, затем уже готовый SKU связывается со справочником.
                         entity_all_history = load_forecast_history(
                             entity_consumption_start,
                             entity_consumption_end + timedelta(days=1),
                             entity_consumption_shop_numbers,
                         ).copy()
-                        # Факт выбранных сущностей ищем по каждому возможному коду SQL-строки,
-                        # а не только по COALESCE-коду общего загрузчика.
-                        selected_entity_history = load_entity_sku_history(
-                            entity_consumption_start,
-                            entity_consumption_end + timedelta(days=1),
-                            entity_consumption_shop_numbers,
-                            selected_sku_tuple,
-                        ).copy()
                     except Exception as error:
                         st.error(f"Не удалось загрузить продажи для расчёта сущностей: {error}")
                         entity_all_history = pd.DataFrame()
-                        selected_entity_history = pd.DataFrame()
 
                     if entity_all_history.empty:
                         st.info("За выбранный период нет продаж для определения рабочих дней точек.")
@@ -14578,31 +14572,44 @@ if tab_entities.open:
                         entity_all_history["shop_number"] = pd.to_numeric(
                             entity_all_history["shop_number"], errors="coerce"
                         ).astype("Int64")
+                        entity_all_history["sku"] = entity_all_history["sku"].map(normalize_sku)
+                        entity_all_history["sold_quantity"] = pd.to_numeric(
+                            entity_all_history["sold_quantity"], errors="coerce"
+                        ).fillna(0.0).clip(lower=0.0)
                         entity_all_history = entity_all_history[
-                            entity_all_history["business_date"].notna() & entity_all_history["shop_number"].notna()
+                            entity_all_history["business_date"].notna()
+                            & entity_all_history["shop_number"].notna()
+                            & entity_all_history["sku"].notna()
                         ].copy()
+
+                        # Рабочий день точки определяем по всему факту продаж.
                         entity_active_days = entity_all_history[["shop_number", "business_date"]].drop_duplicates()
 
-                        if selected_entity_history.empty:
-                            selected_entity_history = pd.DataFrame(
-                                columns=["business_date", "shop_number", "sku", "product_name", "sold_quantity", "revenue"]
-                            )
-                        else:
-                            selected_entity_history["business_date"] = pd.to_datetime(
-                                selected_entity_history["business_date"], errors="coerce"
-                            ).dt.date
-                            selected_entity_history["shop_number"] = pd.to_numeric(
-                                selected_entity_history["shop_number"], errors="coerce"
-                            ).astype("Int64")
-                            selected_entity_history["sku"] = selected_entity_history["sku"].map(normalize_sku)
-                            selected_entity_history["sold_quantity"] = pd.to_numeric(
-                                selected_entity_history["sold_quantity"], errors="coerce"
-                            ).fillna(0.0).clip(lower=0.0)
-                            selected_entity_history = selected_entity_history[
-                                selected_entity_history["business_date"].notna()
-                                & selected_entity_history["shop_number"].notna()
-                                & selected_entity_history["sku"].notna()
-                            ].copy()
+                        # Полный справочник задаёт принадлежность SKU к категории/сущности.
+                        # Факт НЕ определяется по названию блюда и НЕ сравнивается с сырыми кодовыми полями.
+                        entity_membership = entity_reference_for_consumption[["sku", "category", "entity"]].copy()
+                        entity_membership["sku"] = entity_membership["sku"].map(normalize_sku)
+                        entity_membership = (
+                            entity_membership[entity_membership["sku"].notna()]
+                            .drop_duplicates("sku", keep="last")
+                            .reset_index(drop=True)
+                        )
+                        entity_history_enriched = entity_all_history.merge(
+                            entity_membership,
+                            on="sku",
+                            how="left",
+                            validate="many_to_one",
+                        )
+                        entity_history_enriched["category"] = (
+                            entity_history_enriched["category"].fillna("Не сопоставлено").astype(str).str.strip()
+                        )
+                        entity_history_enriched["entity"] = (
+                            entity_history_enriched["entity"].fillna("Не задана").astype(str).str.strip()
+                        )
+                        selected_entity_history = entity_history_enriched[
+                            entity_history_enriched["category"].eq(entity_consumption_category)
+                            & entity_history_enriched["entity"].isin(selected_entity_set)
+                        ].copy()
 
                         entity_daily_sales = (
                             selected_entity_history.groupby(["shop_number", "business_date"], as_index=False)["sold_quantity"].sum()
@@ -14686,7 +14693,7 @@ if tab_entities.open:
                         st.caption(
                             f"Период: {entity_consumption_start:%d.%m.%Y}–{entity_consumption_end:%d.%m.%Y}. "
                             f"В справочнике для выбранных сущностей: {len(selected_sku_tuple)} SKU. "
-                            "Все эти SKU участвуют в поиске продаж по всем четырём кодовым полям PostgreSQL."
+                            "Продажи берутся из основного дневного источника приложения и связываются со справочником по нормализованному SKU."
                         )
 
                         sku_fact = (
@@ -14847,19 +14854,19 @@ if tab_entities.open:
                         )
                         if st.button(
                             "Сформировать Excel", type="primary", use_container_width=True,
-                            key="entity_consumption_build_excel_v751223",
+                            key="entity_consumption_build_excel_v751224",
                         ):
                             try:
-                                st.session_state["entity_consumption_excel_v751223"] = _build_entity_consumption_excel()
-                                st.session_state["entity_consumption_excel_signature_v751223"] = entity_report_signature
-                                st.session_state.pop("entity_consumption_excel_error_v751223", None)
+                                st.session_state["entity_consumption_excel_v751224"] = _build_entity_consumption_excel()
+                                st.session_state["entity_consumption_excel_signature_v751224"] = entity_report_signature
+                                st.session_state.pop("entity_consumption_excel_error_v751224", None)
                             except Exception as error:
-                                st.session_state["entity_consumption_excel_error_v751223"] = str(error)
-                        entity_excel_error = st.session_state.get("entity_consumption_excel_error_v751223")
+                                st.session_state["entity_consumption_excel_error_v751224"] = str(error)
+                        entity_excel_error = st.session_state.get("entity_consumption_excel_error_v751224")
                         if entity_excel_error:
                             st.error(f"Не удалось сформировать Excel: {entity_excel_error}")
-                        entity_excel_bytes = st.session_state.get("entity_consumption_excel_v751223")
-                        entity_excel_signature = st.session_state.get("entity_consumption_excel_signature_v751223")
+                        entity_excel_bytes = st.session_state.get("entity_consumption_excel_v751224")
+                        entity_excel_signature = st.session_state.get("entity_consumption_excel_signature_v751224")
                         if entity_excel_bytes and entity_excel_signature == entity_report_signature:
                             safe_entity_name = re.sub(
                                 r"[^0-9A-Za-zА-Яа-яЁё_-]+", "_", "_".join(entity_consumption_entities_selected)
@@ -14871,7 +14878,7 @@ if tab_entities.open:
                                     f"{entity_consumption_start:%Y-%m-%d}_{entity_consumption_end:%Y-%m-%d}.xlsx"
                                 ),
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                                key="entity_consumption_download_excel_v751223",
+                                key="entity_consumption_download_excel_v751224",
                                 use_container_width=True,
                             )
 
