@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.21-ENTITY-MULTI-TABLE"
+BUILD_ID = "75.12.23-ENTITY-REFERENCE-SKU"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -1993,6 +1993,86 @@ def load_forecast_history(date_from: date, date_to_exclusive: date, points: tupl
             cursor.execute(
                 query,
                 {"date_from": date_from, "date_to": date_to_exclusive, "points": list(points)},
+            )
+            records = cursor.fetchall()
+            columns = [description.name for description in cursor.description]
+    return _normalize_sales_frame(pd.DataFrame(records, columns=columns))
+
+
+@st.cache_data(ttl=3600, show_spinner="Загружаю продажи SKU выбранных сущностей…")
+def load_entity_sku_history(
+    date_from: date,
+    date_to_exclusive: date,
+    points: tuple[int, ...],
+    selected_skus: tuple[str, ...],
+) -> pd.DataFrame:
+    """Load sales for the exact reference SKUs of selected entities.
+
+    Important: the matrix SKU can live in any of the four source-code columns.
+    The generic history loader chooses only the first non-empty code via COALESCE,
+    which can hide a matrix SKU when another code is populated before it.
+    Here every reference SKU is matched against erp_code/product_code/barcode/product_hash.
+    """
+    if not points or not selected_skus:
+        return pd.DataFrame(
+            columns=[
+                "business_date", "sale_datetime", "shop_number", "sku",
+                "product_name", "sold_quantity", "revenue",
+            ]
+        )
+    query = """
+        WITH matched AS (
+            SELECT
+                business_date,
+                sale_datetime,
+                shop_number,
+                product_name,
+                net_quantity,
+                net_line_amount,
+                CASE
+                    WHEN NULLIF(TRIM(erp_code), '') = ANY(%(skus)s)
+                        THEN NULLIF(TRIM(erp_code), '')
+                    WHEN NULLIF(TRIM(product_code), '') = ANY(%(skus)s)
+                        THEN NULLIF(TRIM(product_code), '')
+                    WHEN NULLIF(TRIM(barcode), '') = ANY(%(skus)s)
+                        THEN NULLIF(TRIM(barcode), '')
+                    WHEN NULLIF(TRIM(product_hash), '') = ANY(%(skus)s)
+                        THEN NULLIF(TRIM(product_hash), '')
+                    ELSE NULL
+                END AS matched_sku
+            FROM dwh.v_sales_item
+            WHERE business_date >= %(date_from)s
+              AND business_date < %(date_to)s
+              AND shop_number = ANY(%(points)s)
+              AND (
+                    NULLIF(TRIM(erp_code), '') = ANY(%(skus)s)
+                 OR NULLIF(TRIM(product_code), '') = ANY(%(skus)s)
+                 OR NULLIF(TRIM(barcode), '') = ANY(%(skus)s)
+                 OR NULLIF(TRIM(product_hash), '') = ANY(%(skus)s)
+              )
+        )
+        SELECT
+            business_date,
+            MAX(sale_datetime) AS sale_datetime,
+            shop_number,
+            matched_sku AS sku,
+            MAX(product_name) AS product_name,
+            SUM(net_quantity)::numeric AS sold_quantity,
+            SUM(net_line_amount)::numeric AS revenue
+        FROM matched
+        WHERE matched_sku IS NOT NULL
+        GROUP BY business_date, shop_number, matched_sku
+    """
+    with pg_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                query,
+                {
+                    "date_from": date_from,
+                    "date_to": date_to_exclusive,
+                    "points": list(points),
+                    "skus": list(selected_skus),
+                },
             )
             records = cursor.fetchall()
             columns = [description.name for description in cursor.description]
@@ -14186,25 +14266,84 @@ if tab_points.open:
 
 if tab_entities.open:
     with tab_entities:
-        entity_overall = (
-            filtered_sku.groupby(["category", "entity"], as_index=False)
+        # Справочник — источник принадлежности SKU к сущности. Продажи только добавляют факт.
+        reference_columns = [
+            "sku", "category", "entity", "entity_product_name",
+            "attribute_1", "attribute_2", "attribute_3",
+        ]
+        if isinstance(entities, pd.DataFrame) and not entities.empty:
+            entity_reference_tab = entities.copy()
+            for required_column in reference_columns:
+                if required_column not in entity_reference_tab.columns:
+                    entity_reference_tab[required_column] = ""
+            entity_reference_tab = entity_reference_tab[reference_columns].copy()
+        elif isinstance(sku_point, pd.DataFrame) and not sku_point.empty:
+            entity_reference_tab = sku_point.copy()
+            if "entity_product_name" not in entity_reference_tab.columns:
+                entity_reference_tab["entity_product_name"] = entity_reference_tab.get("product_name", "")
+            for required_column in reference_columns:
+                if required_column not in entity_reference_tab.columns:
+                    entity_reference_tab[required_column] = ""
+            entity_reference_tab = entity_reference_tab[reference_columns].copy()
+        else:
+            entity_reference_tab = pd.DataFrame(columns=reference_columns)
+
+        if not entity_reference_tab.empty:
+            entity_reference_tab["sku"] = entity_reference_tab["sku"].map(normalize_sku)
+            entity_reference_tab["category"] = entity_reference_tab["category"].fillna("Не сопоставлено").astype(str).str.strip()
+            entity_reference_tab["entity"] = entity_reference_tab["entity"].fillna("Не задана").astype(str).str.strip()
+            entity_reference_tab["entity_product_name"] = entity_reference_tab["entity_product_name"].fillna("").astype(str).str.strip()
+            entity_reference_tab = (
+                entity_reference_tab[entity_reference_tab["sku"].notna()]
+                .drop_duplicates("sku", keep="last")
+                .reset_index(drop=True)
+            )
+
+        sales_by_sku = (
+            filtered_sku.groupby(["sku"], as_index=False, dropna=False)
             .agg(
-                entity_sales=("sales", "sum"),
+                sold_quantity=("sales", "sum"),
+                revenue=("revenue", "sum"),
+                points_count=("point", "nunique"),
+            )
+        ) if not filtered_sku.empty else pd.DataFrame(columns=["sku", "sold_quantity", "revenue", "points_count"])
+        if not sales_by_sku.empty:
+            sales_by_sku["sku"] = sales_by_sku["sku"].map(normalize_sku)
+            sales_by_sku = sales_by_sku[sales_by_sku["sku"].notna()].groupby("sku", as_index=False).agg(
+                sold_quantity=("sold_quantity", "sum"),
+                revenue=("revenue", "sum"),
+                points_count=("points_count", "max"),
+            )
+
+        entity_sku_detail = entity_reference_tab.merge(sales_by_sku, on="sku", how="left")
+        for numeric_column in ["sold_quantity", "revenue", "points_count"]:
+            entity_sku_detail[numeric_column] = pd.to_numeric(
+                entity_sku_detail.get(numeric_column), errors="coerce"
+            ).fillna(0.0)
+        entity_sku_detail["sold_flag"] = entity_sku_detail["sold_quantity"].gt(0).astype(int)
+
+        entity_overall = (
+            entity_sku_detail.groupby(["category", "entity"], as_index=False, dropna=False)
+            .agg(
+                entity_sales=("sold_quantity", "sum"),
                 entity_revenue=("revenue", "sum"),
-                active_sku=("sku", "nunique"),
+                reference_sku=("sku", "nunique"),
+                sold_sku=("sold_flag", "sum"),
             )
         )
-        entity_overall["category_sales"] = entity_overall.groupby("category")["entity_sales"].transform("sum")
-        entity_overall["entity_share_category"] = (
-            entity_overall["entity_sales"] / entity_overall["category_sales"].replace(0, pd.NA)
-        )
-        entity_overall["entity_rank_category"] = (
-            entity_overall.groupby("category")["entity_sales"].rank(method="first", ascending=False).astype(int)
-        )
-        entity_overall["dominant"] = entity_overall["entity_rank_category"].map(
-            lambda rank: "Да" if rank == 1 else "Нет"
-        )
-        entity_overall = entity_overall.sort_values(["category", "entity_rank_category"])
+        if not entity_overall.empty:
+            entity_overall["category_sales"] = entity_overall.groupby("category")["entity_sales"].transform("sum")
+            entity_overall["entity_share_category"] = (
+                entity_overall["entity_sales"] / entity_overall["category_sales"].replace(0, pd.NA)
+            )
+            entity_overall["entity_rank_category"] = (
+                entity_overall.groupby("category")["entity_sales"].rank(method="first", ascending=False).astype(int)
+            )
+            entity_overall["dominant"] = entity_overall["entity_rank_category"].map(
+                lambda rank: "Да" if rank == 1 else "Нет"
+            )
+            entity_overall = entity_overall.sort_values(["category", "entity_rank_category"])
+
         entity_display = entity_overall.rename(
             columns={
                 "category": "Категория",
@@ -14214,111 +14353,75 @@ if tab_entities.open:
                 "entity_sales": "Продано, шт.",
                 "entity_revenue": "Выручка, ₽",
                 "entity_share_category": "Доля сущности в категории",
-                "active_sku": "Активных SKU",
+                "reference_sku": "SKU в справочнике",
+                "sold_sku": "SKU с продажами",
             }
         )
-        st.caption("Общий анализ по всем выбранным точкам. Доли сущностей рассчитаны внутри соответствующей категории.")
-        st.dataframe(
-            entity_display[
-                [
-                    "Категория",
-                    "Место в категории",
-                    "Преобладающая сущность",
-                    "Сущность",
-                    "Продано, шт.",
-                    "Доля сущности в категории",
-                    "Выручка, ₽",
-                    "Активных SKU",
-                ]
-            ].style.format(
-                {
-                    "Продано, шт.": "{:,.0f}",
-                    "Доля сущности в категории": "{:.1%}",
-                    "Выручка, ₽": "{:,.0f}",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
+        st.caption(
+            "Принадлежность SKU к сущности берётся из полного листа «Справочник». "
+            "Продажи за выбранный период только добавляются к этому составу, поэтому SKU без продаж тоже видны."
         )
+        if not entity_display.empty:
+            st.dataframe(
+                entity_display[
+                    [
+                        "Категория", "Место в категории", "Преобладающая сущность", "Сущность",
+                        "Продано, шт.", "Доля сущности в категории", "Выручка, ₽",
+                        "SKU в справочнике", "SKU с продажами",
+                    ]
+                ].style.format(
+                    {
+                        "Продано, шт.": "{:,.0f}",
+                        "Доля сущности в категории": "{:.1%}",
+                        "Выручка, ₽": "{:,.0f}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
 
-        # Раскрытие сущности до конкретных SKU. Используем тот же filtered_sku,
-        # поэтому список и количества полностью соответствуют выбранным точкам и категориям.
         st.markdown("### Состав сущностей по SKU")
         st.caption(
-            "Раскройте сущность — внутри показаны все SKU, которые к ней относятся, "
-            "их названия и количество проданного за выбранный период."
+            "Раскрытие показывает полный состав сущности по справочнику, а не только SKU, которые встретились в продажах."
         )
-
-        entity_sku_detail = (
-            filtered_sku.groupby(
-                ["category", "entity", "sku", "product_name"],
-                as_index=False,
-                dropna=False,
-            )
-            .agg(
-                sold_quantity=("sales", "sum"),
-                revenue=("revenue", "sum"),
-                points_count=("point", "nunique"),
-            )
-        )
-
         if entity_sku_detail.empty:
-            st.info("Для выбранных фильтров нет продаж по сущностям.")
+            st.info("Справочник сущностей пуст или временно недоступен.")
         else:
-            entity_sku_detail["category"] = entity_sku_detail["category"].fillna("Не сопоставлено").astype(str)
-            entity_sku_detail["entity"] = entity_sku_detail["entity"].fillna("Не сопоставлено").astype(str)
-            entity_sku_detail["product_name"] = entity_sku_detail["product_name"].fillna("").astype(str)
-
-            entity_order = entity_overall.copy()
-            entity_order["category"] = entity_order["category"].fillna("Не сопоставлено").astype(str)
-            entity_order["entity"] = entity_order["entity"].fillna("Не сопоставлено").astype(str)
-            entity_order = entity_order.sort_values(
-                ["category", "entity_sales"],
-                ascending=[True, False],
-                kind="stable",
+            entity_order = entity_overall.copy().sort_values(
+                ["category", "entity_sales", "entity"], ascending=[True, False, True], kind="stable"
             )
-
             for entity_category in entity_order["category"].drop_duplicates().tolist():
                 st.markdown(f"#### {entity_category}")
                 category_entities = entity_order[entity_order["category"].eq(entity_category)]
-
                 for entity_row in category_entities.itertuples(index=False):
                     entity_name = str(entity_row.entity)
                     entity_sales_total = float(entity_row.entity_sales)
-                    entity_sku_count = int(entity_row.active_sku)
+                    entity_sku_count = int(entity_row.reference_sku)
+                    entity_sold_sku_count = int(entity_row.sold_sku)
                     expander_title = (
-                        f"{entity_name} · {entity_sales_total:,.0f} шт. · {entity_sku_count} SKU"
+                        f"{entity_name} · {entity_sales_total:,.0f} шт. · "
+                        f"{entity_sku_count} SKU в справочнике · {entity_sold_sku_count} с продажами"
                     ).replace(",", " ")
-
                     with st.expander(expander_title, expanded=False):
                         current_entity_skus = entity_sku_detail[
                             entity_sku_detail["category"].eq(entity_category)
                             & entity_sku_detail["entity"].eq(entity_name)
                         ].copy()
                         current_entity_skus = current_entity_skus.sort_values(
-                            ["sold_quantity", "product_name", "sku"],
-                            ascending=[False, True, True],
-                            kind="stable",
+                            ["sold_quantity", "entity_product_name", "sku"],
+                            ascending=[False, True, True], kind="stable",
                         )
                         sku_display = current_entity_skus.rename(
                             columns={
                                 "sku": "SKU",
-                                "product_name": "Название товара",
+                                "entity_product_name": "Название товара",
                                 "sold_quantity": "Продано, шт.",
                                 "revenue": "Выручка, ₽",
                                 "points_count": "Точек с продажами",
                             }
                         )
                         st.dataframe(
-                            sku_display[
-                                [
-                                    "SKU",
-                                    "Название товара",
-                                    "Продано, шт.",
-                                    "Выручка, ₽",
-                                    "Точек с продажами",
-                                ]
-                            ],
+                            sku_display[["SKU", "Название товара", "Продано, шт.", "Выручка, ₽", "Точек с продажами"]],
                             use_container_width=True,
                             hide_index=True,
                             column_config={
@@ -14330,14 +14433,12 @@ if tab_entities.open:
                             },
                         )
 
-
         st.divider()
         st.subheader("Расчёт потребления сущностей")
         st.caption(
-            "Выберите период, категорию и одну или несколько сущностей. Таблица считает их совместное "
-            "потребление: сначала продажи выбранных сущностей суммируются внутри каждой точки и даты, "
-            "затем по каждому дню недели рассчитываются среднее и максимум. Если точка работала, но "
-            "ни одна из выбранных сущностей не продавалась, в среднем учитывается 0."
+            "Выберите период, категорию и одну или несколько сущностей. Состав каждой сущности берётся напрямую "
+            "из полного справочника SKU. Затем продажи всех этих SKU суммируются внутри точки и даты, а по дням недели "
+            "считаются среднее и максимум. Рабочий день точки без продаж выбранной группы учитывается как 0."
         )
 
         entity_consumption_controls = st.columns([1.45, 1.15, 1.8])
@@ -14345,64 +14446,26 @@ if tab_entities.open:
             entity_consumption_range = st.date_input(
                 "Период расчёта",
                 value=(period[0], period[1]),
-                key="entity_consumption_period_v751221",
+                key="entity_consumption_period_v751223",
             )
 
-        entity_reference_frames = []
-        if isinstance(entities, pd.DataFrame) and not entities.empty:
-            live_entity_reference = entities.copy()
-            for required_column in ["sku", "category", "entity"]:
-                if required_column not in live_entity_reference.columns:
-                    live_entity_reference[required_column] = pd.NA
-            live_entity_reference = live_entity_reference[["sku", "category", "entity"]].copy()
-            live_entity_reference["_source_priority"] = 0
-            entity_reference_frames.append(live_entity_reference)
-        if isinstance(sku_point, pd.DataFrame) and not sku_point.empty:
-            session_entity_reference = sku_point[["sku", "category", "entity"]].copy()
-            session_entity_reference["_source_priority"] = 1
-            entity_reference_frames.append(session_entity_reference)
-
-        entity_reference_for_consumption = (
-            pd.concat(entity_reference_frames, ignore_index=True)
-            if entity_reference_frames else pd.DataFrame(columns=["sku", "category", "entity"])
+        entity_reference_for_consumption = entity_reference_tab.copy()
+        entity_consumption_categories = sorted(
+            value
+            for value in entity_reference_for_consumption.get("category", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()
+            if value and value not in {"Не сопоставлено", "Не задана"}
         )
-        if not entity_reference_for_consumption.empty:
-            entity_reference_for_consumption["category"] = (
-                entity_reference_for_consumption["category"].fillna("Не сопоставлено").astype(str).str.strip()
-            )
-            entity_reference_for_consumption["entity"] = (
-                entity_reference_for_consumption["entity"].fillna("Не сопоставлено").astype(str).str.strip()
-            )
-            entity_reference_for_consumption["sku"] = entity_reference_for_consumption["sku"].map(normalize_sku)
-            entity_reference_for_consumption = (
-                entity_reference_for_consumption.sort_values("_source_priority", kind="stable")
-                .drop_duplicates("sku", keep="first")
-                .drop(columns=["_source_priority"], errors="ignore")
-                .reset_index(drop=True)
-            )
-
-        entity_consumption_categories = []
-        if not entity_reference_for_consumption.empty:
-            entity_consumption_categories = sorted(
-                value
-                for value in entity_reference_for_consumption["category"].dropna().astype(str).unique().tolist()
-                if value and value != "Не сопоставлено"
-            )
 
         with entity_consumption_controls[1]:
             if entity_consumption_categories:
                 entity_consumption_category = st.selectbox(
-                    "Категория",
-                    entity_consumption_categories,
-                    key="entity_consumption_category_v751221",
+                    "Категория", entity_consumption_categories, key="entity_consumption_category_v751223"
                 )
             else:
                 entity_consumption_category = None
                 st.selectbox(
-                    "Категория",
-                    ["Справочник недоступен"],
-                    disabled=True,
-                    key="entity_consumption_category_empty_v751221",
+                    "Категория", ["Справочник недоступен"], disabled=True,
+                    key="entity_consumption_category_empty_v751223",
                 )
 
         entity_consumption_entity_options = []
@@ -14412,7 +14475,7 @@ if tab_entities.open:
                 for value in entity_reference_for_consumption.loc[
                     entity_reference_for_consumption["category"].eq(entity_consumption_category), "entity"
                 ].dropna().astype(str).unique().tolist()
-                if value and value != "Не сопоставлено"
+                if value and value not in {"Не сопоставлено", "Не задана"}
             )
 
         with entity_consumption_controls[2]:
@@ -14421,22 +14484,18 @@ if tab_entities.open:
                     "Сущности",
                     entity_consumption_entity_options,
                     default=entity_consumption_entity_options[:1],
-                    key="entity_consumption_entities_v751221",
-                    help="Можно выбрать несколько сущностей. Их продажи суммируются на каждой точке и дате до расчёта среднего и максимума.",
+                    key="entity_consumption_entities_v751223",
+                    help="Можно выбрать несколько сущностей. В расчёт попадут ВСЕ SKU, закреплённые за ними в справочнике.",
                 )
             else:
                 entity_consumption_entities_selected = []
                 st.multiselect(
-                    "Сущности",
-                    ["Нет доступных сущностей"],
-                    default=[],
-                    disabled=True,
-                    key="entity_consumption_entities_empty_v751221",
+                    "Сущности", ["Нет доступных сущностей"], default=[], disabled=True,
+                    key="entity_consumption_entities_empty_v751223",
                 )
 
         entity_consumption_period_valid = (
-            isinstance(entity_consumption_range, (tuple, list))
-            and len(entity_consumption_range) == 2
+            isinstance(entity_consumption_range, (tuple, list)) and len(entity_consumption_range) == 2
         )
         if not entity_consumption_period_valid:
             st.info("Укажите начальную и конечную дату периода расчёта.")
@@ -14449,395 +14508,372 @@ if tab_entities.open:
             if entity_consumption_start > entity_consumption_end:
                 entity_consumption_start, entity_consumption_end = entity_consumption_end, entity_consumption_start
 
-            try:
-                entity_consumption_shops = load_available_shops(
-                    entity_consumption_start,
-                    entity_consumption_end + timedelta(days=1),
-                ).copy()
-            except Exception as error:
-                st.error(f"Не удалось получить список точек для расчёта сущностей: {error}")
-                entity_consumption_shops = pd.DataFrame()
+            selected_entity_set = {str(value).strip() for value in entity_consumption_entities_selected}
+            selected_reference = entity_reference_for_consumption[
+                entity_reference_for_consumption["category"].eq(entity_consumption_category)
+                & entity_reference_for_consumption["entity"].isin(selected_entity_set)
+            ].copy()
+            selected_reference = selected_reference.drop_duplicates("sku", keep="last").reset_index(drop=True)
+            selected_sku_tuple = tuple(sorted(selected_reference["sku"].dropna().astype(str).unique().tolist()))
 
-            if entity_consumption_shops.empty:
-                st.info("За выбранный период точки продаж не найдены.")
+            if not selected_sku_tuple:
+                st.error("В справочнике не найдено ни одного SKU для выбранных сущностей.")
             else:
-                entity_consumption_shop_numbers = tuple(
-                    sorted(
-                        {
-                            int(value)
-                            for value in pd.to_numeric(
-                                entity_consumption_shops.get("shop_number", pd.Series(dtype=float)),
-                                errors="coerce",
-                            ).dropna().tolist()
-                            if int(value) > 0
-                        }
-                    )
-                )
-                current_entity_point_mapping = {
-                    int(raw): str(label).strip()
-                    for raw, label in st.session_state.get("point_mapping", {}).items()
-                    if str(raw).isdigit() and str(label).strip()
-                }
-                entity_consumption_point_mapping = {
-                    raw: current_entity_point_mapping.get(raw, f"Т{raw}")
-                    for raw in entity_consumption_shop_numbers
-                }
-
                 try:
-                    entity_consumption_history = load_forecast_history(
-                        entity_consumption_start,
-                        entity_consumption_end + timedelta(days=1),
-                        entity_consumption_shop_numbers,
+                    entity_consumption_shops = load_available_shops(
+                        entity_consumption_start, entity_consumption_end + timedelta(days=1)
                     ).copy()
                 except Exception as error:
-                    st.error(f"Не удалось загрузить продажи для расчёта сущностей: {error}")
-                    entity_consumption_history = pd.DataFrame()
+                    st.error(f"Не удалось получить список точек для расчёта сущностей: {error}")
+                    entity_consumption_shops = pd.DataFrame()
 
-                if entity_consumption_history.empty:
-                    st.info("За выбранный период нет продаж для расчёта.")
+                if entity_consumption_shops.empty:
+                    st.info("За выбранный период точки продаж не найдены.")
                 else:
-                    entity_consumption_history["business_date"] = pd.to_datetime(
-                        entity_consumption_history["business_date"], errors="coerce"
-                    ).dt.date
-                    entity_consumption_history["shop_number"] = pd.to_numeric(
-                        entity_consumption_history["shop_number"], errors="coerce"
-                    ).astype("Int64")
-                    entity_consumption_history["sku"] = entity_consumption_history["sku"].map(normalize_sku)
-                    entity_consumption_history["sold_quantity"] = pd.to_numeric(
-                        entity_consumption_history["sold_quantity"], errors="coerce"
-                    ).fillna(0.0)
-                    entity_consumption_history = entity_consumption_history[
-                        entity_consumption_history["business_date"].notna()
-                        & entity_consumption_history["shop_number"].notna()
-                    ].copy()
-
-                    entity_consumption_reference = entity_reference_for_consumption[
-                        ["sku", "category", "entity"]
-                    ].drop_duplicates("sku", keep="last")
-                    entity_consumption_history = entity_consumption_history.merge(
-                        entity_consumption_reference,
-                        on="sku",
-                        how="left",
-                        validate="many_to_one",
+                    entity_consumption_shop_numbers = tuple(
+                        sorted({
+                            int(value)
+                            for value in pd.to_numeric(
+                                entity_consumption_shops.get("shop_number", pd.Series(dtype=float)), errors="coerce"
+                            ).dropna().tolist()
+                            if int(value) > 0
+                        })
                     )
-                    entity_consumption_history["category"] = (
-                        entity_consumption_history["category"].fillna("Не сопоставлено").astype(str)
-                    )
-                    entity_consumption_history["entity"] = (
-                        entity_consumption_history["entity"].fillna("Не сопоставлено").astype(str)
-                    )
-
-                    # Рабочий день точки = PostgreSQL вернул по ней хотя бы один SKU в эту дату.
-                    # Поэтому отсутствие выбранных сущностей в рабочий день превращается в 0 и влияет на среднее.
-                    entity_active_days = entity_consumption_history[
-                        ["shop_number", "business_date"]
-                    ].drop_duplicates()
-
-                    selected_entity_history = entity_consumption_history[
-                        entity_consumption_history["category"].eq(entity_consumption_category)
-                        & entity_consumption_history["entity"].isin(entity_consumption_entities_selected)
-                    ].copy()
-                    entity_daily_sales = (
-                        selected_entity_history.groupby(
-                            ["shop_number", "business_date"], as_index=False
-                        )["sold_quantity"].sum()
-                        .rename(columns={"sold_quantity": "entity_sales"})
-                    )
-                    entity_daily_grid = entity_active_days.merge(
-                        entity_daily_sales,
-                        on=["shop_number", "business_date"],
-                        how="left",
-                    )
-                    entity_daily_grid["entity_sales"] = pd.to_numeric(
-                        entity_daily_grid["entity_sales"], errors="coerce"
-                    ).fillna(0.0).clip(lower=0.0)
-                    entity_daily_grid["weekday_number"] = entity_daily_grid["business_date"].map(
-                        lambda value: int(value.weekday())
-                    )
-                    entity_weekday_short = {
-                        0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт",
-                        4: "Пт", 5: "Сб", 6: "Вс",
+                    current_entity_point_mapping = {
+                        int(raw): str(label).strip()
+                        for raw, label in st.session_state.get("point_mapping", {}).items()
+                        if str(raw).isdigit() and str(label).strip()
                     }
-                    entity_daily_grid["День недели"] = entity_daily_grid["weekday_number"].map(
-                        entity_weekday_short
-                    )
-                    entity_daily_grid["Точка"] = entity_daily_grid["shop_number"].astype(int).map(
-                        entity_consumption_point_mapping
-                    )
-
-                    entity_point_summary = (
-                        entity_daily_grid.groupby(
-                            ["shop_number", "Точка", "weekday_number", "День недели"],
-                            as_index=False,
-                        )
-                        .agg(
-                            average_sales=("entity_sales", "mean"),
-                            max_sales=("entity_sales", "max"),
-                            active_days=("business_date", "nunique"),
-                        )
-                    )
-
-                    # Итог сети: сначала суммируем выбранные сущности всех точек на каждой дате,
-                    # потом считаем среднее/максимум по дням недели. Это не среднее от средних точек.
-                    entity_network_daily = (
-                        entity_daily_grid.groupby("business_date", as_index=False)["entity_sales"].sum()
-                    )
-                    entity_network_daily["weekday_number"] = entity_network_daily["business_date"].map(
-                        lambda value: int(value.weekday())
-                    )
-                    entity_network_daily["День недели"] = entity_network_daily["weekday_number"].map(
-                        entity_weekday_short
-                    )
-                    entity_network_summary = (
-                        entity_network_daily.groupby(
-                            ["weekday_number", "День недели"], as_index=False
-                        )
-                        .agg(
-                            average_sales=("entity_sales", "mean"),
-                            max_sales=("entity_sales", "max"),
-                            active_days=("business_date", "nunique"),
-                        )
-                    )
-
-                    entity_summary_lookup = {
-                        (int(row.shop_number), int(row.weekday_number)): row
-                        for row in entity_point_summary.itertuples(index=False)
+                    entity_consumption_point_mapping = {
+                        raw: current_entity_point_mapping.get(raw, f"Т{raw}")
+                        for raw in entity_consumption_shop_numbers
                     }
-                    entity_network_lookup = {
-                        int(row.weekday_number): row
-                        for row in entity_network_summary.itertuples(index=False)
-                    }
-                    entity_summary_rows = []
-                    active_raw_points = sorted(
-                        entity_daily_grid["shop_number"].dropna().astype(int).unique().tolist()
-                    )
-                    for raw_point in active_raw_points:
-                        point_label = entity_consumption_point_mapping.get(raw_point, f"Т{raw_point}")
-                        for metric_name, metric_column in [
-                            ("Среднее", "average_sales"),
-                            ("Максимум", "max_sales"),
-                        ]:
-                            summary_row = {
-                                "Точка": point_label,
-                                "raw shop_number": raw_point,
-                                "Показатель": metric_name,
-                            }
+
+                    try:
+                        # Общая история нужна только для определения фактических рабочих дат точки.
+                        entity_all_history = load_forecast_history(
+                            entity_consumption_start,
+                            entity_consumption_end + timedelta(days=1),
+                            entity_consumption_shop_numbers,
+                        ).copy()
+                        # Факт выбранных сущностей ищем по каждому возможному коду SQL-строки,
+                        # а не только по COALESCE-коду общего загрузчика.
+                        selected_entity_history = load_entity_sku_history(
+                            entity_consumption_start,
+                            entity_consumption_end + timedelta(days=1),
+                            entity_consumption_shop_numbers,
+                            selected_sku_tuple,
+                        ).copy()
+                    except Exception as error:
+                        st.error(f"Не удалось загрузить продажи для расчёта сущностей: {error}")
+                        entity_all_history = pd.DataFrame()
+                        selected_entity_history = pd.DataFrame()
+
+                    if entity_all_history.empty:
+                        st.info("За выбранный период нет продаж для определения рабочих дней точек.")
+                    else:
+                        entity_all_history["business_date"] = pd.to_datetime(
+                            entity_all_history["business_date"], errors="coerce"
+                        ).dt.date
+                        entity_all_history["shop_number"] = pd.to_numeric(
+                            entity_all_history["shop_number"], errors="coerce"
+                        ).astype("Int64")
+                        entity_all_history = entity_all_history[
+                            entity_all_history["business_date"].notna() & entity_all_history["shop_number"].notna()
+                        ].copy()
+                        entity_active_days = entity_all_history[["shop_number", "business_date"]].drop_duplicates()
+
+                        if selected_entity_history.empty:
+                            selected_entity_history = pd.DataFrame(
+                                columns=["business_date", "shop_number", "sku", "product_name", "sold_quantity", "revenue"]
+                            )
+                        else:
+                            selected_entity_history["business_date"] = pd.to_datetime(
+                                selected_entity_history["business_date"], errors="coerce"
+                            ).dt.date
+                            selected_entity_history["shop_number"] = pd.to_numeric(
+                                selected_entity_history["shop_number"], errors="coerce"
+                            ).astype("Int64")
+                            selected_entity_history["sku"] = selected_entity_history["sku"].map(normalize_sku)
+                            selected_entity_history["sold_quantity"] = pd.to_numeric(
+                                selected_entity_history["sold_quantity"], errors="coerce"
+                            ).fillna(0.0).clip(lower=0.0)
+                            selected_entity_history = selected_entity_history[
+                                selected_entity_history["business_date"].notna()
+                                & selected_entity_history["shop_number"].notna()
+                                & selected_entity_history["sku"].notna()
+                            ].copy()
+
+                        entity_daily_sales = (
+                            selected_entity_history.groupby(["shop_number", "business_date"], as_index=False)["sold_quantity"].sum()
+                            .rename(columns={"sold_quantity": "entity_sales"})
+                            if not selected_entity_history.empty
+                            else pd.DataFrame(columns=["shop_number", "business_date", "entity_sales"])
+                        )
+                        entity_daily_grid = entity_active_days.merge(
+                            entity_daily_sales, on=["shop_number", "business_date"], how="left"
+                        )
+                        entity_daily_grid["entity_sales"] = pd.to_numeric(
+                            entity_daily_grid["entity_sales"], errors="coerce"
+                        ).fillna(0.0).clip(lower=0.0)
+                        entity_daily_grid["weekday_number"] = entity_daily_grid["business_date"].map(
+                            lambda value: int(value.weekday())
+                        )
+                        entity_weekday_short = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
+                        entity_daily_grid["День недели"] = entity_daily_grid["weekday_number"].map(entity_weekday_short)
+                        entity_daily_grid["Точка"] = entity_daily_grid["shop_number"].astype(int).map(
+                            entity_consumption_point_mapping
+                        )
+
+                        entity_point_summary = (
+                            entity_daily_grid.groupby(
+                                ["shop_number", "Точка", "weekday_number", "День недели"], as_index=False
+                            )
+                            .agg(
+                                average_sales=("entity_sales", "mean"),
+                                max_sales=("entity_sales", "max"),
+                                active_days=("business_date", "nunique"),
+                            )
+                        )
+                        entity_network_daily = entity_daily_grid.groupby("business_date", as_index=False)["entity_sales"].sum()
+                        entity_network_daily["weekday_number"] = entity_network_daily["business_date"].map(lambda value: int(value.weekday()))
+                        entity_network_daily["День недели"] = entity_network_daily["weekday_number"].map(entity_weekday_short)
+                        entity_network_summary = (
+                            entity_network_daily.groupby(["weekday_number", "День недели"], as_index=False)
+                            .agg(
+                                average_sales=("entity_sales", "mean"),
+                                max_sales=("entity_sales", "max"),
+                                active_days=("business_date", "nunique"),
+                            )
+                        )
+
+                        entity_summary_lookup = {
+                            (int(row.shop_number), int(row.weekday_number)): row
+                            for row in entity_point_summary.itertuples(index=False)
+                        }
+                        entity_network_lookup = {
+                            int(row.weekday_number): row for row in entity_network_summary.itertuples(index=False)
+                        }
+                        entity_summary_rows = []
+                        active_raw_points = list(entity_consumption_shop_numbers)
+                        for raw_point in active_raw_points:
+                            point_label = entity_consumption_point_mapping.get(raw_point, f"Т{raw_point}")
+                            for metric_name, metric_column in [("Среднее", "average_sales"), ("Максимум", "max_sales")]:
+                                summary_row = {"Точка": point_label, "raw shop_number": raw_point, "Показатель": metric_name}
+                                for weekday_number, weekday_label in entity_weekday_short.items():
+                                    source_row = entity_summary_lookup.get((raw_point, weekday_number))
+                                    summary_row[weekday_label] = (
+                                        float(getattr(source_row, metric_column)) if source_row is not None else pd.NA
+                                    )
+                                entity_summary_rows.append(summary_row)
+                        for metric_name, metric_column in [("Среднее", "average_sales"), ("Максимум", "max_sales")]:
+                            summary_row = {"Точка": "Все точки", "raw shop_number": pd.NA, "Показатель": metric_name}
                             for weekday_number, weekday_label in entity_weekday_short.items():
-                                source_row = entity_summary_lookup.get((raw_point, weekday_number))
+                                source_row = entity_network_lookup.get(weekday_number)
                                 summary_row[weekday_label] = (
-                                    float(getattr(source_row, metric_column))
-                                    if source_row is not None
-                                    else pd.NA
+                                    float(getattr(source_row, metric_column)) if source_row is not None else pd.NA
                                 )
                             entity_summary_rows.append(summary_row)
 
-                    for metric_name, metric_column in [
-                        ("Среднее", "average_sales"),
-                        ("Максимум", "max_sales"),
-                    ]:
-                        summary_row = {
-                            "Точка": "Все точки",
-                            "raw shop_number": pd.NA,
-                            "Показатель": metric_name,
-                        }
-                        for weekday_number, weekday_label in entity_weekday_short.items():
-                            source_row = entity_network_lookup.get(weekday_number)
-                            summary_row[weekday_label] = (
-                                float(getattr(source_row, metric_column))
-                                if source_row is not None
-                                else pd.NA
-                            )
-                        entity_summary_rows.append(summary_row)
-
-                    entity_consumption_table = pd.DataFrame(entity_summary_rows)
-                    entity_consumption_columns = [
-                        "Точка", "Показатель", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"
-                    ]
-                    entity_consumption_table = entity_consumption_table[
-                        ["Точка", "raw shop_number", "Показатель", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-                    ]
-
-                    selected_entities_title = " + ".join(entity_consumption_entities_selected)
-                    st.markdown(
-                        f"#### {entity_consumption_category} → {selected_entities_title}"
-                    )
-                    st.caption(
-                        f"Период: {entity_consumption_start:%d.%m.%Y}–{entity_consumption_end:%d.%m.%Y}. "
-                        f"Выбрано сущностей: {len(entity_consumption_entities_selected)}. "
-                        "В строках — точки и показатели «Среднее»/«Максимум», по горизонтали — дни недели. "
-                        "Все выбранные сущности уже суммированы внутри каждой ячейки расчёта."
-                    )
-
-                    entity_consumption_display = entity_consumption_table[entity_consumption_columns].copy()
-                    for weekday_label in entity_weekday_short.values():
-                        entity_consumption_display[weekday_label] = entity_consumption_display.apply(
-                            lambda row: (
-                                ""
-                                if pd.isna(row[weekday_label])
-                                else (
-                                    f"{float(row[weekday_label]):.1f}"
-                                    if row["Показатель"] == "Среднее"
-                                    else f"{float(row[weekday_label]):.0f}"
-                                )
-                            ),
-                            axis=1,
-                        )
-                    st.dataframe(
-                        entity_consumption_display,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                    st.divider()
-                    st.markdown("### Отчёт")
-                    st.caption(
-                        "Excel повторяет текущую таблицу: выбранные категория, несколько сущностей, период, "
-                        "точки, средние и максимальные продажи по дням недели."
-                    )
-
-                    def _build_entity_consumption_excel() -> bytes:
-                        from openpyxl import Workbook
-                        from openpyxl.styles import Alignment, Font, PatternFill
-                        from openpyxl.utils import get_column_letter
-
-                        output = io.BytesIO()
-                        workbook = Workbook()
-                        sheet = workbook.active
-                        sheet.title = "Потребление сущностей"
-                        sheet.sheet_view.showGridLines = False
-
-                        sheet.merge_cells("A1:I1")
-                        sheet["A1"] = (
-                            f"{entity_consumption_category} → {selected_entities_title}"
-                        )
-                        sheet["A1"].font = Font(bold=True, size=14)
-                        sheet["A1"].alignment = Alignment(horizontal="center")
-                        sheet["A1"].fill = PatternFill("solid", fgColor="D9EAF7")
-
-                        sheet.merge_cells("A2:I2")
-                        sheet["A2"] = (
-                            f"Период: {entity_consumption_start:%d.%m.%Y}–"
-                            f"{entity_consumption_end:%d.%m.%Y}"
-                        )
-                        sheet["A2"].alignment = Alignment(horizontal="center")
-                        sheet["A2"].font = Font(italic=True)
-
-                        headers = entity_consumption_columns
-                        for column_index, header in enumerate(headers, start=1):
-                            cell = sheet.cell(4, column_index, header)
-                            cell.font = Font(bold=True)
-                            cell.fill = PatternFill("solid", fgColor="E7E6E6")
-                            cell.alignment = Alignment(horizontal="center", vertical="center")
-
-                        for row_index, record in enumerate(
-                            entity_consumption_table[entity_consumption_columns].itertuples(index=False),
-                            start=5,
-                        ):
-                            point_name = str(record[0])
-                            metric_name = str(record[1])
-                            sheet.cell(row_index, 1, point_name)
-                            sheet.cell(row_index, 2, metric_name)
-                            for offset, value in enumerate(record[2:], start=3):
-                                cell = sheet.cell(row_index, offset)
-                                if pd.notna(value):
-                                    cell.value = float(value)
-                                    cell.number_format = "0.0" if metric_name == "Среднее" else "0"
-                                cell.alignment = Alignment(horizontal="center")
-                            if point_name == "Все точки":
-                                for cell in sheet[row_index]:
-                                    cell.fill = PatternFill("solid", fgColor="DDEBF7")
-                                    cell.font = Font(bold=True)
-                            elif metric_name == "Среднее":
-                                for cell in sheet[row_index]:
-                                    cell.fill = PatternFill("solid", fgColor="F7F7F7")
-
-                        sheet.freeze_panes = "C5"
-                        sheet.auto_filter.ref = f"A4:I{sheet.max_row}"
-                        widths = {1: 16, 2: 14, 3: 11, 4: 11, 5: 11, 6: 11, 7: 11, 8: 11, 9: 11}
-                        for column_index, width in widths.items():
-                            sheet.column_dimensions[get_column_letter(column_index)].width = width
-                        sheet.page_setup.orientation = "landscape"
-                        sheet.page_setup.fitToWidth = 1
-                        sheet.sheet_properties.pageSetUpPr.fitToPage = True
-
-                        daily_sheet = workbook.create_sheet("Факт по дням")
-                        daily_sheet.sheet_view.showGridLines = False
-                        daily_headers = [
-                            "Дата", "День недели", "Точка", "raw shop_number",
-                            "Категория", "Выбранные сущности", "Продано суммарно, шт."
+                        entity_consumption_table = pd.DataFrame(entity_summary_rows)
+                        entity_consumption_columns = ["Точка", "Показатель", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+                        entity_consumption_table = entity_consumption_table[
+                            ["Точка", "raw shop_number", "Показатель", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
                         ]
-                        for column_index, header in enumerate(daily_headers, start=1):
-                            cell = daily_sheet.cell(1, column_index, header)
-                            cell.font = Font(bold=True)
-                            cell.fill = PatternFill("solid", fgColor="E7E6E6")
-                            cell.alignment = Alignment(horizontal="center")
 
-                        daily_export = entity_daily_grid.sort_values(
-                            ["business_date", "shop_number"], kind="stable"
+                        selected_entities_title = " + ".join(entity_consumption_entities_selected)
+                        st.markdown(f"#### {entity_consumption_category} → {selected_entities_title}")
+                        st.caption(
+                            f"Период: {entity_consumption_start:%d.%m.%Y}–{entity_consumption_end:%d.%m.%Y}. "
+                            f"В справочнике для выбранных сущностей: {len(selected_sku_tuple)} SKU. "
+                            "Все эти SKU участвуют в поиске продаж по всем четырём кодовым полям PostgreSQL."
                         )
-                        selected_entities_text = ", ".join(entity_consumption_entities_selected)
-                        for row_index, (_, record) in enumerate(daily_export.iterrows(), start=2):
-                            daily_sheet.cell(row_index, 1, record["business_date"])
-                            daily_sheet.cell(row_index, 1).number_format = "DD.MM.YYYY"
-                            daily_sheet.cell(row_index, 2, record["День недели"])
-                            daily_sheet.cell(row_index, 3, record["Точка"])
-                            daily_sheet.cell(row_index, 4, int(record["shop_number"]))
-                            daily_sheet.cell(row_index, 5, entity_consumption_category)
-                            daily_sheet.cell(row_index, 6, selected_entities_text)
-                            daily_sheet.cell(row_index, 7, float(record["entity_sales"]))
-                            daily_sheet.cell(row_index, 7).number_format = "0"
-                        daily_sheet.freeze_panes = "A2"
-                        daily_sheet.auto_filter.ref = daily_sheet.dimensions
-                        daily_widths = [13, 14, 16, 18, 22, 48, 20]
-                        for column_index, width in enumerate(daily_widths, start=1):
-                            daily_sheet.column_dimensions[get_column_letter(column_index)].width = width
 
-                        workbook.save(output)
-                        output.seek(0)
-                        return output.getvalue()
-
-                    entity_report_signature = (
-                        str(entity_consumption_start),
-                        str(entity_consumption_end),
-                        str(entity_consumption_category),
-                        tuple(sorted(entity_consumption_entities_selected)),
-                        tuple(active_raw_points),
-                    )
-                    if st.button(
-                        "Сформировать Excel",
-                        type="primary",
-                        key="entity_consumption_build_excel_v751221",
-                    ):
-                        try:
-                            st.session_state["entity_consumption_excel_v751221"] = _build_entity_consumption_excel()
-                            st.session_state["entity_consumption_excel_signature_v751221"] = entity_report_signature
-                            st.session_state.pop("entity_consumption_excel_error_v751221", None)
-                        except Exception as error:
-                            st.session_state["entity_consumption_excel_error_v751221"] = str(error)
-
-                    entity_excel_error = st.session_state.get("entity_consumption_excel_error_v751221")
-                    if entity_excel_error:
-                        st.error(f"Не удалось сформировать Excel: {entity_excel_error}")
-                    entity_excel_bytes = st.session_state.get("entity_consumption_excel_v751221")
-                    entity_excel_signature = st.session_state.get("entity_consumption_excel_signature_v751221")
-                    if entity_excel_bytes and entity_excel_signature == entity_report_signature:
-                        safe_entity_name = re.sub(
-                            r"[^0-9A-Za-zА-Яа-яЁё_-]+", "_",
-                            "_".join(entity_consumption_entities_selected),
-                        ).strip("_") or "entities"
-                        safe_entity_name = safe_entity_name[:80]
-                        st.download_button(
-                            "Скачать отчёт Excel",
-                            data=entity_excel_bytes,
-                            file_name=(
-                                f"Потребление_{safe_entity_name}_"
-                                f"{entity_consumption_start:%Y-%m-%d}_"
-                                f"{entity_consumption_end:%Y-%m-%d}.xlsx"
-                            ),
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key="entity_consumption_download_excel_v751221",
-                            use_container_width=True,
+                        sku_fact = (
+                            selected_entity_history.groupby("sku", as_index=False)
+                            .agg(
+                                sold_quantity=("sold_quantity", "sum"),
+                                sale_days=("business_date", "nunique"),
+                                sale_points=("shop_number", "nunique"),
+                            )
+                            if not selected_entity_history.empty
+                            else pd.DataFrame(columns=["sku", "sold_quantity", "sale_days", "sale_points"])
                         )
+                        selected_reference_display = selected_reference.merge(sku_fact, on="sku", how="left")
+                        for col in ["sold_quantity", "sale_days", "sale_points"]:
+                            selected_reference_display[col] = pd.to_numeric(
+                                selected_reference_display.get(col), errors="coerce"
+                            ).fillna(0)
+                        selected_reference_display = selected_reference_display.rename(columns={
+                            "sku": "SKU",
+                            "entity_product_name": "Название товара",
+                            "entity": "Сущность",
+                            "sold_quantity": "Продано за период, шт.",
+                            "sale_days": "Дней с продажами",
+                            "sale_points": "Точек с продажами",
+                        })
+                        with st.expander(f"SKU выбранных сущностей по справочнику · {len(selected_reference_display)} SKU", expanded=False):
+                            st.dataframe(
+                                selected_reference_display[[
+                                    "SKU", "Название товара", "Сущность", "Продано за период, шт.",
+                                    "Дней с продажами", "Точек с продажами",
+                                ]].sort_values(["Сущность", "Продано за период, шт.", "Название товара"], ascending=[True, False, True]),
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Продано за период, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                    "Дней с продажами": st.column_config.NumberColumn(format="%d"),
+                                    "Точек с продажами": st.column_config.NumberColumn(format="%d"),
+                                },
+                            )
+
+                        entity_consumption_display = entity_consumption_table[entity_consumption_columns].copy()
+                        for weekday_label in entity_weekday_short.values():
+                            entity_consumption_display[weekday_label] = entity_consumption_display.apply(
+                                lambda row: (
+                                    "" if pd.isna(row[weekday_label]) else (
+                                        f"{float(row[weekday_label]):.1f}" if row["Показатель"] == "Среднее"
+                                        else f"{float(row[weekday_label]):.0f}"
+                                    )
+                                ), axis=1,
+                            )
+                        st.dataframe(entity_consumption_display, use_container_width=True, hide_index=True)
+
+                        st.divider()
+                        st.markdown("### Отчёт")
+                        st.caption(
+                            "Excel повторяет текущий расчёт и отдельно выгружает полный список SKU выбранных сущностей."
+                        )
+
+                        def _build_entity_consumption_excel() -> bytes:
+                            from openpyxl import Workbook
+                            from openpyxl.styles import Alignment, Font, PatternFill
+                            from openpyxl.utils import get_column_letter
+
+                            output = io.BytesIO()
+                            workbook = Workbook()
+                            sheet = workbook.active
+                            sheet.title = "Потребление сущностей"
+                            sheet.sheet_view.showGridLines = False
+                            sheet.merge_cells("A1:I1")
+                            sheet["A1"] = f"{entity_consumption_category} → {selected_entities_title}"
+                            sheet["A1"].font = Font(bold=True, size=14)
+                            sheet["A1"].alignment = Alignment(horizontal="center")
+                            sheet["A1"].fill = PatternFill("solid", fgColor="D9EAF7")
+                            sheet.merge_cells("A2:I2")
+                            sheet["A2"] = f"Период: {entity_consumption_start:%d.%m.%Y}–{entity_consumption_end:%d.%m.%Y}"
+                            sheet["A2"].alignment = Alignment(horizontal="center")
+                            sheet["A2"].font = Font(italic=True)
+                            for column_index, header in enumerate(entity_consumption_columns, start=1):
+                                cell = sheet.cell(4, column_index, header)
+                                cell.font = Font(bold=True)
+                                cell.fill = PatternFill("solid", fgColor="E7E6E6")
+                                cell.alignment = Alignment(horizontal="center", vertical="center")
+                            for row_index, record in enumerate(
+                                entity_consumption_table[entity_consumption_columns].itertuples(index=False), start=5
+                            ):
+                                point_name = str(record[0])
+                                metric_name = str(record[1])
+                                sheet.cell(row_index, 1, point_name)
+                                sheet.cell(row_index, 2, metric_name)
+                                for offset, value in enumerate(record[2:], start=3):
+                                    cell = sheet.cell(row_index, offset)
+                                    if pd.notna(value):
+                                        cell.value = float(value)
+                                        cell.number_format = "0.0" if metric_name == "Среднее" else "0"
+                                    cell.alignment = Alignment(horizontal="center")
+                                if point_name == "Все точки":
+                                    for cell in sheet[row_index]:
+                                        cell.fill = PatternFill("solid", fgColor="DDEBF7")
+                                        cell.font = Font(bold=True)
+                                elif metric_name == "Среднее":
+                                    for cell in sheet[row_index]:
+                                        cell.fill = PatternFill("solid", fgColor="F7F7F7")
+                            sheet.freeze_panes = "C5"
+                            sheet.auto_filter.ref = f"A4:I{sheet.max_row}"
+                            for column_index, width in {1:16,2:14,3:11,4:11,5:11,6:11,7:11,8:11,9:11}.items():
+                                sheet.column_dimensions[get_column_letter(column_index)].width = width
+                            sheet.page_setup.orientation = "landscape"
+                            sheet.page_setup.fitToWidth = 1
+                            sheet.sheet_properties.pageSetUpPr.fitToPage = True
+
+                            daily_sheet = workbook.create_sheet("Факт по дням")
+                            daily_headers = ["Дата", "День недели", "Точка", "raw shop_number", "Продано суммарно, шт."]
+                            for column_index, header in enumerate(daily_headers, start=1):
+                                cell = daily_sheet.cell(1, column_index, header)
+                                cell.font = Font(bold=True)
+                                cell.fill = PatternFill("solid", fgColor="E7E6E6")
+                            for row_index, (_, record) in enumerate(
+                                entity_daily_grid.sort_values(["business_date", "shop_number"], kind="stable").iterrows(), start=2
+                            ):
+                                daily_sheet.cell(row_index, 1, record["business_date"])
+                                daily_sheet.cell(row_index, 1).number_format = "DD.MM.YYYY"
+                                daily_sheet.cell(row_index, 2, record["День недели"])
+                                daily_sheet.cell(row_index, 3, record["Точка"])
+                                daily_sheet.cell(row_index, 4, int(record["shop_number"]))
+                                daily_sheet.cell(row_index, 5, float(record["entity_sales"]))
+                                daily_sheet.cell(row_index, 5).number_format = "0"
+                            daily_sheet.freeze_panes = "A2"
+                            daily_sheet.auto_filter.ref = daily_sheet.dimensions
+                            for column_index, width in enumerate([13,14,16,18,22], start=1):
+                                daily_sheet.column_dimensions[get_column_letter(column_index)].width = width
+
+                            sku_sheet = workbook.create_sheet("SKU в расчёте")
+                            sku_headers = ["SKU", "Название товара", "Категория", "Сущность", "Продано за период, шт.", "Дней с продажами", "Точек с продажами"]
+                            for column_index, header in enumerate(sku_headers, start=1):
+                                cell = sku_sheet.cell(1, column_index, header)
+                                cell.font = Font(bold=True)
+                                cell.fill = PatternFill("solid", fgColor="E7E6E6")
+                            sku_excel = selected_reference_display.copy().rename(columns={"category": "Категория"})
+                            sku_excel = sku_excel[[
+                                "SKU", "Название товара", "Категория", "Сущность", "Продано за период, шт.",
+                                "Дней с продажами", "Точек с продажами",
+                            ]]
+                            for row_index, record in enumerate(sku_excel.itertuples(index=False), start=2):
+                                for column_index, value in enumerate(record, start=1):
+                                    sku_sheet.cell(row_index, column_index, value)
+                            sku_sheet.freeze_panes = "A2"
+                            sku_sheet.auto_filter.ref = sku_sheet.dimensions
+                            for column_index, width in enumerate([14,42,22,30,20,18,18], start=1):
+                                sku_sheet.column_dimensions[get_column_letter(column_index)].width = width
+                            workbook.save(output)
+                            output.seek(0)
+                            return output.getvalue()
+
+                        entity_report_signature = (
+                            str(entity_consumption_start), str(entity_consumption_end),
+                            str(entity_consumption_category), tuple(sorted(entity_consumption_entities_selected)),
+                            tuple(active_raw_points), tuple(selected_sku_tuple),
+                        )
+                        if st.button(
+                            "Сформировать Excel", type="primary", use_container_width=True,
+                            key="entity_consumption_build_excel_v751223",
+                        ):
+                            try:
+                                st.session_state["entity_consumption_excel_v751223"] = _build_entity_consumption_excel()
+                                st.session_state["entity_consumption_excel_signature_v751223"] = entity_report_signature
+                                st.session_state.pop("entity_consumption_excel_error_v751223", None)
+                            except Exception as error:
+                                st.session_state["entity_consumption_excel_error_v751223"] = str(error)
+                        entity_excel_error = st.session_state.get("entity_consumption_excel_error_v751223")
+                        if entity_excel_error:
+                            st.error(f"Не удалось сформировать Excel: {entity_excel_error}")
+                        entity_excel_bytes = st.session_state.get("entity_consumption_excel_v751223")
+                        entity_excel_signature = st.session_state.get("entity_consumption_excel_signature_v751223")
+                        if entity_excel_bytes and entity_excel_signature == entity_report_signature:
+                            safe_entity_name = re.sub(
+                                r"[^0-9A-Za-zА-Яа-яЁё_-]+", "_", "_".join(entity_consumption_entities_selected)
+                            ).strip("_") or "entities"
+                            st.download_button(
+                                "Скачать отчёт Excel", data=entity_excel_bytes,
+                                file_name=(
+                                    f"Потребление_{safe_entity_name[:80]}_"
+                                    f"{entity_consumption_start:%Y-%m-%d}_{entity_consumption_end:%Y-%m-%d}.xlsx"
+                                ),
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                key="entity_consumption_download_excel_v751223",
+                                use_container_width=True,
+                            )
 
 if tab_detail.open:
     with tab_detail:
