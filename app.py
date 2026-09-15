@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.28-REPORT-SOURCE-AUDIT"
+BUILD_ID = "75.12.29-REPORT-PERFORMANCE-TIMING"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -13875,22 +13875,32 @@ if tab_report.open:
                 else:
                     point_numbers = tuple(sorted(int(point[1:]) for point in report_points))
                     try:
+                        report_run_started = time.perf_counter()
                         with st.spinner("Загружаю продажи для двух периодов…"):
+                            report_pg_1_started = time.perf_counter()
                             raw_1 = load_sales(
                                 report_period_1[0],
                                 report_period_1[1] + timedelta(days=1),
                                 point_numbers,
                             )
+                            report_pg_1_seconds = time.perf_counter() - report_pg_1_started
+
+                            report_pg_2_started = time.perf_counter()
                             raw_2 = load_sales(
                                 report_period_2[0],
                                 report_period_2[1] + timedelta(days=1),
                                 point_numbers,
                             )
+                            report_pg_2_seconds = time.perf_counter() - report_pg_2_started
+
+                        report_prepare_started = time.perf_counter()
                         frame_1 = prepare_report_sales_frame(raw_1, entities, "Период 1")
                         frame_2 = prepare_report_sales_frame(raw_2, entities, "Период 2")
                         if report_match_weekdays:
                             frame_1 = frame_1[frame_1["business_date"].isin(set(dates_1))].copy()
                             frame_2 = frame_2[frame_2["business_date"].isin(set(dates_2))].copy()
+                        report_prepare_seconds = time.perf_counter() - report_prepare_started
+                        report_initial_seconds = time.perf_counter() - report_run_started
                         for stale_key in [
                             "report_category_filter_v770",
                             "report_entity_filter_v770",
@@ -13914,6 +13924,16 @@ if tab_report.open:
                             "pairs": date_pairs,
                             "match_weekdays": report_match_weekdays,
                             "points": report_points,
+                            "timing": {
+                                "load_sales_p1_seconds": report_pg_1_seconds,
+                                "load_sales_p2_seconds": report_pg_2_seconds,
+                                "prepare_seconds": report_prepare_seconds,
+                                "initial_seconds": report_initial_seconds,
+                                "raw_rows_p1": int(len(raw_1)),
+                                "raw_rows_p2": int(len(raw_2)),
+                                "points_count": int(len(point_numbers)),
+                                "measured_at": datetime.now().isoformat(timespec="seconds"),
+                            },
                         }
                     except Exception as error:
                         st.error(f"Не удалось сформировать отчет: {error}")
@@ -13989,6 +14009,7 @@ if tab_report.open:
                     key="report_point_filter_v770",
                 )
 
+            report_filter_started = time.perf_counter()
             filtered_report_1 = report_frame_1[
                 report_frame_1["category"].isin(selected_report_categories)
                 & report_frame_1["entity"].isin(selected_report_entities)
@@ -13999,7 +14020,9 @@ if tab_report.open:
                 & report_frame_2["entity"].isin(selected_report_entities)
                 & report_frame_2["point"].isin(selected_report_points)
             ].copy()
+            report_filter_seconds = time.perf_counter() - report_filter_started
 
+            report_tables_started = time.perf_counter()
             report_tables = build_report_tables(
                 filtered_report_1,
                 filtered_report_2,
@@ -14007,6 +14030,7 @@ if tab_report.open:
                 report_dates_2,
                 selected_report_points,
             )
+            report_tables_seconds = time.perf_counter() - report_tables_started
 
             total_1 = float(filtered_report_1["sales"].sum()) if not filtered_report_1.empty else 0.0
             total_2 = float(filtered_report_2["sales"].sum()) if not filtered_report_2.empty else 0.0
@@ -14028,6 +14052,42 @@ if tab_report.open:
             )
             report_metrics[4].metric("СР/день П1", f"{avg_1:,.1f}".replace(",", " "))
             report_metrics[5].metric("СР/день П2", f"{avg_2:,.1f}".replace(",", " "))
+
+            report_timing = report_state.get("timing", {}) or {}
+            with st.expander("⏱ Диагностика скорости отчета", expanded=True):
+                timing_cols = st.columns(5)
+                timing_cols[0].metric(
+                    "П1 · load_sales",
+                    f"{float(report_timing.get('load_sales_p1_seconds', 0.0)):.2f} сек",
+                )
+                timing_cols[1].metric(
+                    "П2 · load_sales",
+                    f"{float(report_timing.get('load_sales_p2_seconds', 0.0)):.2f} сек",
+                )
+                timing_cols[2].metric(
+                    "Категории / сущности",
+                    f"{float(report_timing.get('prepare_seconds', 0.0)):.2f} сек",
+                )
+                timing_cols[3].metric("Фильтры", f"{report_filter_seconds:.2f} сек")
+                timing_cols[4].metric("Сводные таблицы", f"{report_tables_seconds:.2f} сек")
+
+                measured_total = (
+                    float(report_timing.get("initial_seconds", 0.0))
+                    + report_filter_seconds
+                    + report_tables_seconds
+                )
+                st.caption(
+                    "Контрольное время до вывода таблиц: "
+                    f"{measured_total:.2f} сек · "
+                    f"строк после SQL: П1 — {int(report_timing.get('raw_rows_p1', 0)):,}, "
+                    f"П2 — {int(report_timing.get('raw_rows_p2', 0)):,} · "
+                    f"точек — {int(report_timing.get('points_count', 0))}.".replace(",", " ")
+                )
+                st.caption(
+                    "П1/П2 показывают время вызова load_sales. Если значение близко к 0 сек, "
+                    "скорее всего сработал часовой Streamlit cache и PostgreSQL повторно не запрашивался. "
+                    "Для замера реального запроса измените период или очистите кэш приложения."
+                )
 
             st.markdown("#### Сравнение по категориям за выбранные периоды")
             st.caption(
