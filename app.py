@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.26-DIRECT-GSHEET-REFERENCE"
+BUILD_ID = "75.12.25-ENTITY-DIRECT-ERPI"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -56,12 +56,6 @@ MATRIX_PLAN_SHEETS = [
     "План 4-я неделя",
 ]
 MATRIX_ENTITY_SHEET = "Справочник"
-
-MATRIX_SPREADSHEET_ID = os.getenv(
-    "GOOGLE_MATRIX_SPREADSHEET_ID",
-    "1tGSIIiVMUBDE8dT-lyNQYULovDQ3D5D8BGM7ykBMbrw",
-).strip()
-GOOGLE_ENTITY_REFERENCE_REFRESH_SECONDS = 5 * 60
 
 st.set_page_config(
     page_title="Аналитика спроса",
@@ -290,130 +284,6 @@ def _fetch_apps_script_matrix_snapshot(
         return content, source, checked_at, ""
     except Exception as error:
         return b"", "", checked_at, f"Apps Script (планы): {error}"
-
-
-def _google_service_account_info() -> dict[str, str]:
-    """Read Google service-account credentials from env or Streamlit Secrets."""
-    raw_json = _read_runtime_secret("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON") or _read_runtime_secret(
-        "GOOGLE_SERVICE_ACCOUNT_JSON"
-    )
-    if raw_json:
-        try:
-            payload = json.loads(raw_json)
-            if isinstance(payload, dict):
-                return {str(k): str(v) for k, v in payload.items() if v is not None}
-        except Exception:
-            pass
-
-    for section_name in ("gcp_service_account", "google_service_account"):
-        try:
-            section = st.secrets.get(section_name)
-        except Exception:
-            section = None
-        if section:
-            try:
-                payload = dict(section)
-            except Exception:
-                payload = {}
-            if payload:
-                return {str(k): str(v) for k, v in payload.items() if v is not None}
-    return {}
-
-
-def _google_service_account_access_token(credentials: dict[str, str]) -> str:
-    client_email = str(credentials.get("client_email") or "").strip()
-    private_key = str(credentials.get("private_key") or "").replace("\\n", "\n").strip()
-    token_uri = str(credentials.get("token_uri") or "https://oauth2.googleapis.com/token").strip()
-    if not client_email or not private_key:
-        raise RuntimeError(
-            "Google Sheets direct access is not configured: client_email/private_key are missing."
-        )
-
-    now = int(time.time())
-    assertion = jwt.encode(
-        {
-            "iss": client_email,
-            "scope": "https://www.googleapis.com/auth/spreadsheets.readonly",
-            "aud": token_uri,
-            "iat": now,
-            "exp": now + 3600,
-        },
-        private_key,
-        algorithm="RS256",
-    )
-
-    import requests
-
-    response = requests.post(
-        token_uri,
-        data={
-            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
-            "assertion": assertion,
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    token = str((response.json() or {}).get("access_token") or "").strip()
-    if not token:
-        raise RuntimeError("Google OAuth token endpoint returned no access_token.")
-    return token
-
-
-@st.cache_data(ttl=GOOGLE_ENTITY_REFERENCE_REFRESH_SECONDS, show_spinner=False)
-def _fetch_google_sheets_entity_reference(
-    spreadsheet_id: str,
-    sheet_name: str,
-) -> tuple[pd.DataFrame, str, str, str]:
-    """Read the reference sheet directly via Google Sheets API (no Apps Script)."""
-    checked_at = datetime.now().isoformat(timespec="seconds")
-    empty = pd.DataFrame()
-    if not spreadsheet_id:
-        return empty, "", checked_at, "GOOGLE_MATRIX_SPREADSHEET_ID is empty"
-
-    try:
-        credentials = _google_service_account_info()
-        if not credentials:
-            raise RuntimeError(
-                "service-account credentials are not configured in Streamlit Secrets"
-            )
-        token = _google_service_account_access_token(credentials)
-
-        import requests
-        from urllib.parse import quote
-
-        range_name = f"{sheet_name}!A:Z"
-        encoded_range = quote(range_name, safe="")
-        url = (
-            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}"
-            f"/values/{encoded_range}"
-        )
-        response = requests.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            params={
-                "majorDimension": "ROWS",
-                "valueRenderOption": "UNFORMATTED_VALUE",
-                "dateTimeRenderOption": "FORMATTED_STRING",
-            },
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json() or {}
-        values = payload.get("values") or []
-        if not isinstance(values, list) or not values:
-            raise RuntimeError("Google Sheets API returned an empty values array")
-
-        frame = _parse_entity_reference_raw(pd.DataFrame(values))
-        if frame.empty:
-            raise RuntimeError("reference sheet parsed to an empty dataframe")
-        return (
-            frame,
-            f"Google Sheets API | spreadsheet {spreadsheet_id} | sheet {sheet_name}",
-            checked_at,
-            "",
-        )
-    except Exception as error:
-        return empty, "", checked_at, f"Google Sheets API: {error}"
 
 
 @st.cache_data(ttl=GOOGLE_MATRIX_REFRESH_SECONDS, show_spinner=False)
@@ -1422,38 +1292,27 @@ def _entity_reference_signature(frame: pd.DataFrame) -> str:
 
 
 def get_current_entity_reference() -> tuple[pd.DataFrame, str, str, str, str]:
-    """Load the reference directly from Google Sheets; use Apps Script only as fallback."""
-    direct_frame, direct_source, direct_checked_at, direct_error = _fetch_google_sheets_entity_reference(
-        MATRIX_SPREADSHEET_ID,
-        MATRIX_ENTITY_SHEET,
-    )
-    if direct_frame is not None and not direct_frame.empty:
-        return (
-            direct_frame,
-            direct_source,
-            direct_checked_at,
-            "",
-            _entity_reference_signature(direct_frame),
-        )
+    """Load SKU/category/entity mapping from the live Apps Script reference only.
 
-    fallback_frame, fallback_source, fallback_checked_at, fallback_error = _fetch_apps_script_entity_reference(
+    No entities.xlsx or combo_matrix.xlsx fallback is used. This prevents stale local
+    workbooks from silently replacing the current reference.
+    """
+    live_frame, live_source, checked_at, live_error = _fetch_apps_script_entity_reference(
         MATRIX_APPS_SCRIPT_URL,
         MATRIX_APPS_SCRIPT_KEY,
     )
-    if fallback_frame is not None and not fallback_frame.empty:
-        warning = "Direct Google Sheets read failed; Apps Script fallback is active."
-        if direct_error:
-            warning += f" {direct_error}"
+    if live_frame is not None and not live_frame.empty:
         return (
-            fallback_frame,
-            fallback_source,
-            fallback_checked_at,
-            warning,
-            _entity_reference_signature(fallback_frame),
+            live_frame,
+            live_source,
+            checked_at,
+            "",
+            _entity_reference_signature(live_frame),
         )
 
-    errors = [value for value in (direct_error, fallback_error) if value]
-    raise RuntimeError(" | ".join(errors) or "Reference sheet is unavailable.")
+    raise RuntimeError(
+        live_error or "Лист «Справочник» недоступен через Apps Script."
+    )
 
 
 ENTITY_REFERENCE_SESSION_KEY = "entity_reference_snapshot_v751215"
@@ -1553,54 +1412,61 @@ def _store_entity_reference_in_session(
 
 
 def load_entity_reference_resilient() -> tuple[pd.DataFrame, str, str, str, str]:
-    """Refresh through cached direct Google API and preserve last good snapshot on failure."""
+    """Load «Справочник» once per Streamlit session and survive transient API 404s."""
     saved = st.session_state.get(ENTITY_REFERENCE_SESSION_KEY)
-    saved_frame = None
-    saved_valid = False
     if isinstance(saved, dict):
-        candidate = saved.get("frame")
-        required_columns = {
-            "sku", "entity_product_name", "category",
-            "attribute_1", "attribute_2", "attribute_3", "entity",
-        }
-        if isinstance(candidate, pd.DataFrame) and required_columns.issubset(set(candidate.columns)):
-            saved_frame = candidate.copy()
-            saved_valid = True
+        saved_frame = saved.get("frame")
+        # Empty is a valid emergency snapshot too. Reusing it prevents a broken
+        # Apps Script endpoint from being called again on every Streamlit rerun.
+        # The user can explicitly retry with «Обновить справочник сейчас».
+        if isinstance(saved_frame, pd.DataFrame):
+            required_columns = {
+                "sku", "entity_product_name", "category",
+                "attribute_1", "attribute_2", "attribute_3", "entity",
+            }
+            if required_columns.issubset(set(saved_frame.columns)):
+                return (
+                    saved_frame.copy(),
+                    str(saved.get("source") or ""),
+                    str(saved.get("checked_at") or ""),
+                    str(saved.get("warning") or ""),
+                    str(saved.get("signature") or _entity_reference_signature(saved_frame)),
+                )
 
     try:
         result = get_current_entity_reference()
         _store_entity_reference_in_session(*result)
         return result
     except Exception as error:
-        if saved_valid and isinstance(saved_frame, pd.DataFrame) and not saved_frame.empty:
-            return (
-                saved_frame,
-                str(saved.get("source") or "Last successful in-session reference"),
-                str(saved.get("checked_at") or datetime.now().isoformat(timespec="seconds")),
-                f"Live reference refresh failed; last successful snapshot is in use. Error: {error}",
-                str(saved.get("signature") or _entity_reference_signature(saved_frame)),
-            )
-
         rebuilt = _entity_reference_from_existing_analysis()
         if not rebuilt.empty:
             checked_at = datetime.now().isoformat(timespec="seconds")
+            warning = (
+                "Apps Script сейчас недоступен, поэтому используется справочник из уже "
+                f"загруженного анализа этой сессии. Ошибка: {error}"
+            )
             result = (
                 rebuilt,
-                "In-session analysis fallback",
+                "Резерв текущей сессии · ранее подготовленный анализ",
                 checked_at,
-                f"Live Google Sheets and Apps Script reference are unavailable. Error: {error}",
+                warning,
                 _entity_reference_signature(rebuilt),
             )
             _store_entity_reference_in_session(*result)
             return result
-
+        # Fresh Streamlit worker: there may be no successful reference snapshot yet.
+        # Do NOT stop the whole site.  Keep a schema-safe empty mapping so PostgreSQL
+        # sections, navigation, DataLens and raw reports stay available.  All unmatched
+        # SKU will be explicitly classified as «Не сопоставлено» until refresh succeeds.
         empty = _empty_entity_reference()
         checked_at = datetime.now().isoformat(timespec="seconds")
         result = (
             empty,
-            "Reference temporarily unavailable; PostgreSQL remains active",
+            "Временно без справочника · PostgreSQL продолжает работать",
             checked_at,
-            f"Reference sheet is unavailable. Error: {error}",
+            "Лист «Справочник» сейчас недоступен через Apps Script. "
+            "Сайт продолжает работу; SKU без справочника временно попадут в «Не сопоставлено». "
+            "Нажмите «Обновить справочник сейчас» после восстановления Apps Script.",
             _entity_reference_signature(empty),
         )
         _store_entity_reference_in_session(*result)
@@ -10205,7 +10071,7 @@ with st.sidebar:
     st.header("Параметры")
     st.caption(f"Аналитика спроса · {BUILD_ID} · LAZY LOAD")
     st.caption("Автозагрузка · дневной срез + ленивая детализация")
-    st.caption("Источники: PostgreSQL + Google Sheets API; Apps Script только резерв")
+    st.caption("Источники: PostgreSQL + Apps Script · без обязательных локальных XLSX")
     st.caption(f"SKU / категории / сущности · {entity_reference_source}")
     if entity_reference_checked_at:
         checked_label = str(entity_reference_checked_at).replace("T", " ")
@@ -10215,27 +10081,26 @@ with st.sidebar:
     if st.button(
         "Обновить справочник сейчас",
         use_container_width=True,
-        key="refresh_entity_reference_now_v751226",
+        key="refresh_entity_reference_now_v751215",
         help=(
-            "Directly rereads the reference sheet through Google Sheets API. "
-            "If direct access fails, Apps Script is used as fallback."
+            "Пробует заново прочитать лист «Справочник» через Apps Script. "
+            "Если запрос не пройдет, уже загруженный справочник останется в работе."
         ),
     ):
         previous_snapshot = st.session_state.get(ENTITY_REFERENCE_SESSION_KEY)
-        _fetch_google_sheets_entity_reference.clear()
         _fetch_apps_script_entity_reference.clear()
         st.session_state.pop(ENTITY_REFERENCE_SESSION_KEY, None)
         try:
             refreshed_reference = get_current_entity_reference()
             _store_entity_reference_in_session(*refreshed_reference)
-            st.toast(f"Справочник обновлен: {refreshed_reference[1]}")
+            st.toast("Справочник обновлен через Apps Script", icon="✅")
             st.rerun()
         except Exception as refresh_error:
             if isinstance(previous_snapshot, dict):
                 st.session_state[ENTITY_REFERENCE_SESSION_KEY] = previous_snapshot
             st.warning(
-                "Reference refresh failed. The previous successful snapshot remains active. "
-                f"{refresh_error}"
+                "Apps Script пока недоступен. Сайт не остановлен: продолжаю работать "
+                "с текущим резервом справочника / режимом «Не сопоставлено»."
             )
     with st.expander("Подключение к PostgreSQL", expanded=not bool(os.getenv("PGPASSWORD"))):
         pg_host = st.text_input(
