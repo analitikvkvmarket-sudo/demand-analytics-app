@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.27-REMOVE-TOP3-ENTITIES"
+BUILD_ID = "75.12.28-REPORT-SOURCE-AUDIT"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -1669,6 +1669,148 @@ def load_sales(date_from: date, date_to_exclusive: date, points: tuple[int, ...]
             records = cursor.fetchall()
             columns = [description.name for description in cursor.description]
     return _normalize_sales_frame(pd.DataFrame(records, columns=columns))
+
+
+@st.cache_data(ttl=1800, show_spinner="Сверяю SET/ERP с dwh.v_sales_item…")
+def load_report_source_audit(
+    date_from: date,
+    date_to_exclusive: date,
+) -> dict[str, object]:
+    """Read-only reconciliation of the raw SET/ERP sales fact and dwh.v_sales_item.
+
+    The global daily comparison answers the main question without relying on point
+    mapping: did the same quantity of sales reach the DWH view for each date?
+    A second raw-shop table is diagnostic only and compares p.shop with shop_number
+    literally, so it can also reveal point-code transformations between layers.
+    """
+    config = get_entity_direct_source_config()
+    purchase_table = str(config["purchase_table"])
+    positions_table = str(config["positions_table"])
+    purchase_id_column = str(config["purchase_id_column"])
+    position_purchase_column = str(config["position_purchase_column"])
+    sale_time_column = str(config["sale_time_column"])
+    shop_column = str(config["shop_column"])
+    quantity_column = str(config["quantity_column"])
+    operation_column = config.get("operation_column")
+    operation_filter = f" AND p.{operation_column} = TRUE " if operation_column else ""
+
+    erp_daily_sql = f"""
+        SELECT
+            p.{sale_time_column}::date AS business_date,
+            SUM(COALESCE(pos.{quantity_column}, 0))::numeric AS set_qty,
+            COUNT(DISTINCT p.{purchase_id_column})::bigint AS set_checks
+        FROM public.{purchase_table} p
+        INNER JOIN public.{positions_table} pos
+            ON pos.{position_purchase_column} = p.{purchase_id_column}
+        WHERE p.{sale_time_column} >= %(date_from)s
+          AND p.{sale_time_column} < %(date_to)s
+          AND p.{shop_column} IS NOT NULL
+          {operation_filter}
+        GROUP BY p.{sale_time_column}::date
+        ORDER BY 1
+    """
+    dwh_daily_sql = """
+        SELECT
+            business_date,
+            SUM(COALESCE(net_quantity, 0))::numeric AS dwh_qty,
+            COUNT(DISTINCT source_purchase_id)::bigint AS dwh_checks,
+            SUM(COALESCE(net_line_amount, 0))::numeric AS dwh_revenue
+        FROM dwh.v_sales_item
+        WHERE business_date >= %(date_from)s
+          AND business_date < %(date_to)s
+          AND shop_number IS NOT NULL
+        GROUP BY business_date
+        ORDER BY 1
+    """
+    erp_shop_sql = f"""
+        SELECT
+            p.{sale_time_column}::date AS business_date,
+            BTRIM(CAST(p.{shop_column} AS text)) AS raw_shop,
+            SUM(COALESCE(pos.{quantity_column}, 0))::numeric AS set_qty,
+            COUNT(DISTINCT p.{purchase_id_column})::bigint AS set_checks
+        FROM public.{purchase_table} p
+        INNER JOIN public.{positions_table} pos
+            ON pos.{position_purchase_column} = p.{purchase_id_column}
+        WHERE p.{sale_time_column} >= %(date_from)s
+          AND p.{sale_time_column} < %(date_to)s
+          AND p.{shop_column} IS NOT NULL
+          {operation_filter}
+        GROUP BY p.{sale_time_column}::date, BTRIM(CAST(p.{shop_column} AS text))
+        ORDER BY 1, 2
+    """
+    dwh_shop_sql = """
+        SELECT
+            business_date,
+            BTRIM(CAST(shop_number AS text)) AS raw_shop,
+            SUM(COALESCE(net_quantity, 0))::numeric AS dwh_qty,
+            COUNT(DISTINCT source_purchase_id)::bigint AS dwh_checks,
+            SUM(COALESCE(net_line_amount, 0))::numeric AS dwh_revenue
+        FROM dwh.v_sales_item
+        WHERE business_date >= %(date_from)s
+          AND business_date < %(date_to)s
+          AND shop_number IS NOT NULL
+        GROUP BY business_date, BTRIM(CAST(shop_number AS text))
+        ORDER BY 1, 2
+    """
+
+    params = {"date_from": date_from, "date_to": date_to_exclusive}
+    with pg_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(erp_daily_sql, params)
+            erp_daily_rows = cursor.fetchall()
+            erp_daily_cols = [description.name for description in cursor.description]
+
+            cursor.execute(dwh_daily_sql, params)
+            dwh_daily_rows = cursor.fetchall()
+            dwh_daily_cols = [description.name for description in cursor.description]
+
+            cursor.execute(erp_shop_sql, params)
+            erp_shop_rows = cursor.fetchall()
+            erp_shop_cols = [description.name for description in cursor.description]
+
+            cursor.execute(dwh_shop_sql, params)
+            dwh_shop_rows = cursor.fetchall()
+            dwh_shop_cols = [description.name for description in cursor.description]
+
+    erp_daily = pd.DataFrame(erp_daily_rows, columns=erp_daily_cols)
+    dwh_daily = pd.DataFrame(dwh_daily_rows, columns=dwh_daily_cols)
+    daily = erp_daily.merge(dwh_daily, on="business_date", how="outer").sort_values("business_date")
+    for column in ["set_qty", "set_checks", "dwh_qty", "dwh_checks", "dwh_revenue"]:
+        if column not in daily.columns:
+            daily[column] = 0.0
+        daily[column] = pd.to_numeric(daily[column], errors="coerce").fillna(0.0)
+    daily["qty_delta"] = daily["dwh_qty"] - daily["set_qty"]
+    daily["qty_delta_pct"] = daily["qty_delta"].div(daily["set_qty"].replace(0, pd.NA)) * 100
+    daily["checks_delta"] = daily["dwh_checks"] - daily["set_checks"]
+    daily["status"] = daily["qty_delta"].abs().le(0.0001).map({True: "OK", False: "РАСХОЖДЕНИЕ"})
+    daily["business_date"] = pd.to_datetime(daily["business_date"], errors="coerce").dt.date
+
+    erp_shop = pd.DataFrame(erp_shop_rows, columns=erp_shop_cols)
+    dwh_shop = pd.DataFrame(dwh_shop_rows, columns=dwh_shop_cols)
+    by_shop = erp_shop.merge(dwh_shop, on=["business_date", "raw_shop"], how="outer")
+    for column in ["set_qty", "set_checks", "dwh_qty", "dwh_checks", "dwh_revenue"]:
+        if column not in by_shop.columns:
+            by_shop[column] = 0.0
+        by_shop[column] = pd.to_numeric(by_shop[column], errors="coerce").fillna(0.0)
+    by_shop["qty_delta"] = by_shop["dwh_qty"] - by_shop["set_qty"]
+    by_shop["qty_delta_pct"] = by_shop["qty_delta"].div(by_shop["set_qty"].replace(0, pd.NA)) * 100
+    by_shop["checks_delta"] = by_shop["dwh_checks"] - by_shop["set_checks"]
+    by_shop["status"] = by_shop["qty_delta"].abs().le(0.0001).map({True: "OK", False: "РАСХОЖДЕНИЕ"})
+    by_shop["business_date"] = pd.to_datetime(by_shop["business_date"], errors="coerce").dt.date
+    by_shop["raw_shop"] = by_shop["raw_shop"].fillna("").astype(str).str.strip()
+    by_shop = by_shop.sort_values(["business_date", "raw_shop"], kind="stable").reset_index(drop=True)
+
+    return {
+        "daily": daily.reset_index(drop=True),
+        "by_shop": by_shop,
+        "source_caption": (
+            f"SET/ERP: public.{purchase_table} + public.{positions_table} · "
+            f"дата p.{sale_time_column} · точка p.{shop_column} · "
+            f"количество SUM(pos.{quantity_column})"
+            + (f" · фильтр p.{operation_column}=TRUE" if operation_column else "")
+            + "; DWH: dwh.v_sales_item · business_date / shop_number / SUM(net_quantity)."
+        ),
+    }
 
 
 @st.cache_data(ttl=1800, show_spinner="Проверяю все точки напрямую в PostgreSQL…")
@@ -13513,6 +13655,173 @@ if tab_report.open:
                 format="DD.MM.YYYY",
                 key="report_period_2_v770",
             )
+
+        with st.expander("Контроль SET → PostgreSQL → Отчет", expanded=False):
+            st.caption(
+                "Проверка ничего не меняет в данных. Она только читает тот же PostgreSQL и сравнивает "
+                "сырой факт SET/ERP с dwh.v_sales_item до категорий, сущностей и фильтров отчета."
+            )
+            audit_period_choice = st.radio(
+                "Какой период проверить",
+                ["Период 1", "Период 2"],
+                horizontal=True,
+                key="report_source_audit_period_v751228",
+            )
+            audit_input = report_period_1_input if audit_period_choice == "Период 1" else report_period_2_input
+            audit_valid = isinstance(audit_input, tuple) and len(audit_input) == 2
+            if st.button(
+                "Проверить прохождение данных",
+                type="secondary",
+                use_container_width=True,
+                key="report_source_audit_run_v751228",
+            ):
+                if not audit_valid:
+                    st.error("Сначала укажите начало и конец выбранного периода.")
+                else:
+                    audit_start, audit_end = tuple(audit_input)
+                    if audit_start > audit_end:
+                        audit_start, audit_end = audit_end, audit_start
+                    try:
+                        audit_result = load_report_source_audit(
+                            audit_start,
+                            audit_end + timedelta(days=1),
+                        )
+                        st.session_state["report_source_audit_v751228"] = {
+                            "label": audit_period_choice,
+                            "period": (audit_start, audit_end),
+                            "result": audit_result,
+                        }
+                    except Exception as error:
+                        st.session_state.pop("report_source_audit_v751228", None)
+                        st.error(f"Не удалось выполнить контроль источника: {error}")
+
+            audit_state = st.session_state.get("report_source_audit_v751228")
+            if audit_state:
+                audit_result = audit_state.get("result") or {}
+                audit_daily = audit_result.get("daily")
+                audit_by_shop = audit_result.get("by_shop")
+                audit_period = audit_state.get("period")
+                if audit_period:
+                    st.caption(
+                        f"Проверено: {audit_state.get('label', '')} · "
+                        f"{audit_period[0]:%d.%m.%Y}–{audit_period[1]:%d.%m.%Y}"
+                    )
+                source_caption = str(audit_result.get("source_caption") or "")
+                if source_caption:
+                    st.caption(source_caption)
+
+                if isinstance(audit_daily, pd.DataFrame) and not audit_daily.empty:
+                    set_qty_total = float(audit_daily["set_qty"].sum())
+                    dwh_qty_total = float(audit_daily["dwh_qty"].sum())
+                    qty_delta_total = dwh_qty_total - set_qty_total
+                    set_checks_total = float(audit_daily["set_checks"].sum())
+                    dwh_checks_total = float(audit_daily["dwh_checks"].sum())
+                    bad_days = int(audit_daily["status"].ne("OK").sum())
+
+                    audit_metrics = st.columns(6)
+                    audit_metrics[0].metric("SET/ERP, шт.", f"{set_qty_total:,.0f}".replace(",", " "))
+                    audit_metrics[1].metric("DWH, шт.", f"{dwh_qty_total:,.0f}".replace(",", " "))
+                    audit_metrics[2].metric("Разница, шт.", f"{qty_delta_total:+,.0f}".replace(",", " "))
+                    audit_metrics[3].metric("SET чеков", f"{set_checks_total:,.0f}".replace(",", " "))
+                    audit_metrics[4].metric("DWH чеков", f"{dwh_checks_total:,.0f}".replace(",", " "))
+                    audit_metrics[5].metric("Дней с расхождением", str(bad_days))
+
+                    if abs(qty_delta_total) <= 0.0001 and bad_days == 0:
+                        st.success(
+                            "По количеству продаж SET/ERP и dwh.v_sales_item совпадают по каждому дню выбранного периода."
+                        )
+                    elif abs(qty_delta_total) <= 0.0001:
+                        st.warning(
+                            "Общий итог по штукам совпал, но внутри периода есть дни с переносом/расхождением. Смотрите таблицу ниже."
+                        )
+                    else:
+                        st.error(
+                            "Есть расхождение между сырым SET/ERP и dwh.v_sales_item ещё ДО формирования вкладки «Отчет»."
+                        )
+
+                    daily_display = audit_daily.rename(
+                        columns={
+                            "business_date": "Дата",
+                            "set_qty": "SET/ERP, шт.",
+                            "dwh_qty": "DWH, шт.",
+                            "qty_delta": "Разница, шт.",
+                            "qty_delta_pct": "Разница, %",
+                            "set_checks": "SET чеков",
+                            "dwh_checks": "DWH чеков",
+                            "checks_delta": "Разница чеков",
+                            "dwh_revenue": "DWH выручка, ₽",
+                            "status": "Статус",
+                        }
+                    )
+                    st.markdown("##### По дням")
+                    st.dataframe(
+                        daily_display[
+                            [
+                                "Дата", "SET/ERP, шт.", "DWH, шт.", "Разница, шт.", "Разница, %",
+                                "SET чеков", "DWH чеков", "Разница чеков", "DWH выручка, ₽", "Статус",
+                            ]
+                        ],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "SET/ERP, шт.": st.column_config.NumberColumn(format="%.0f"),
+                            "DWH, шт.": st.column_config.NumberColumn(format="%.0f"),
+                            "Разница, шт.": st.column_config.NumberColumn(format="%+.0f"),
+                            "Разница, %": st.column_config.NumberColumn(format="%+.2f%%"),
+                            "SET чеков": st.column_config.NumberColumn(format="%.0f"),
+                            "DWH чеков": st.column_config.NumberColumn(format="%.0f"),
+                            "Разница чеков": st.column_config.NumberColumn(format="%+.0f"),
+                            "DWH выручка, ₽": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                    )
+
+                    if isinstance(audit_by_shop, pd.DataFrame) and not audit_by_shop.empty:
+                        shop_bad = audit_by_shop[audit_by_shop["status"].ne("OK")].copy()
+                        st.markdown("##### Диагностика по raw-точкам")
+                        st.caption(
+                            "Здесь p.shop из SET/ERP сравнивается буквально с shop_number из DWH. "
+                            "Если код точки преобразуется при загрузке, это будет видно отдельными строками."
+                        )
+                        if shop_bad.empty:
+                            st.success("По raw-кодам точек расхождений количества не найдено.")
+                        else:
+                            shop_display = shop_bad.rename(
+                                columns={
+                                    "business_date": "Дата",
+                                    "raw_shop": "raw точка",
+                                    "set_qty": "SET/ERP, шт.",
+                                    "dwh_qty": "DWH, шт.",
+                                    "qty_delta": "Разница, шт.",
+                                    "qty_delta_pct": "Разница, %",
+                                    "set_checks": "SET чеков",
+                                    "dwh_checks": "DWH чеков",
+                                    "checks_delta": "Разница чеков",
+                                    "dwh_revenue": "DWH выручка, ₽",
+                                    "status": "Статус",
+                                }
+                            )
+                            st.dataframe(
+                                shop_display[
+                                    [
+                                        "Дата", "raw точка", "SET/ERP, шт.", "DWH, шт.", "Разница, шт.",
+                                        "Разница, %", "SET чеков", "DWH чеков", "Разница чеков", "Статус",
+                                    ]
+                                ],
+                                use_container_width=True,
+                                hide_index=True,
+                                height=min(650, 38 * len(shop_display) + 80),
+                                column_config={
+                                    "SET/ERP, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                    "DWH, шт.": st.column_config.NumberColumn(format="%.0f"),
+                                    "Разница, шт.": st.column_config.NumberColumn(format="%+.0f"),
+                                    "Разница, %": st.column_config.NumberColumn(format="%+.2f%%"),
+                                    "SET чеков": st.column_config.NumberColumn(format="%.0f"),
+                                    "DWH чеков": st.column_config.NumberColumn(format="%.0f"),
+                                    "Разница чеков": st.column_config.NumberColumn(format="%+.0f"),
+                                },
+                            )
+                else:
+                    st.info("За выбранный период контрольный запрос не вернул данных.")
 
         report_match_weekdays = st.checkbox(
             "Сверять по одинаковым дням недели",
