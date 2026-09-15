@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.25-ENTITY-DIRECT-ERPI"
+BUILD_ID = "75.12.27-REMOVE-TOP3-ENTITIES"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -8882,19 +8882,6 @@ def export_excel(
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         category_profile.to_excel(writer, sheet_name="Профиль категорий", index=False)
         entity_profile.to_excel(writer, sheet_name="Профиль сущностей", index=False)
-        top3_export = entity_profile[entity_profile["entity_rank_category"] <= 3].copy()
-        entity_category_totals = (
-            entity_profile.groupby(["point", "category"], as_index=False)["entity_sales"]
-            .sum()
-            .rename(columns={"entity_sales": "category_entity_sales"})
-        )
-        top3_export = top3_export.merge(entity_category_totals, on=["point", "category"], how="left")
-        top3_export["share_inside_category"] = (
-            top3_export["entity_sales"] / top3_export["category_entity_sales"].replace(0, pd.NA)
-        )
-        top3_export.sort_values(["point", "category", "entity_rank_category"]).to_excel(
-            writer, sheet_name="Топ-3 сущности", index=False
-        )
         sku_point.to_excel(writer, sheet_name="Продажи SKU", index=False)
         detail_export = daily_detail.copy()
         detail_export.insert(0, "Дата", pd.to_datetime(detail_export["business_date"]).dt.date)
@@ -11950,7 +11937,6 @@ MENU_ITEMS = [
     ("Аналитика DataLens", ":material/analytics:"),
     ("Отчет", ":material/description:"),
     ("Сравнение", ":material/compare_arrows:"),
-    ("Топ-3 сущности", ":material/account_tree:"),
     ("Сущности", ":material/storefront:"),
     ("Детализация", ":material/pie_chart:"),
     ("Детализация категории", ":material/sell:"),
@@ -13144,7 +13130,7 @@ class _MainSection:
         return False
 
 
-tab_mean, tab_datalens, tab_report, tab_comparison, tab_points, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_menu_archive, tab_cycle_plan = [
+tab_mean, tab_datalens, tab_report, tab_comparison, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_menu_archive, tab_cycle_plan = [
     _MainSection(label) for label, _ in MENU_ITEMS
 ]
 # Удалённые разделы оставлены как закрытые заглушки, чтобы старый код ниже
@@ -14497,106 +14483,6 @@ if tab_report.open:
 
 
 # Старый «Дашборд» удалён. Его место в меню занимает отчёт «Ср/знач».
-
-if tab_points.open:
-    with tab_points:
-        top3 = filtered_entity[filtered_entity["entity_rank_category"] <= 3].copy()
-        point_category_totals = filtered_category[["point", "category", "category_sales"]].copy()
-        top3 = top3.merge(point_category_totals, on=["point", "category"], how="left")
-        top3["entity_share_category"] = top3["entity_sales"] / top3["category_sales"].replace(0, pd.NA)
-        top3 = top3.sort_values(["point", "category", "entity_rank_category"])
-        top3_display = top3.rename(
-            columns={
-                "point": "Точка",
-                "category": "Категория",
-                "entity_rank_category": "Ранг",
-                "entity": "Сущность",
-                "entity_sales": "Продано, шт.",
-                "entity_share_category": "Доля сущности в категории",
-                "entity_share_point": "Доля сущности в продажах точки",
-            }
-        )
-        st.caption("Топ-3 сущности внутри каждой категории отдельно по каждой выбранной точке.")
-        st.dataframe(
-            top3_display[
-                [
-                    "Категория",
-                    "Ранг",
-                    "Сущность",
-                    "Продано, шт.",
-                    "Доля сущности в категории",
-                    "Доля сущности в продажах точки",
-                ]
-            ].style.format(
-                {
-                    "Продано, шт.": "{:,.0f}",
-                    "Доля сущности в категории": "{:.1%}",
-                    "Доля сущности в продажах точки": "{:.1%}",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Категория": st.column_config.TextColumn("Категория", width="medium"),
-                "Ранг": st.column_config.NumberColumn("Ранг", width="small", format="%d"),
-                "Сущность": st.column_config.TextColumn("Сущность", width="large"),
-            },
-        )
-        chart_top3 = top3.groupby(["category", "entity"], as_index=False)["entity_sales"].sum()
-        if not chart_top3.empty:
-            category_colors = {
-                "Вторые блюда": "#F4B183",
-                "Десерты": "#C9A0DC",
-                "Завтраки": "#FFD966",
-                "Напитки": "#5B9BD5",
-                "Салаты": "#70AD47",
-                "Супы": "#A5A5A5",
-                "Сэндвичи": "#ED7D31",
-                "Хлеб": "#C55A11",
-                "Япония": "#FF6699",
-            }
-            category_funnel = (
-                filtered_category.groupby("category", as_index=False)["category_sales"]
-                .sum()
-                .sort_values("category_sales", ascending=False)
-            )
-            category_total = category_funnel["category_sales"].sum()
-            category_funnel["category_share"] = category_funnel["category_sales"] / category_total
-            entity_labels = (
-                chart_top3.sort_values(["category", "entity_sales"], ascending=[True, False])
-                .groupby("category")["entity"]
-                .apply(lambda values: " • ".join(values.astype(str).head(3)))
-            )
-            category_funnel["entities"] = category_funnel["category"].map(entity_labels).fillna("Нет данных")
-            category_funnel["label"] = category_funnel.apply(
-                lambda row: (
-                    f"<b>{row['category']}</b> — {row['category_share']:.1%}<br>"
-                    f"{row['entities']}<br>{row['category_sales']:,.0f} шт."
-                ).replace(",", " "),
-                axis=1,
-            )
-            funnel = go.Figure(
-                go.Funnel(
-                    y=category_funnel["category"],
-                    x=category_funnel["category_sales"],
-                    text=category_funnel["label"],
-                    textinfo="text",
-                    textposition="inside",
-                    marker={
-                        "color": [category_colors.get(category, "#7F8C8D") for category in category_funnel["category"]],
-                        "line": {"color": "white", "width": 2},
-                    },
-                    connector={"line": {"color": "#D9D9D9", "width": 1}},
-                    hovertemplate="%{text}<extra></extra>",
-                )
-            )
-            funnel.update_layout(
-                title="Категории по доле продаж и их топ-3 сущности",
-                height=max(600, 90 * len(category_funnel)),
-                margin=dict(t=70, l=30, r=30, b=20),
-                showlegend=False,
-            )
-            st.plotly_chart(funnel, use_container_width=True)
 
 if tab_entities.open:
     with tab_entities:
