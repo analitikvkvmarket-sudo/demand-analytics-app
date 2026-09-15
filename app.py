@@ -79,28 +79,13 @@ def _read_runtime_secret(name: str, default: str = "") -> str:
 
 
 def _build_datalens_embed_url() -> str:
-    """Build a short-lived JWT URL for the private DataLens dashboard embed."""
-    embed_id = _read_runtime_secret("DATALENS_EMBED_ID")
-    private_key = _read_runtime_secret("DATALENS_PRIVATE_KEY")
-
-    if not embed_id:
-        raise RuntimeError("В Streamlit Secrets не задан DATALENS_EMBED_ID.")
-    if not private_key:
-        raise RuntimeError("В Streamlit Secrets не задан DATALENS_PRIVATE_KEY.")
-
-    # Streamlit TOML may contain either real line breaks or escaped \n sequences.
-    private_key = private_key.replace("\\n", "\n")
-
-    now = int(time.time())
-    payload = {
-        "embedId": embed_id,
-        "dlEmbedService": "YC_DATALENS_EMBEDDING_SERVICE_MARK",
-        "iat": now,
-        "exp": now + 360,
-        "params": {},
-    }
-    token = jwt.encode(payload, private_key, algorithm="PS256")
-    return f"https://datalens.ru/embeds/dash#dl_embed_token={token}"
+    """Публичный DataLens dashboard для отображения внутри Streamlit."""
+    return (
+        "https://datalens.yandex/33xzxfj8p4mgm"
+        "?_share_link=public"
+        "&_embedded=1"
+        "&_theme=light"
+    )
 
 
 MENU_ARCHIVE_APPS_SCRIPT_URL = _read_runtime_secret(
