@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.30-REMOVE-DATALENS"
+BUILD_ID = "75.12.31-CYCLE-LIMITS-WEEKDAY-PROFILE"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -10714,13 +10714,11 @@ def apply_cycle_category_limits(
         limit_frame["month_key"] = ""
     limit_frame["month_key"] = limit_frame["month_key"].fillna("").astype(str)
 
-    # A month-specific uploaded report only controls plans inside that same month.
-    month_specific = bool(limit_frame["month_key"].ne("").any())
+    # The uploaded report is a reusable weekday profile, not a month lock.
+    # Its source period stays in metadata only; limits apply by
+    # Point + Category + Weekday to any plan date until the file is replaced/cleared.
     merge_left = ["_point", "_category", "_weekday"]
     merge_right = ["_point", "_category", "_weekday"]
-    if month_specific:
-        merge_left = ["_month_key"] + merge_left
-        merge_right = ["month_key"] + merge_right
 
     limit_unique = limit_frame[
         merge_right + ["min_sales", "avg_sales", "max_sales"]
@@ -21938,7 +21936,7 @@ if tab_cycle_plan.open:
                 limit_metrics[1].metric("Категорий", int(loaded_limits["category"].nunique()))
                 limit_metrics[2].metric("Связок", int(len(loaded_limits)))
                 limit_metrics[3].metric(
-                    "Месяц",
+                    "Источник",
                     str(loaded_limits_meta.get("month_label") or loaded_limits_meta.get("month_key") or "—"),
                 )
                 period_from = loaded_limits_meta.get("period_start")
@@ -21946,7 +21944,9 @@ if tab_cycle_plan.open:
                 if isinstance(period_from, date) and isinstance(period_to, date):
                     st.caption(
                         f"Источник ограничений: {period_from:%d.%m.%Y}–{period_to:%d.%m.%Y}. "
-                        "Ограничения применяются к соответствующему дню недели и, если в отчёте определён один месяц, только к этому месяцу."
+                        "Период используется только как информация об источнике. "
+                        "Ограничения действуют как профиль Точка + Категория + День недели для любых дат плана "
+                        "до загрузки нового файла или очистки ограничений."
                     )
                 if st.button(
                     "Очистить ограничения",
@@ -21991,7 +21991,8 @@ if tab_cycle_plan.open:
         if isinstance(active_limits, pd.DataFrame) and not active_limits.empty:
             st.success(
                 "Контроль Мин/Макс категории активен. Новый план SKU сначала считается по циклической логике, "
-                "после чего сумма категории на точке сверяется с загруженным отчётом."
+                "после чего сумма категории на точке сверяется с профилем Точка + Категория + День недели "
+                "без привязки к месяцу."
             )
         else:
             st.warning("Контроль категорий не загружен — цветовые ограничения Мин/Макс применяться не будут.")
