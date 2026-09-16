@@ -35,7 +35,7 @@ from openpyxl.utils import get_column_letter
 
 
 APP_DIR = Path(__file__).resolve().parent
-BUILD_ID = "75.12.31-CYCLE-LIMITS-WEEKDAY-PROFILE"
+BUILD_ID = "75.12.32-CARRYOVER-CATEGORY-BY-POINT"
 
 
 MATRIX_APPS_SCRIPT_URL = os.getenv(
@@ -12042,6 +12042,231 @@ def export_cycle_plan_v1_excel(file_bytes: bytes, frame: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
+# ============================================================
+# Переходящий остаток: Дата плана + Точка + SKU -> D1 -> D2
+# ============================================================
+
+@st.cache_data(ttl=900, show_spinner="Загружаю продажи D1/D2 для переходящего остатка…")
+def load_carryover_sales(
+    date_from: date,
+    date_to_exclusive: date,
+    shops: tuple[int, ...],
+    skus: tuple[str, ...],
+) -> pd.DataFrame:
+    """Продажи только выбранных SKU плана за D1/D2.
+
+    SKU формируется тем же правилом, что и в основном факте приложения:
+    первый непустой erp_code -> product_code -> barcode -> product_hash.
+    """
+    if not shops or not skus:
+        return pd.DataFrame(
+            columns=["business_date", "shop_number", "sku", "product_name", "sold_quantity"]
+        )
+
+    query = """
+        SELECT
+            business_date,
+            shop_number,
+            COALESCE(
+                NULLIF(TRIM(erp_code), ''),
+                NULLIF(TRIM(product_code), ''),
+                NULLIF(TRIM(barcode), ''),
+                NULLIF(TRIM(product_hash), ''),
+                'БЕЗ_SKU'
+            ) AS sku,
+            MAX(product_name) AS product_name,
+            SUM(net_quantity)::numeric AS sold_quantity
+        FROM dwh.v_sales_item
+        WHERE business_date >= %(date_from)s
+          AND business_date < %(date_to)s
+          AND shop_number = ANY(%(shops)s)
+          AND COALESCE(
+                NULLIF(TRIM(erp_code), ''),
+                NULLIF(TRIM(product_code), ''),
+                NULLIF(TRIM(barcode), ''),
+                NULLIF(TRIM(product_hash), ''),
+                'БЕЗ_SKU'
+              ) = ANY(%(skus)s)
+        GROUP BY business_date, shop_number,
+                 COALESCE(
+                    NULLIF(TRIM(erp_code), ''),
+                    NULLIF(TRIM(product_code), ''),
+                    NULLIF(TRIM(barcode), ''),
+                    NULLIF(TRIM(product_hash), ''),
+                    'БЕЗ_SKU'
+                 )
+        ORDER BY business_date, shop_number, sku
+    """
+    with pg_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                query,
+                {
+                    "date_from": date_from,
+                    "date_to": date_to_exclusive,
+                    "shops": list(shops),
+                    "skus": list(skus),
+                },
+            )
+            records = cursor.fetchall()
+            columns = [description.name for description in cursor.description]
+
+    frame = pd.DataFrame(records, columns=columns)
+    if frame.empty:
+        return frame
+    frame["business_date"] = pd.to_datetime(frame["business_date"], errors="coerce").dt.date
+    frame["shop_number"] = pd.to_numeric(frame["shop_number"], errors="coerce")
+    frame["sku"] = frame["sku"].map(normalize_sku)
+    frame["sold_quantity"] = pd.to_numeric(
+        frame["sold_quantity"], errors="coerce"
+    ).fillna(0.0)
+    return frame[
+        frame["business_date"].notna()
+        & frame["shop_number"].notna()
+        & frame["sku"].notna()
+    ].copy()
+
+
+def build_carryover_detail(
+    plan_rows: pd.DataFrame,
+    sales_rows: pd.DataFrame,
+    point_to_shop: dict[str, int],
+    plan_date: date,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Сначала считает каждый SKU, затем агрегирует SKU в Точка -> Категория.
+
+    Расчётный остаток не является физическим складским остатком. Это остаток выбранной
+    плановой партии по формуле План - продажи D1/D2 в пределах доступного остатка.
+    """
+    detail_columns = [
+        "Точка", "Категория", "SKU", "Название блюда", "Дата плана", "D1", "D2",
+        "План", "Съели D1", "Осталось после D1", "Продажи D2 в БД",
+        "Съели из остатка D2", "Осталось после D2",
+    ]
+    summary_columns = [
+        "Точка", "Категория", "Дата плана", "D1", "D2", "SKU, шт.", "План",
+        "Съели D1", "Осталось после D1", "Съели из остатка D2", "Осталось после D2",
+    ]
+    if plan_rows is None or plan_rows.empty:
+        return pd.DataFrame(columns=detail_columns), pd.DataFrame(columns=summary_columns)
+
+    d1 = plan_date + timedelta(days=1)
+    d2 = plan_date + timedelta(days=2)
+
+    plans = plan_rows.copy()
+    plans["plan_date"] = pd.to_datetime(plans["plan_date"], errors="coerce").dt.date
+    plans["point_number"] = pd.to_numeric(plans["point_number"], errors="coerce")
+    plans["sku"] = plans["sku"].map(normalize_sku)
+    plans["analyst_plan"] = pd.to_numeric(
+        plans["analyst_plan"], errors="coerce"
+    ).fillna(0.0).clip(lower=0)
+    plans["matrix_category"] = (
+        plans["matrix_category"]
+        .map(normalize_matrix_category)
+        .fillna("Не сопоставлено")
+        .astype(str)
+        .str.strip()
+        .replace({"": "Не сопоставлено", "nan": "Не сопоставлено", "None": "Не сопоставлено"})
+    )
+    plans["product_name"] = plans["product_name"].fillna("").astype(str).str.strip()
+    plans = plans[
+        plans["plan_date"].eq(plan_date)
+        & plans["point_number"].notna()
+        & plans["sku"].notna()
+        & plans["analyst_plan"].gt(0)
+    ].copy()
+    if plans.empty:
+        return pd.DataFrame(columns=detail_columns), pd.DataFrame(columns=summary_columns)
+
+    plans["point_number"] = plans["point_number"].astype(int)
+    plans["Точка"] = plans["point_number"].map(lambda value: f"Т{int(value)}")
+    plans["shop_number"] = plans["Точка"].map(point_to_shop)
+    plans = plans[plans["shop_number"].notna()].copy()
+    if plans.empty:
+        return pd.DataFrame(columns=detail_columns), pd.DataFrame(columns=summary_columns)
+    plans["shop_number"] = plans["shop_number"].astype(int)
+
+    sales = sales_rows.copy() if sales_rows is not None else pd.DataFrame()
+    if sales.empty:
+        sales = pd.DataFrame(columns=["business_date", "shop_number", "sku", "sold_quantity"])
+    else:
+        sales["business_date"] = pd.to_datetime(sales["business_date"], errors="coerce").dt.date
+        sales["shop_number"] = pd.to_numeric(sales["shop_number"], errors="coerce")
+        sales["sku"] = sales["sku"].map(normalize_sku)
+        sales["sold_quantity"] = pd.to_numeric(
+            sales["sold_quantity"], errors="coerce"
+        ).fillna(0.0)
+
+    def _sales_for_day(fact_date: date, output_name: str) -> pd.DataFrame:
+        day = sales[sales["business_date"].eq(fact_date)].copy()
+        if day.empty:
+            return pd.DataFrame(columns=["shop_number", "sku", output_name])
+        day = (
+            day.groupby(["shop_number", "sku"], as_index=False, dropna=False)["sold_quantity"]
+            .sum()
+            .rename(columns={"sold_quantity": output_name})
+        )
+        day[output_name] = pd.to_numeric(day[output_name], errors="coerce").fillna(0.0).clip(lower=0)
+        return day
+
+    d1_sales = _sales_for_day(d1, "Съели D1")
+    d2_sales = _sales_for_day(d2, "Продажи D2 в БД")
+
+    work = plans.merge(d1_sales, on=["shop_number", "sku"], how="left")
+    work = work.merge(d2_sales, on=["shop_number", "sku"], how="left")
+    work["Съели D1"] = pd.to_numeric(work["Съели D1"], errors="coerce").fillna(0.0).clip(lower=0)
+    work["Продажи D2 в БД"] = pd.to_numeric(
+        work["Продажи D2 в БД"], errors="coerce"
+    ).fillna(0.0).clip(lower=0)
+    work["Осталось после D1"] = (work["analyst_plan"] - work["Съели D1"]).clip(lower=0)
+    work["Съели из остатка D2"] = work[["Продажи D2 в БД", "Осталось после D1"]].min(axis=1)
+    work["Осталось после D2"] = (
+        work["Осталось после D1"] - work["Съели из остатка D2"]
+    ).clip(lower=0)
+
+    detail = pd.DataFrame(
+        {
+            "Точка": work["Точка"],
+            "Категория": work["matrix_category"].replace("", "Не сопоставлено"),
+            "SKU": work["sku"],
+            "Название блюда": work["product_name"],
+            "Дата плана": plan_date,
+            "D1": d1,
+            "D2": d2,
+            "План": work["analyst_plan"],
+            "Съели D1": work["Съели D1"],
+            "Осталось после D1": work["Осталось после D1"],
+            "Продажи D2 в БД": work["Продажи D2 в БД"],
+            "Съели из остатка D2": work["Съели из остатка D2"],
+            "Осталось после D2": work["Осталось после D2"],
+        }
+    )
+    detail = detail.sort_values(
+        ["Точка", "Категория", "Осталось после D2", "Название блюда", "SKU"],
+        ascending=[True, True, False, True, True],
+        kind="stable",
+    ).reset_index(drop=True)
+
+    summary = (
+        detail.groupby(["Точка", "Категория"], as_index=False, dropna=False)
+        .agg(
+            **{
+                "SKU, шт.": ("SKU", "nunique"),
+                "План": ("План", "sum"),
+                "Съели D1": ("Съели D1", "sum"),
+                "Осталось после D1": ("Осталось после D1", "sum"),
+                "Съели из остатка D2": ("Съели из остатка D2", "sum"),
+                "Осталось после D2": ("Осталось после D2", "sum"),
+            }
+        )
+    )
+    summary.insert(2, "Дата плана", plan_date)
+    summary.insert(3, "D1", d1)
+    summary.insert(4, "D2", d2)
+    summary = summary[summary_columns]
+    return detail, summary
+
+
 sku_point, category_profile, entity_profile, daily_detail = st.session_state["analysis"]
 period = st.session_state["period"]
 
@@ -12056,6 +12281,7 @@ MENU_ITEMS = [
     ("Анализ категории", ":material/bar_chart:"),
     ("Окно свежести", ":material/calendar_month:"),
     ("Архив меню", ":material/history:"),
+    ("Переходящий остаток", ":material/swap_horiz:"),
     ("Циклический план", ":material/repeat:"),
 ]
 SECTION_STATE_KEY = "main_section_v759"
@@ -13220,7 +13446,7 @@ class _MainSection:
         return False
 
 
-tab_mean, tab_report, tab_comparison, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_menu_archive, tab_cycle_plan = [
+tab_mean, tab_report, tab_comparison, tab_entities, tab_detail, tab_category_detail, tab_abc, tab_category_analysis, tab_sales_time, tab_menu_archive, tab_carryover, tab_cycle_plan = [
     _MainSection(label) for label, _ in MENU_ITEMS
 ]
 # Удалённые разделы оставлены как закрытые заглушки, чтобы старый код ниже
@@ -21881,6 +22107,322 @@ if tab_forecast.open:
 
     st.markdown('<div class="vk-footer-brand">ВКУСНО МАРКЕТ</div>', unsafe_allow_html=True)
 
+
+
+if tab_carryover.open:
+    with tab_carryover:
+        st.subheader("Переходящий остаток")
+        st.caption(
+            "Основной уровень: Точка → Категория. Сначала каждый SKU выбранного плана считается отдельно, "
+            "и только потом SKU суммируются в категорию. Это расчётный остаток выбранной плановой партии, "
+            "а не физический складской остаток."
+        )
+
+        carry_matrix_bytes, carry_matrix_source, _, carry_matrix_error = _load_matrix_context_for_active_tab()
+        carry_current_plans = pd.DataFrame()
+        if carry_matrix_bytes:
+            try:
+                carry_current_plans = parse_freshness_plan(carry_matrix_bytes)
+                if not carry_current_plans.empty:
+                    carry_current_plans = carry_current_plans.copy()
+                    carry_current_plans["plan_date"] = pd.to_datetime(
+                        carry_current_plans["plan_date"], errors="coerce"
+                    ).dt.date
+            except Exception as error:
+                carry_matrix_error = str(error)
+                carry_current_plans = pd.DataFrame()
+
+        carry_archive_isos, carry_archive_error = _fetch_system_menu_archive_dates(
+            MENU_ARCHIVE_APPS_SCRIPT_URL,
+            MENU_ARCHIVE_APPS_SCRIPT_KEY,
+        )
+        carry_archive_dates: list[date] = []
+        for iso_value in carry_archive_isos:
+            try:
+                carry_archive_dates.append(date.fromisoformat(str(iso_value)))
+            except ValueError:
+                continue
+
+        carry_current_dates = (
+            [value for value in carry_current_plans.get("plan_date", pd.Series(dtype=object)).dropna().unique().tolist() if isinstance(value, date)]
+            if not carry_current_plans.empty
+            else []
+        )
+        carry_all_dates = sorted(set(carry_current_dates) | set(carry_archive_dates))
+        # Для полноценного переходящего потребления нужен уже наступивший D2.
+        carry_completed_dates = [value for value in carry_all_dates if value + timedelta(days=2) <= date.today()]
+
+        carry_point_to_shop = {
+            str(point_label).strip(): int(shop_number)
+            for shop_number, point_label in st.session_state.get("point_mapping", {}).items()
+            if str(point_label).strip() and re.fullmatch(r"Т\d+", str(point_label).strip())
+        }
+        carry_point_options = sorted(
+            carry_point_to_shop,
+            key=lambda value: int(re.search(r"\d+", value).group()) if re.search(r"\d+", value) else 10_000,
+        )
+
+        if not carry_completed_dates:
+            st.info("Нет даты меню, для которой уже наступил второй день реализации D2.")
+            if carry_matrix_error:
+                st.caption(f"Матрица: {carry_matrix_error}")
+            if carry_archive_error:
+                st.caption(f"Архив: {carry_archive_error}")
+        elif not carry_point_options:
+            st.error("Не найдено сопоставление точек меню ТN с shop_number PostgreSQL.")
+        else:
+            selector_columns = st.columns([1.0, 1.0])
+            with selector_columns[0]:
+                carry_point_filter = st.selectbox(
+                    "Точка",
+                    options=["Все точки"] + carry_point_options,
+                    index=0,
+                    key="carryover_point_filter_v1",
+                )
+            with selector_columns[1]:
+                carry_plan_date = st.selectbox(
+                    "Дата плана",
+                    options=list(reversed(carry_completed_dates)),
+                    index=0,
+                    format_func=lambda value: value.strftime("%d.%m.%Y"),
+                    key="carryover_plan_date_v1",
+                )
+
+            carry_plan_rows = pd.DataFrame()
+            carry_plan_source = ""
+            if not carry_current_plans.empty and carry_plan_date in set(carry_current_dates):
+                carry_plan_rows = carry_current_plans[
+                    carry_current_plans["plan_date"].eq(carry_plan_date)
+                ].copy()
+                carry_plan_source = carry_matrix_source or "Текущая Матрица КОМБО"
+            else:
+                archive_snapshot_id, archive_day_frame, archive_day_error = _fetch_system_menu_archive_day(
+                    MENU_ARCHIVE_APPS_SCRIPT_URL,
+                    MENU_ARCHIVE_APPS_SCRIPT_KEY,
+                    carry_plan_date.isoformat(),
+                )
+                if archive_day_error:
+                    st.error(f"Не удалось загрузить выбранную дату из архива: {archive_day_error}")
+                else:
+                    carry_plan_rows = _archive_menu_frame_to_freshness_plan(archive_day_frame)
+                    carry_plan_source = (
+                        f"Системный архив меню · снимок {archive_snapshot_id}"
+                        if archive_snapshot_id
+                        else "Системный архив меню"
+                    )
+
+            if carry_plan_rows.empty:
+                st.info("Для выбранной даты не найден план меню.")
+            else:
+                carry_plan_rows = carry_plan_rows.copy()
+                carry_plan_rows["point_number"] = pd.to_numeric(
+                    carry_plan_rows["point_number"], errors="coerce"
+                )
+                carry_plan_rows["Точка"] = carry_plan_rows["point_number"].map(
+                    lambda value: f"Т{int(value)}" if pd.notna(value) else ""
+                )
+                carry_unmapped_points = sorted(
+                    set(carry_plan_rows["Точка"].dropna().astype(str)) - set(carry_point_to_shop)
+                )
+                carry_unmapped_points = [value for value in carry_unmapped_points if value]
+                if carry_unmapped_points:
+                    st.warning(
+                        "В плане есть точки без сопоставления с shop_number PostgreSQL: "
+                        + ", ".join(carry_unmapped_points)
+                        + ". Они не включены в расчёт, чтобы не подставлять номер магазина наугад."
+                    )
+                carry_plan_rows = carry_plan_rows[
+                    carry_plan_rows["Точка"].isin(carry_point_to_shop)
+                ].copy()
+                if carry_point_filter != "Все точки":
+                    carry_plan_rows = carry_plan_rows[
+                        carry_plan_rows["Точка"].eq(carry_point_filter)
+                    ].copy()
+
+                carry_plan_rows["analyst_plan"] = pd.to_numeric(
+                    carry_plan_rows["analyst_plan"], errors="coerce"
+                ).fillna(0.0)
+                carry_plan_rows = carry_plan_rows[carry_plan_rows["analyst_plan"].gt(0)].copy()
+
+                if carry_plan_rows.empty:
+                    st.info("На выбранную дату и точку нет положительного плана.")
+                else:
+                    carry_selected_points = sorted(carry_plan_rows["Точка"].dropna().unique().tolist())
+                    carry_shops = tuple(
+                        sorted({carry_point_to_shop[point] for point in carry_selected_points})
+                    )
+                    carry_skus = tuple(
+                        sorted({str(value) for value in carry_plan_rows["sku"].map(normalize_sku).dropna().tolist()})
+                    )
+                    carry_d1 = carry_plan_date + timedelta(days=1)
+                    carry_d2 = carry_plan_date + timedelta(days=2)
+                    if carry_d2 == date.today():
+                        st.warning(
+                            "D2 приходится на сегодняшний день. Значение «съели D2» будет текущим фактом на момент обновления PostgreSQL, "
+                            "а не итогом закрытого дня."
+                        )
+                    carry_sales = load_carryover_sales(
+                        carry_d1,
+                        carry_d2 + timedelta(days=1),
+                        carry_shops,
+                        carry_skus,
+                    )
+                    carry_detail, carry_summary = build_carryover_detail(
+                        carry_plan_rows,
+                        carry_sales,
+                        carry_point_to_shop,
+                        carry_plan_date,
+                    )
+
+                    if carry_summary.empty:
+                        st.info("После сопоставления плана с PostgreSQL не осталось строк для расчёта.")
+                    else:
+                        st.caption(
+                            f"Источник плана: {carry_plan_source}. "
+                            f"D1: {carry_d1:%d.%m.%Y} · D2: {carry_d2:%d.%m.%Y}. "
+                            "Факт продаж: dwh.v_sales_item. Процент переходящего остатка пока не рассчитывается."
+                        )
+
+                        carry_metrics = st.columns(5)
+                        carry_metrics[0].metric(
+                            "План, шт.",
+                            f"{carry_summary['План'].sum():,.0f}".replace(",", " "),
+                        )
+                        carry_metrics[1].metric(
+                            "Съели D1, шт.",
+                            f"{carry_summary['Съели D1'].sum():,.0f}".replace(",", " "),
+                        )
+                        carry_metrics[2].metric(
+                            "Осталось после D1",
+                            f"{carry_summary['Осталось после D1'].sum():,.0f}".replace(",", " "),
+                        )
+                        carry_metrics[3].metric(
+                            "Съели из остатка D2",
+                            f"{carry_summary['Съели из остатка D2'].sum():,.0f}".replace(",", " "),
+                        )
+                        carry_metrics[4].metric(
+                            "Осталось после D2",
+                            f"{carry_summary['Осталось после D2'].sum():,.0f}".replace(",", " "),
+                        )
+
+                        st.markdown("#### Сводка по каждой точке и категории")
+                        carry_summary_display = carry_summary.copy()
+                        carry_summary_display["_point_sort"] = carry_summary_display["Точка"].str.extract(
+                            r"(\d+)", expand=False
+                        ).astype(float)
+                        carry_summary_display = carry_summary_display.sort_values(
+                            ["_point_sort", "Категория"], kind="stable"
+                        ).drop(columns="_point_sort")
+                        st.dataframe(
+                            carry_summary_display,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Дата плана": st.column_config.DateColumn(format="DD.MM.YYYY"),
+                                "D1": st.column_config.DateColumn(format="DD.MM.YYYY"),
+                                "D2": st.column_config.DateColumn(format="DD.MM.YYYY"),
+                                "SKU, шт.": st.column_config.NumberColumn(format="%d"),
+                                "План": st.column_config.NumberColumn(format="%.0f"),
+                                "Съели D1": st.column_config.NumberColumn(format="%.0f"),
+                                "Осталось после D1": st.column_config.NumberColumn(format="%.0f"),
+                                "Съели из остатка D2": st.column_config.NumberColumn(format="%.0f"),
+                                "Осталось после D2": st.column_config.NumberColumn(format="%.0f"),
+                            },
+                        )
+
+                        st.markdown("#### Раскрытие категорий до SKU")
+                        detail_points = sorted(
+                            carry_detail["Точка"].dropna().unique().tolist(),
+                            key=lambda value: int(re.search(r"\d+", value).group()) if re.search(r"\d+", value) else 10_000,
+                        )
+                        for point_label in detail_points:
+                            point_detail = carry_detail[carry_detail["Точка"].eq(point_label)].copy()
+                            point_summary = carry_summary[carry_summary["Точка"].eq(point_label)].copy()
+                            st.markdown(f"### {point_label}")
+                            st.dataframe(
+                                point_summary[
+                                    [
+                                        "Категория", "План", "Съели D1", "Осталось после D1",
+                                        "Съели из остатка D2", "Осталось после D2", "SKU, шт.",
+                                    ]
+                                ],
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "План": st.column_config.NumberColumn(format="%.0f"),
+                                    "Съели D1": st.column_config.NumberColumn(format="%.0f"),
+                                    "Осталось после D1": st.column_config.NumberColumn(format="%.0f"),
+                                    "Съели из остатка D2": st.column_config.NumberColumn(format="%.0f"),
+                                    "Осталось после D2": st.column_config.NumberColumn(format="%.0f"),
+                                    "SKU, шт.": st.column_config.NumberColumn(format="%d"),
+                                },
+                            )
+
+                            category_names = point_summary["Категория"].dropna().astype(str).tolist()
+                            for category_name in category_names:
+                                category_detail = point_detail[
+                                    point_detail["Категория"].astype(str).eq(category_name)
+                                ].copy()
+                                category_row = point_summary[
+                                    point_summary["Категория"].astype(str).eq(category_name)
+                                ].iloc[0]
+                                expander_title = (
+                                    f"{category_name} · съели D2 из остатка: "
+                                    f"{float(category_row['Съели из остатка D2']):,.0f} · "
+                                    f"осталось: {float(category_row['Осталось после D2']):,.0f}"
+                                ).replace(",", " ")
+                                with st.expander(expander_title, expanded=False):
+                                    sku_table = category_detail[
+                                        [
+                                            "SKU", "Название блюда", "План", "Съели D1",
+                                            "Осталось после D1", "Продажи D2 в БД",
+                                            "Съели из остатка D2", "Осталось после D2",
+                                        ]
+                                    ].copy()
+                                    st.dataframe(
+                                        sku_table,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        column_config={
+                                            "План": st.column_config.NumberColumn(format="%.0f"),
+                                            "Съели D1": st.column_config.NumberColumn(format="%.0f"),
+                                            "Осталось после D1": st.column_config.NumberColumn(format="%.0f"),
+                                            "Продажи D2 в БД": st.column_config.NumberColumn(format="%.0f"),
+                                            "Съели из остатка D2": st.column_config.NumberColumn(format="%.0f"),
+                                            "Осталось после D2": st.column_config.NumberColumn(format="%.0f"),
+                                        },
+                                    )
+
+                                    diagnostic_options = category_detail["SKU"].astype(str).tolist()
+                                    if diagnostic_options:
+                                        diagnostic_sku = st.selectbox(
+                                            "Как рассчитано · выбрать SKU",
+                                            options=diagnostic_options,
+                                            format_func=lambda sku_value: (
+                                                f"{sku_value} · "
+                                                f"{category_detail.loc[category_detail['SKU'].astype(str).eq(str(sku_value)), 'Название блюда'].iloc[0]}"
+                                            ),
+                                            key=f"carryover_diag_{carry_plan_date}_{point_label}_{hashlib.md5(category_name.encode('utf-8')).hexdigest()[:8]}",
+                                        )
+                                        diagnostic_row = category_detail[
+                                            category_detail["SKU"].astype(str).eq(str(diagnostic_sku))
+                                        ].iloc[0]
+                                        st.markdown("**Как рассчитано**")
+                                        st.markdown(
+                                            f"План {carry_plan_date:%d.%m}: **{diagnostic_row['План']:.0f}** → "
+                                            f"D1 {carry_d1:%d.%m}: продано **{diagnostic_row['Съели D1']:.0f}** → "
+                                            f"расчётный остаток **max({diagnostic_row['План']:.0f} − {diagnostic_row['Съели D1']:.0f}, 0) = {diagnostic_row['Осталось после D1']:.0f}** → "
+                                            f"D2 {carry_d2:%d.%m}: в PostgreSQL продано **{diagnostic_row['Продажи D2 в БД']:.0f}** → "
+                                            f"переходящее потребление **min({diagnostic_row['Продажи D2 в БД']:.0f}, {diagnostic_row['Осталось после D1']:.0f}) = {diagnostic_row['Съели из остатка D2']:.0f}** → "
+                                            f"осталось после D2 **{diagnostic_row['Осталось после D2']:.0f}**."
+                                        )
+
+                        st.info(
+                            "Важно: «Осталось» здесь — расчётный остаток конкретного плана по SKU. "
+                            "Он не заменяет складской остаток, потому что в этом расчёте нет движений склада, списаний и перемещений."
+                        )
+
+        st.markdown('<div class="vk-footer-brand">ВКУСНО МАРКЕТ</div>', unsafe_allow_html=True)
 
 
 if tab_cycle_plan.open:
